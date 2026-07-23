@@ -1,0 +1,125 @@
+"use client";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { toast } from "sonner";
+import { Plus } from "lucide-react";
+import { Button } from "@/frontend/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/frontend/components/ui/dialog";
+import { Input } from "@/frontend/components/ui/input";
+import { Label } from "@/frontend/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/frontend/components/ui/select";
+
+export function FactoryForm({ disabled }: { disabled?: boolean }) {
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [country, setCountry] = useState<"china" | "uzbekistan">("china");
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function submit() {
+    if (!name.trim()) {
+      toast.error("Укажите название фабрики");
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await fetch("/api/factory", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: name.trim(), country, note: note.trim() || null }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error ?? "Ошибка");
+      toast.success(
+        data.persisted
+          ? `Фабрика «${name.trim()}» добавлена`
+          : `Фабрика «${name.trim()}» принята (демо — без записи в БД)`,
+      );
+      setName("");
+      setNote("");
+      setCountry("china");
+      setOpen(false);
+      router.refresh();
+    } catch (e) {
+      toast.error(`Не удалось добавить фабрику: ${(e as Error).message}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      <Button size="sm" onClick={() => setOpen(true)} disabled={disabled}>
+        <Plus className="size-4" />
+        Добавить фабрику
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Новая фабрика</DialogTitle>
+            <DialogDescription>
+              Производитель товара. Страна определяет валюту расчётов.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="grid gap-3">
+            <div className="grid gap-1.5">
+              <Label htmlFor="factory-name">Название</Label>
+              <Input
+                id="factory-name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="Например, Guangzhou Textile Co."
+              />
+            </div>
+            <div className="grid gap-1.5">
+              <Label>Страна</Label>
+              <Select value={country} onValueChange={(v) => setCountry(v as "china" | "uzbekistan")}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="china">Китай</SelectItem>
+                  <SelectItem value="uzbekistan">Узбекистан</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="factory-note">Заметка (необязательно)</Label>
+              <Input
+                id="factory-note"
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="Что отшивает, контакт и т. п."
+              />
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOpen(false)} disabled={saving}>
+              Отмена
+            </Button>
+            <Button onClick={submit} disabled={saving}>
+              {saving ? "Сохранение…" : "Добавить"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}

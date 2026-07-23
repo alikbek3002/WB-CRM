@@ -1,0 +1,192 @@
+// RBAC: роли и матрица прав из раздела 5.1 плана.
+// Роли хранятся в БД как enum member_role (миграции 0002 + 0018).
+
+export type MemberRole =
+  | "owner"
+  | "admin"
+  | "manager"
+  | "analyst"
+  | "viewer"
+  | "designer" // дизайнер карточек
+  | "seo" // SEO-менеджер (и дизайнер)
+  | "kiz" // менеджер по КИЗам (маркировка)
+  | "adv" // менеджер по внутренней рекламе
+  | "shipping"; // менеджер по отгрузкам на склады WB
+
+export const ROLE_LABELS: Record<MemberRole, string> = {
+  owner: "Директор",
+  admin: "Администратор",
+  manager: "Старший менеджер",
+  analyst: "Аналитик",
+  viewer: "Наблюдатель",
+  designer: "Дизайнер",
+  seo: "SEO-менеджер",
+  kiz: "Менеджер по КИЗам",
+  adv: "Менеджер по рекламе",
+  shipping: "Менеджер по отгрузкам",
+};
+
+export type Permission =
+  | "dashboard:view"
+  | "rnp:view"
+  | "rnp:edit" // редактирование планов
+  | "products:view"
+  | "products:edit" // себестоимость, статусы, группы
+  | "finance:view"
+  | "finance:plan" // задать план продаж WB на период
+  | "tasks:view" // viewer видит только свои — фильтрация на уровне данных/RLS
+  | "team:manage"
+  | "integrations:manage" // API-ключи
+  | "tariffs:manage"
+  // ─── Цепочка поставок (КП) ───
+  | "factory:view"
+  | "factory:edit" // создание фабрик
+  | "supply:view"
+  | "supply:edit" // создание карточек отгрузки (закупщики)
+  | "supply:pay" // оплаты товар/карго (финансисты)
+  | "supply:receive" // приёмка + распределение по WB (приёмщик Москва)
+  | "fulfillment:view"
+  // ─── Регламент и отчёты ───
+  | "duty:view" // мои ежедневные обязанности
+  | "duty:complete" // отметить выполнение + отчёт
+  | "reports:view" // отчёты всех менеджеров (директор/ст. менеджер)
+  // ─── Дизайн карточек ───
+  | "design:view" // очередь заявок на дизайн
+  | "design:request" // создать заявку (товар + референсы)
+  | "design:submit" // сдать макет (дизайнер)
+  | "design:approve"; // утвердить/вернуть (директор/ст. менеджер)
+
+const ALL: Permission[] = [
+  "dashboard:view",
+  "rnp:view",
+  "rnp:edit",
+  "products:view",
+  "products:edit",
+  "finance:view",
+  "finance:plan",
+  "tasks:view",
+  "team:manage",
+  "integrations:manage",
+  "tariffs:manage",
+  "factory:view",
+  "factory:edit",
+  "supply:view",
+  "supply:edit",
+  "supply:pay",
+  "supply:receive",
+  "fulfillment:view",
+  "duty:view",
+  "duty:complete",
+  "reports:view",
+  "design:view",
+  "design:request",
+  "design:submit",
+  "design:approve",
+];
+
+export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
+  owner: ALL,
+  admin: ALL.filter((p) => p !== "tariffs:manage"),
+  manager: [
+    "dashboard:view",
+    "rnp:view",
+    "rnp:edit",
+    "products:view",
+    "products:edit",
+    "finance:view",
+    "finance:plan",
+    "tasks:view",
+    "factory:view",
+    "factory:edit",
+    "supply:view",
+    "supply:edit",
+    "supply:pay",
+    "supply:receive",
+    "fulfillment:view",
+    "duty:view",
+    "duty:complete",
+    "reports:view", // старший менеджер видит отчёты команды
+    "design:view",
+    "design:request",
+    "design:approve",
+  ],
+  analyst: [
+    "dashboard:view",
+    "rnp:view",
+    "products:view",
+    "finance:view",
+    "tasks:view",
+    "factory:view",
+    "supply:view",
+    "fulfillment:view",
+    "duty:view",
+  ],
+  viewer: [
+    "dashboard:view",
+    "rnp:view",
+    "tasks:view",
+    "factory:view",
+    "supply:view",
+    "fulfillment:view",
+  ],
+  // ─── Специализации (реальная команда) ───
+  designer: [
+    "dashboard:view",
+    "products:view",
+    "tasks:view",
+    "duty:view",
+    "duty:complete",
+    "design:view",
+    "design:submit",
+  ],
+  seo: [
+    "dashboard:view",
+    "products:view",
+    "products:edit", // SEO правит карточки (ключи, тексты)
+    "tasks:view",
+    "duty:view",
+    "duty:complete",
+    "design:view",
+    "design:request",
+    "design:submit", // Назира — SEO и дизайнер
+  ],
+  kiz: [
+    "dashboard:view",
+    "products:view",
+    "supply:view",
+    "fulfillment:view",
+    "tasks:view",
+    "duty:view",
+    "duty:complete",
+  ],
+  adv: [
+    "dashboard:view",
+    "products:view",
+    "rnp:view",
+    "tasks:view",
+    "duty:view",
+    "duty:complete",
+    "design:view",
+    "design:request", // заказ креативов для рекламы
+  ],
+  shipping: [
+    "dashboard:view",
+    "products:view",
+    "supply:view",
+    "supply:edit",
+    "supply:receive",
+    "fulfillment:view",
+    "tasks:view",
+    "duty:view",
+    "duty:complete",
+    "design:view", // видит статусы дизайна перед отгрузкой
+  ],
+};
+
+export function can(role: MemberRole, permission: Permission): boolean {
+  return ROLE_PERMISSIONS[role].includes(permission);
+}
+
+export function isMemberRole(value: string): value is MemberRole {
+  return value in ROLE_LABELS;
+}

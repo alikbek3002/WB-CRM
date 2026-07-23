@@ -1,0 +1,56 @@
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { DEMO_ORG_ID } from "@/shared/constants";
+import { can } from "@/shared/rbac";
+import { getSession } from "@/backend/auth/session";
+import { getSupabaseAdmin } from "@/backend/supabase/admin";
+import { invalidateWbData } from "@/backend/data/revalidate";
+
+export const runtime = "nodejs";
+
+// Создание фабрики (КП: закупщик выбирает страну Китай/Узбекистан). Роль factory:edit.
+const factorySchema = z.object({
+  name: z.string().trim().min(1).max(200),
+  country: z.enum(["china", "uzbekistan"]),
+  note: z.string().trim().max(500).nullable().optional(),
+});
+
+export async function POST(request: Request) {
+  const session = await getSession();
+  if (!can(session.role, "factory:edit")) {
+    return NextResponse.json({ error: "forbidden" }, { status: 403 });
+  }
+
+  const body = await request.json().catch(() => null);
+  const parsed = factorySchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "invalid_payload", details: parsed.error.flatten() },
+      { status: 400 },
+    );
+  }
+
+  const admin = getSupabaseAdmin();
+  if (!admin) {
+    return NextResponse.json({ ok: true, persisted: false, factory: parsed.data });
+  }
+
+  const { data, error } = await admin
+    .from("factories")
+    .insert({
+      org_id: DEMO_ORG_ID,
+      name: parsed.data.name,
+      country: parsed.data.country,
+      note: parsed.data.note ?? null,
+    })
+    .select("id")
+    .single();
+
+  if (error) {
+    console.error("[factory] insert failed:", error);
+    return NextResponse.json({ error: "db_error" }, { status: 500 });
+  }
+
+  invalidateWbData();
+  return NextResponse.json({ ok: true, persisted: true, id: data.id });
+}
