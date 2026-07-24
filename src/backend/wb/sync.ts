@@ -91,12 +91,20 @@ async function runSource(
   }
 }
 
+// Какие источники тянуть за прогон. Разделение нужно, чтобы частый авто-синк гонял
+// только «живые» данные (orders/sales/stocks — инкрементально, дёшево), а тяжёлую
+// полную выгрузку каталога (cards+prices) — редко.
+export const WB_SYNC_SOURCES = ["cards", "stocks", "orders", "sales"] as const;
+export type WbSyncSource = (typeof WB_SYNC_SOURCES)[number];
+
 // days — стартовое окно заказов/продаж при пустой БД (дальше — по курсору
-// last_change_date); maxBatches — партий по 80k за запуск (интерактив 2, cron больше)
+// last_change_date); maxBatches — партий по 80k за запуск (интерактив 2, cron больше);
+// sources — какие источники тянуть (по умолчанию все).
 export async function runWbSync(
   db: SupabaseClient,
   days = 30,
   maxBatches = 2,
+  sources: readonly WbSyncSource[] = WB_SYNC_SOURCES,
 ): Promise<WbSyncResult> {
   const startedAt = new Date().toISOString();
   const token = getWbToken();
@@ -113,6 +121,7 @@ export async function runWbSync(
 
   const counts: Record<string, number> = {};
   const errors: string[] = [];
+  const want = new Set<WbSyncSource>(sources);
 
   // Защита от параллельных запусков: два синка одним токеном душат друг друга
   // rate-limit'ами WB (наблюдалось вживую). Живой запуск = running моложе 15 мин;
@@ -168,8 +177,8 @@ export async function runWbSync(
     };
   }
 
-  // ── Карточки + цены → products ──────────────────────────────────────────
-  await runSource(db, "cards", null, async () => {
+  // ── Карточки + цены → products (только в полном синке) ──────────────────
+  if (want.has("cards")) await runSource(db, "cards", null, async () => {
     const [cards, prices] = await Promise.all([
       fetchAllCards(token),
       fetchPrices(token).catch(() => new Map<number, { price: number; discounted: number }>()),
@@ -211,16 +220,19 @@ export async function runWbSync(
     return chunkedUpsert(db, "products", rows, "store_id,nm_id");
   }, counts, errors);
 
-  // Карта nm_id → product_id (после апсерта карточек)
-  const { data: prods, error: prodErr } = await db
-    .from("products")
-    .select("id, nm_id")
-    .eq("store_id", DEMO_STORE_ID);
-  if (prodErr) errors.push(`products map: ${prodErr.message}`);
-  const idByNm = new Map((prods ?? []).map((p) => [Number(p.nm_id), p.id as string]));
+  // Карта nm_id → product_id — нужна только остаткам (заказы/продажи пишут nm_id напрямую)
+  const idByNm = new Map<number, string>();
+  if (want.has("stocks")) {
+    const { data: prods, error: prodErr } = await db
+      .from("products")
+      .select("id, nm_id")
+      .eq("store_id", DEMO_STORE_ID);
+    if (prodErr) errors.push(`products map: ${prodErr.message}`);
+    for (const p of prods ?? []) idByNm.set(Number(p.nm_id), p.id as string);
+  }
 
   // ── Остатки → stock_snapshots (срез на сегодня, warehouse_remains) ──────
-  await runSource(db, "stocks", isoDate(new Date()), async () => {
+  if (want.has("stocks")) await runSource(db, "stocks", isoDate(new Date()), async () => {
     const remains = await fetchWarehouseRemains(token);
     const today = isoDate(new Date());
     // Служебные «склады» отчёта: транзит — отдельной строкой, агрегат — мимо
@@ -312,7 +324,7 @@ export async function runWbSync(
     return total;
   }
 
-  await runSource(db, "orders", daysAgo(days), async () => {
+  if (want.has("orders")) await runSource(db, "orders", daysAgo(days), async () => {
     return syncBatched(
       "raw_orders",
       (from) => fetchOrders(token!, from, 150_000),
@@ -337,7 +349,7 @@ export async function runWbSync(
     );
   }, counts, errors);
 
-  await runSource(db, "sales", daysAgo(days), async () => {
+  if (want.has("sales")) await runSource(db, "sales", daysAgo(days), async () => {
     return syncBatched(
       "raw_sales",
       (from) => fetchSales(token!, from, 150_000),

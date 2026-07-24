@@ -184,7 +184,9 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
 };
 
 export function can(role: MemberRole, permission: Permission): boolean {
-  return ROLE_PERMISSIONS[role].includes(permission);
+  // ?. — сессия-заглушка (anonymous при выключенном демо) не имеет строки в
+  // матрице → любое право = false. Не бросаем, чтобы API отвечал 403, а не 500.
+  return ROLE_PERMISSIONS[role]?.includes(permission) ?? false;
 }
 
 export function isMemberRole(value: string): value is MemberRole {

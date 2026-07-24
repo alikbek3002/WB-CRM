@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
-import { runWbSync } from "@/backend/wb/sync";
+import { runWbSync, type WbSyncSource } from "@/backend/wb/sync";
 import { invalidateWbData } from "@/backend/data/revalidate";
+import { warmReadCache } from "@/backend/data";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -24,7 +25,18 @@ export async function GET(request: Request) {
     );
   }
 
-  const result = await runWbSync(admin, 2, 3);
-  if (result.ok) invalidateWbData(); // свежие заказы/остатки видно сразу
+  // mode=live → только живые данные (остатки/заказы/продажи): инкрементально и часто.
+  // Иначе полный синк (+ карточки/цены) — реже. Разводит их планировщик бота.
+  const mode = new URL(request.url).searchParams.get("mode");
+  const sources: WbSyncSource[] | undefined =
+    mode === "live" ? ["stocks", "orders", "sales"] : undefined;
+
+  const result = await runWbSync(admin, 2, 3, sources);
+  if (result.ok) {
+    invalidateWbData(); // свежие заказы/остатки видно сразу
+    // Прогрев: юзер открывает вкладки уже с тёплым кэшем (без холодных 5-9с рендеров)
+    const warm = await warmReadCache();
+    console.log(`[wb-sync] кэш прогрет за ${warm.ms}мс (ошибок: ${warm.failed})`);
+  }
   return NextResponse.json(result, { status: result.ok ? 200 : 502 });
 }

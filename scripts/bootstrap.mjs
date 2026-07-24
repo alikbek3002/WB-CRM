@@ -63,7 +63,10 @@ async function ensureUsers() {
       });
       if (e) throw e;
       id = data.user.id;
-    } else {
+    } else if (process.env.RESET_PASSWORDS === "1") {
+      // Существующим пользователям пароль НЕ трогаем: боевые пароли ротированы
+      // и не должны откатываться на шаблон при повторном bootstrap.
+      // Явный сброс на шаблонные: RESET_PASSWORDS=1 npm run db:bootstrap
       const { error: e } = await db.auth.admin.updateUserById(id, { password: u.password });
       if (e) throw e;
     }

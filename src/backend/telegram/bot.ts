@@ -12,7 +12,7 @@ import { Bot, GrammyError, InlineKeyboard, InputFile } from "grammy";
 import type { Context } from "grammy";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { ROLE_LABELS, can, isMemberRole, type MemberRole } from "../../shared/rbac";
-import { SUPPLY_AUTO_ARRIVE_DAYS, DEMO_STORE_ID } from "../../shared/constants";
+import { SUPPLY_AUTO_ARRIVE_DAYS, DEMO_ORG_ID, DEMO_STORE_ID } from "../../shared/constants";
 import { askAssistant, aiConfigured, type ChatMessage } from "../ai/assistant";
 import { buildSnapshot } from "../ai/snapshot";
 import { ensureDutyAssignments, localIsoDate } from "../data/duties-core";
@@ -60,6 +60,7 @@ type SessionData = {
   lockUntil?: number;
   aiHistory?: ChatMessage[]; // короткая история диалога с ИИ
   dutyId?: string; // назначение, по которому ждём текст отчёта
+  testProfileId?: string; // тестовый режим: под каким сотрудником смотрим бот
 };
 
 // Анти-брутфорс: после MAX_FAILS неудачных попыток — пауза LOCK_MS.
@@ -73,7 +74,15 @@ async function readSession(chatId: number): Promise<SessionData> {
     .eq("chat_id", chatId)
     .maybeSingle();
   const d = (data?.data ?? {}) as SessionData;
-  return { step: d.step ?? "idle", login: d.login, aiHistory: d.aiHistory, dutyId: d.dutyId };
+  return {
+    step: d.step ?? "idle",
+    login: d.login,
+    fails: d.fails,
+    lockUntil: d.lockUntil,
+    aiHistory: d.aiHistory,
+    dutyId: d.dutyId,
+    testProfileId: d.testProfileId,
+  };
 }
 
 async function writeSession(chatId: number, data: SessionData): Promise<void> {
@@ -82,8 +91,11 @@ async function writeSession(chatId: number, data: SessionData): Promise<void> {
     .upsert({ chat_id: chatId, data, updated_at: new Date().toISOString() }, { onConflict: "chat_id" });
 }
 
+// Сброс шага диалога. Выбор тестового сотрудника переживает сброс — его снимает
+// только явный /logout или «Сменить сотрудника».
 async function clearSession(chatId: number): Promise<void> {
-  await writeSession(chatId, { step: "idle" });
+  const prev = await readSession(chatId);
+  await writeSession(chatId, { step: "idle", testProfileId: prev.testProfileId });
 }
 
 // ───────────────────────── Личность / роли ─────────────────────────
@@ -121,8 +133,82 @@ async function resolveMembership(
   return { role, orgId: String(m.org_id), orgName: (org?.name as string) ?? "—" };
 }
 
+// ── Тестовый режим: владелец Telegram ID из TELEGRAM_TEST_IDS заходит под любым
+// сотрудником БЕЗ пароля (кнопки с именами). Выбор живёт в telegram_sessions
+// (testProfileId) — реальные привязки profiles.telegram_id НЕ трогаются, поэтому
+// тест не разлогинивает сотрудников и не перехватывает их уведомления.
+function isTestTg(telegramId: number): boolean {
+  return (process.env.TELEGRAM_TEST_IDS ?? "")
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0)
+    .includes(telegramId);
+}
+
+// Личка: chat_id == telegram_id (guard пускает только приватные чаты)
+async function getTestUser(telegramId: number): Promise<AuthedUser | null> {
+  const sess = await readSession(telegramId);
+  if (!sess.testProfileId) return null;
+  const { data: p, error } = await admin()
+    .from("profiles")
+    .select("id, full_name, email, login")
+    .eq("id", sess.testProfileId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!p) return null;
+  const m = await resolveMembership(String(p.id));
+  if (!m) return null;
+  return {
+    id: String(p.id),
+    name: (p.full_name as string) ?? "Сотрудник",
+    email: (p.email as string) ?? "",
+    login: (p.login as string) ?? null,
+    role: m.role,
+    roleLabel: ROLE_LABELS[m.role],
+    orgId: m.orgId,
+    orgName: m.orgName,
+  };
+}
+
+const ROLE_RANK: Record<string, number> = {
+  owner: 0, admin: 1, manager: 2, designer: 3, seo: 4, kiz: 5, adv: 6, shipping: 7, analyst: 8, viewer: 9,
+};
+
+// Список сотрудников для тестового входа (имя + роль, отсортировано по рангу роли)
+async function renderTestPicker(): Promise<{ body: string; kb: InlineKeyboard }> {
+  const { data, error } = await admin()
+    .from("org_members")
+    .select("role, profile:profiles(id, full_name)")
+    .eq("org_id", DEMO_ORG_ID);
+  if (error) throw error;
+  const rows = ((data ?? []) as unknown as Array<{
+    role: string;
+    profile: { id: string; full_name: string | null } | { id: string; full_name: string | null }[] | null;
+  }>)
+    .map((m) => {
+      const p = Array.isArray(m.profile) ? m.profile[0] : m.profile;
+      return p ? { id: String(p.id), name: p.full_name ?? "—", role: m.role } : null;
+    })
+    .filter(Boolean) as Array<{ id: string; name: string; role: string }>;
+  rows.sort((a, b) => (ROLE_RANK[a.role] ?? 99) - (ROLE_RANK[b.role] ?? 99) || a.name.localeCompare(b.name, "ru"));
+
+  const kb = new InlineKeyboard();
+  for (const r of rows) {
+    kb.text(`${r.name} — ${ROLE_LABELS[r.role as MemberRole] ?? r.role}`, `test:pick:${r.id}`).row();
+  }
+  return {
+    body: [
+      "🧪 <b>Тестовый режим</b>",
+      "",
+      "Выберите сотрудника — бот покажет всё его глазами (меню, задачи, доступы):",
+    ].join("\n"),
+    kb,
+  };
+}
+
 // Профиль, уже привязанный к этому Telegram-аккаунту (авто-вход).
 async function getLinkedUser(telegramId: number): Promise<AuthedUser | null> {
+  if (isTestTg(telegramId)) return getTestUser(telegramId); // тест — только через сессию
   const { data: p, error } = await admin()
     .from("profiles")
     .select("id, full_name, email, login, telegram_id")
@@ -260,9 +346,11 @@ const HELP_TEXT = [
   "/logout — выйти",
 ].join("\n");
 
-function greeting(user: AuthedUser): string {
+function greeting(user: AuthedUser, test = false): string {
   return [
-    `✅ Вы вошли как <b>${esc(user.name)}</b>`,
+    test
+      ? `🧪 Тестовый режим: вы смотрите бот глазами <b>${esc(user.name)}</b>`
+      : `✅ Вы вошли как <b>${esc(user.name)}</b>`,
     `Роль: <b>${esc(user.roleLabel)}</b>`,
     `Организация: ${esc(user.orgName)}`,
     "",
@@ -298,7 +386,7 @@ async function handleAiQuestion(ctx: Context, user: AuthedUser, chatId: number, 
     return;
   }
   const newHistory = [...history, { role: "assistant" as const, content: reply }].slice(-10);
-  await writeSession(chatId, { step: "idle", aiHistory: newHistory });
+  await writeSession(chatId, { step: "idle", aiHistory: newHistory, testProfileId: sess.testProfileId });
   // Ответ ИИ — простым текстом (без parse_mode, чтобы спецсимволы не ломали HTML)
   await ctx.reply(reply.slice(0, 4000), {
     reply_markup: new InlineKeyboard().text("📋 Меню", "menu:home"),
@@ -306,7 +394,7 @@ async function handleAiQuestion(ctx: Context, user: AuthedUser, chatId: number, 
 }
 
 // Главное меню — только разделы, доступные роли (RBAC).
-function mainMenu(user: AuthedUser): InlineKeyboard {
+function mainMenu(user: AuthedUser, test = false): InlineKeyboard {
   const kb = new InlineKeyboard();
   if (aiConfigured()) kb.text("🤖 ИИ-ассистент", "menu:ai").row();
   if (can(user.role, "duty:view")) kb.text("📋 Регламент сегодня", "menu:duties").row();
@@ -317,6 +405,7 @@ function mainMenu(user: AuthedUser): InlineKeyboard {
   if (can(user.role, "finance:view")) kb.text("💰 Финансы", "menu:finance").row();
   if (can(user.role, "team:manage")) kb.text("👥 Команда", "menu:team").row();
   if (can(user.role, "dashboard:view")) kb.text("📄 Отчёт PDF за день", "menu:pdf").row();
+  if (test) kb.text("🔄 Сменить сотрудника", "test:switch").row();
   kb.text("🚪 Выйти", "action:logout");
   return kb;
 }
@@ -650,7 +739,14 @@ async function handleStart(ctx: Context): Promise<void> {
   const linked = await getLinkedUser(tgId);
   if (linked) {
     await clearSession(chatId);
-    await ctx.reply(greeting(linked), { parse_mode: "HTML", reply_markup: mainMenu(linked) });
+    const test = isTestTg(tgId);
+    await ctx.reply(greeting(linked, test), { parse_mode: "HTML", reply_markup: mainMenu(linked, test) });
+    return;
+  }
+  // Тестовый аккаунт: вместо логина/пароля — выбор сотрудника кнопками
+  if (isTestTg(tgId)) {
+    const { body, kb } = await renderTestPicker();
+    await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
     return;
   }
   await writeSession(chatId, { step: "await_login" });
@@ -669,14 +765,15 @@ async function handleMenu(ctx: Context): Promise<void> {
     await handleStart(ctx);
     return;
   }
-  await ctx.reply(greeting(linked), { parse_mode: "HTML", reply_markup: mainMenu(linked) });
+  const test = isTestTg(tgId);
+  await ctx.reply(greeting(linked, test), { parse_mode: "HTML", reply_markup: mainMenu(linked, test) });
 }
 
 async function handleLogout(ctx: Context): Promise<void> {
   const tgId = ctx.from?.id;
   const chatId = ctx.chat?.id;
   if (tgId) await unlinkTelegram(tgId);
-  if (chatId != null) await clearSession(chatId);
+  if (chatId != null) await writeSession(chatId, { step: "idle" }); // сброс вместе с тестовым выбором
   await ctx.reply("🚪 Вы вышли из аккаунта. Чтобы войти снова — /start");
 }
 
@@ -696,7 +793,7 @@ async function handleText(ctx: Context): Promise<void> {
         return;
       }
       const result = await completeDuty(linked, sess0.dutyId, text.slice(0, 2000));
-      await writeSession(chatId, { step: "idle", aiHistory: sess0.aiHistory });
+      await writeSession(chatId, { step: "idle", aiHistory: sess0.aiHistory, testProfileId: sess0.testProfileId });
       await ctx.reply(result, { parse_mode: "HTML" });
       const { body, kb } = await renderDuties(linked);
       await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
@@ -706,7 +803,14 @@ async function handleText(ctx: Context): Promise<void> {
       await handleAiQuestion(ctx, linked, chatId, text);
       return;
     }
-    await ctx.reply("Вы уже вошли. Откройте меню: /menu", { reply_markup: mainMenu(linked) });
+    await ctx.reply("Вы уже вошли. Откройте меню: /menu", { reply_markup: mainMenu(linked, isTestTg(tgId)) });
+    return;
+  }
+
+  // Тестовый аккаунт без выбранного сотрудника: логин-флоу не для него
+  if (isTestTg(tgId)) {
+    const { body, kb } = await renderTestPicker();
+    await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
     return;
   }
 
@@ -862,15 +966,47 @@ async function handleCallback(ctx: Context): Promise<void> {
     return;
   }
 
+  // ── Тестовый режим: выбор/смена сотрудника (до проверки «вошёл ли») ──
+  if (data.startsWith("test:")) {
+    if (!isTestTg(tgId) || ctx.chat?.id == null) {
+      await ctx.answerCallbackQuery({ text: "Недоступно", show_alert: true });
+      return;
+    }
+    if (data === "test:switch") {
+      await ctx.answerCallbackQuery();
+      const sess = await readSession(ctx.chat.id);
+      await writeSession(ctx.chat.id, { step: "idle", aiHistory: sess.aiHistory }); // выбор снят
+      const { body, kb } = await renderTestPicker();
+      await editText(ctx, body, kb);
+      return;
+    }
+    if (data.startsWith("test:pick:")) {
+      const profileId = data.slice("test:pick:".length);
+      await writeSession(ctx.chat.id, { step: "idle", testProfileId: profileId });
+      const picked = await getTestUser(tgId);
+      if (!picked) {
+        await ctx.answerCallbackQuery({ text: "Сотрудник не найден", show_alert: true });
+        await writeSession(ctx.chat.id, { step: "idle" });
+        return;
+      }
+      await ctx.answerCallbackQuery({ text: `Вы — ${picked.name}` });
+      await editText(ctx, greeting(picked, true), mainMenu(picked, true));
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
   const user = await getLinkedUser(tgId);
   if (!user) {
     await ctx.answerCallbackQuery({ text: "Сессия истекла. Нажмите /start", show_alert: true });
     return;
   }
+  const test = isTestTg(tgId);
 
   if (data === "action:logout") {
     await unlinkTelegram(tgId);
-    if (ctx.chat?.id != null) await clearSession(ctx.chat.id);
+    if (ctx.chat?.id != null) await writeSession(ctx.chat.id, { step: "idle" });
     await ctx.answerCallbackQuery({ text: "Вы вышли" });
     await editText(ctx, "🚪 Вы вышли из аккаунта. Чтобы войти снова — /start");
     return;
@@ -878,7 +1014,7 @@ async function handleCallback(ctx: Context): Promise<void> {
 
   if (data === "menu:home") {
     await ctx.answerCallbackQuery();
-    await editText(ctx, greeting(user), mainMenu(user));
+    await editText(ctx, greeting(user, test), mainMenu(user, test));
     return;
   }
 

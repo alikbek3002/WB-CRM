@@ -26,12 +26,28 @@ async function main(): Promise<void> {
   process.once("SIGINT", () => void stop("SIGINT"));
   process.once("SIGTERM", () => void stop("SIGTERM"));
 
-  await bot.start({
-    drop_pending_updates: false,
-    allowed_updates: ["message", "callback_query"],
-    onStart: (info) =>
-      console.log(`✓ Бот @${info.username} запущен (long polling). Открой Telegram → /start`),
-  });
+  // Ретрай на 409 Conflict: при деплое старый контейнер ещё держит getUpdates
+  // несколько секунд. Раньше сразу падали → рестарт ВСЕГО контейнера (вместе с
+  // вебом — краткий даунтайм). Теперь ждём и пробуем снова.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await bot.start({
+        drop_pending_updates: false,
+        allowed_updates: ["message", "callback_query"],
+        onStart: (info) =>
+          console.log(`✓ Бот @${info.username} запущен (long polling). Открой Telegram → /start`),
+      });
+      return; // штатная остановка (bot.stop)
+    } catch (e) {
+      const msg = String((e as Error)?.message ?? e);
+      if (msg.includes("409") && attempt < 12) {
+        console.warn(`бот: 409 Conflict (другой инстанс ещё жив), попытка ${attempt}/12 — жду 10с…`);
+        await new Promise((r) => setTimeout(r, 10_000));
+        continue;
+      }
+      throw e;
+    }
+  }
 }
 
 main().catch((e) => {

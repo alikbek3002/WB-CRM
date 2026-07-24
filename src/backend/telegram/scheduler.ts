@@ -174,6 +174,82 @@ async function eveningSummary(now: Date): Promise<void> {
     );
 }
 
+// ── Авто-синк WB (в проде): дёргаем cron-роут веба ──
+// Через HTTP, а не напрямую: работают invalidateWbData и guard параллельных
+// запусков. APP_URL задаётся на хостинге; локально пропускается.
+//
+// Два трека — чтобы не заваливать запросами ни ВБ, ни наш сервер:
+//   • LIVE — остатки/заказы/продажи: инкрементально, часто (по умолч. 30 мин);
+//   • FULL — то же + карточки/цены (полная выгрузка каталога): редко (по умолч. 6 ч).
+// Когда подходит FULL — он тянет и живые данные, поэтому LIVE в этот тик не дублируем.
+// Периоды настраиваются: WB_SYNC_LIVE_MIN (мин, ≥10), WB_SYNC_FULL_HOURS (ч, ≥1).
+function intFromEnv(name: string, def: number, min: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v >= min ? Math.floor(v) : def;
+}
+
+let lastLiveKey = "";
+let lastFullKey = "";
+function autoSyncWb(now: Date): void {
+  const appUrl = process.env.APP_URL;
+  const secret = process.env.CRON_SECRET;
+  if (!appUrl || !secret) return;
+
+  const liveMin = intFromEnv("WB_SYNC_LIVE_MIN", 30, 10);
+  const fullHours = intFromEnv("WB_SYNC_FULL_HOURS", 6, 1);
+  const day = localIsoDate(now);
+  const minsOfDay = now.getHours() * 60 + now.getMinutes();
+  const liveKey = `${day}#live#${Math.floor(minsOfDay / liveMin)}`;
+  const fullKey = `${day}#full#${Math.floor(now.getHours() / fullHours)}`;
+
+  // Первый тик после старта процесса: только запоминаем текущие слоты, синк НЕ
+  // запускаем. Иначе каждый деплой/рестарт стартует синк, который убивается
+  // рестартом контейнера → сирота sync_runs «running» → guard блокирует 502 до
+  // 15 мин (ловили дважды). Данные и так свежие: прошлый слот отработал.
+  if (!lastFullKey) {
+    lastFullKey = fullKey;
+    lastLiveKey = liveKey;
+    return;
+  }
+
+  let mode: "live" | "full" | null = null;
+  if (fullKey !== lastFullKey) {
+    mode = "full";
+    lastFullKey = fullKey;
+    lastLiveKey = liveKey; // полный синк покрывает и живые данные — LIVE не дублируем
+  } else if (liveKey !== lastLiveKey) {
+    mode = "live";
+    lastLiveKey = liveKey;
+  }
+  if (!mode) return;
+
+  console.log(`[scheduler] запускаю WB-синк (${mode})…`);
+  fetch(`${appUrl.replace(/\/$/, "")}/api/cron/wb-sync?mode=${mode}`, {
+    headers: { authorization: `Bearer ${secret}` },
+    signal: AbortSignal.timeout(590_000),
+  })
+    .then((r) => console.log(`[scheduler] WB-синк (${mode}):`, r.status))
+    .catch((e) => console.error(`[scheduler] WB-синк (${mode}):`, e?.message ?? e));
+}
+
+// ── Раз в час: персист авто-статуса «Приехал» у поставок в пути >15 дн ──
+// (интерфейс и так показывает derived-on-read; cron фиксирует статус в БД)
+let lastArriveKey = "";
+function autoSupplyArrive(now: Date): void {
+  const appUrl = process.env.APP_URL;
+  const secret = process.env.CRON_SECRET;
+  if (!appUrl || !secret) return;
+  const key = `${localIsoDate(now)}T${now.getHours()}`;
+  if (key === lastArriveKey) return;
+  const first = !lastArriveKey;
+  lastArriveKey = key;
+  if (first) return; // первый тик после старта — пропуск (как в autoSyncWb)
+  fetch(`${appUrl.replace(/\/$/, "")}/api/cron/supply-auto-arrive`, {
+    headers: { authorization: `Bearer ${secret}` },
+    signal: AbortSignal.timeout(30_000),
+  }).catch((e) => console.error("[scheduler] supply-arrive:", e?.message ?? e));
+}
+
 // Один тик планировщика (безопасен к повторным вызовам)
 export async function schedulerTick(): Promise<void> {
   const now = new Date();
@@ -185,4 +261,6 @@ export async function schedulerTick(): Promise<void> {
   await morningDigest(now).catch((e) => console.error("[scheduler] morning:", e));
   await deadlineReminders(now).catch((e) => console.error("[scheduler] remind:", e));
   await eveningSummary(now).catch((e) => console.error("[scheduler] evening:", e));
+  autoSyncWb(now);
+  autoSupplyArrive(now);
 }

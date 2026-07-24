@@ -100,7 +100,23 @@ export const getSession = cache(async (): Promise<Session> => {
     }
   }
 
-  // 2) Демо-переключатель ролей (cookie)
+  // 2) Демо-переключатель ролей (cookie) — ТОЛЬКО при ALLOW_DEMO=1 (локальная
+  // разработка/демо). На проде выключено: без входа нет данных — (app)/layout
+  // редиректит на /login, а API-роуты режутся can() (у viewer-заглушки нет прав
+  // на мутации; страницы до неё не доходят).
+  if (process.env.ALLOW_DEMO !== "1") {
+    return {
+      // Роль вне матрицы прав: can() отдаёт false на ЛЮБОЕ право (включая view),
+      // поэтому прямые GET к /api/* без входа получают 403, а не данные.
+      user: { id: "anonymous", name: "Гость", email: "" },
+      role: "anonymous" as MemberRole,
+      roleLabel: "Гость",
+      org: { id: DEMO_ORG_ID, name: "—" },
+      isDemo: false,
+      authenticated: false,
+    };
+  }
+
   const cookieStore = await cookies();
   const rawRole = cookieStore.get(DEMO_ROLE_COOKIE)?.value ?? "owner";
   const role: MemberRole = isMemberRole(rawRole) ? rawRole : "owner";

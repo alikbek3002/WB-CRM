@@ -24,7 +24,10 @@ export const dataSource = () => (getSupabaseAdmin() ? "supabase" : "mock");
 export const WB_DATA_TAG = "wb-data";
 
 // Сколько переиспользовать результат чтения между навигациями (сек).
-const READ_TTL_SECONDS = 120;
+// 30 мин — в такт авто-синку WB: каждый синк сбрасывает тег и тут же прогревает
+// кэш заново (warmReadCache), а любая мутация инвалидирует тегом. Поэтому юзер
+// практически никогда не попадает на холодный рендер тяжёлых агрегатов.
+const READ_TTL_SECONDS = 1800;
 
 // БД настроена → реальные данные (пустая БД = нули); нет БД → демо-режим.
 // Без кэша — для функций, которые ПИШУТ в БД при чтении или зависят от юзера/даты.
@@ -152,6 +155,30 @@ export const getDesignRequests = () =>
 
 export const getMyDuties = (userId: string) =>
   fromDb((client) => db.getMyDuties(client, userId), () => []);
+
+// Прогрев кэша чтения: пересчитать все кэшируемые геттеры (после revalidateTag
+// они выполнят реальные запросы). Зовётся из cron-роута синка WB — к моменту,
+// когда юзер откроет вкладку, тяжёлые агрегаты уже тёплые. Ошибки не роняют
+// синк (allSettled): прогрев — оптимизация, не обязательство.
+export async function warmReadCache(): Promise<{ ms: number; failed: number }> {
+  const t = Date.now();
+  const results = await Promise.allSettled([
+    getDashboardData(),
+    getProductList(),
+    getFinanceRows(),
+    getSalesPlanView(),
+    getTasks(),
+    getIntegrations(),
+    getTariffs(),
+    getRnpProducts(),
+    getTeam(),
+    getFactories(),
+    getSupplies(),
+    getFulfillment(),
+    getStocksOverview(),
+  ]);
+  return { ms: Date.now() - t, failed: results.filter((r) => r.status === "rejected").length };
+}
 
 export const getReportsBoard = (date?: string) =>
   fromDb(

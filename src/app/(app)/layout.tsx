@@ -1,3 +1,4 @@
+import { redirect } from "next/navigation";
 import { AppHeader } from "@/frontend/components/layout/app-header";
 import { AppSidebar } from "@/frontend/components/layout/app-sidebar";
 import { ChatWidget } from "@/frontend/components/ai/chat-widget";
@@ -11,6 +12,12 @@ export default async function AppLayout({
   children: React.ReactNode;
 }) {
   const session = await getSession();
+
+  // Без входа приложение недоступно. anonymous появляется только когда
+  // ALLOW_DEMO выключен (прод) и пользователь не авторизован.
+  if (!session.authenticated && session.user.id === "anonymous") {
+    redirect("/login");
+  }
 
   return (
     <div className="flex h-svh overflow-hidden">
