@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
 import { runWbSync, type WbSyncSource } from "@/backend/wb/sync";
 import { invalidateWbData } from "@/backend/data/revalidate";
-import { warmReadCache } from "@/backend/data";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -32,11 +31,9 @@ export async function GET(request: Request) {
     mode === "live" ? ["stocks", "orders", "sales"] : undefined;
 
   const result = await runWbSync(admin, 2, 3, sources);
-  if (result.ok) {
-    invalidateWbData(); // свежие заказы/остатки видно сразу
-    // Прогрев: юзер открывает вкладки уже с тёплым кэшем (без холодных 5-9с рендеров)
-    const warm = await warmReadCache();
-    console.log(`[wb-sync] кэш прогрет за ${warm.ms}мс (ошибок: ${warm.failed})`);
-  }
+  // Прогрев кэша здесь НЕ делаем: revalidateTag сбрасывает тег в конце ЭТОГО
+  // запроса, прогретое выбрасывается. Планировщик бота после синка дёргает
+  // отдельный /api/cron/warm — там прогрев реально сохраняется.
+  if (result.ok) invalidateWbData(); // свежие заказы/остатки видно сразу
   return NextResponse.json(result, { status: result.ok ? 200 : 502 });
 }

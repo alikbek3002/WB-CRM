@@ -156,28 +156,35 @@ export const getDesignRequests = () =>
 export const getMyDuties = (userId: string) =>
   fromDb((client) => db.getMyDuties(client, userId), () => []);
 
-// Прогрев кэша чтения: пересчитать все кэшируемые геттеры (после revalidateTag
-// они выполнят реальные запросы). Зовётся из cron-роута синка WB — к моменту,
-// когда юзер откроет вкладку, тяжёлые агрегаты уже тёплые. Ошибки не роняют
-// синк (allSettled): прогрев — оптимизация, не обязательство.
+// Прогрев кэша чтения: пересчитать все кэшируемые геттеры, чтобы юзер открывал
+// вкладки уже с тёплым кэшем. ВАЖНО: звать из ОТДЕЛЬНОГО запроса ПОСЛЕ синка
+// (/api/cron/warm), а не из запроса, где был revalidateTag — Next сбрасывает
+// тег в конце того запроса, и прогретое тут же выбрасывается (ловили вживую).
+// Партиями по 4 — тринадцать параллельных геттеров устраивали шторм запросов
+// к Supabase и ловили statement timeout.
 export async function warmReadCache(): Promise<{ ms: number; failed: number }> {
   const t = Date.now();
-  const results = await Promise.allSettled([
-    getDashboardData(),
-    getProductList(),
-    getFinanceRows(),
-    getSalesPlanView(),
-    getTasks(),
-    getIntegrations(),
-    getTariffs(),
-    getRnpProducts(),
-    getTeam(),
-    getFactories(),
-    getSupplies(),
-    getFulfillment(),
-    getStocksOverview(),
-  ]);
-  return { ms: Date.now() - t, failed: results.filter((r) => r.status === "rejected").length };
+  const getters = [
+    getDashboardData,
+    getRnpProducts,
+    getProductList,
+    getStocksOverview,
+    getFinanceRows,
+    getSalesPlanView,
+    getTasks,
+    getIntegrations,
+    getTariffs,
+    getTeam,
+    getFactories,
+    getSupplies,
+    getFulfillment,
+  ];
+  let failed = 0;
+  for (let i = 0; i < getters.length; i += 4) {
+    const results = await Promise.allSettled(getters.slice(i, i + 4).map((g) => g()));
+    failed += results.filter((r) => r.status === "rejected").length;
+  }
+  return { ms: Date.now() - t, failed };
 }
 
 export const getReportsBoard = (date?: string) =>

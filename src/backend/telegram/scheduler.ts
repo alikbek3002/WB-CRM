@@ -224,11 +224,22 @@ function autoSyncWb(now: Date): void {
   if (!mode) return;
 
   console.log(`[scheduler] запускаю WB-синк (${mode})…`);
-  fetch(`${appUrl.replace(/\/$/, "")}/api/cron/wb-sync?mode=${mode}`, {
+  const base = appUrl.replace(/\/$/, "");
+  fetch(`${base}/api/cron/wb-sync?mode=${mode}`, {
     headers: { authorization: `Bearer ${secret}` },
     signal: AbortSignal.timeout(590_000),
   })
-    .then((r) => console.log(`[scheduler] WB-синк (${mode}):`, r.status))
+    .then(async (r) => {
+      console.log(`[scheduler] WB-синк (${mode}):`, r.status);
+      if (!r.ok) return;
+      // Прогрев кэша ОТДЕЛЬНЫМ запросом: revalidateTag синка сбрасывает тег в
+      // конце своего запроса — греть можно только после его завершения.
+      const warm = await fetch(`${base}/api/cron/warm`, {
+        headers: { authorization: `Bearer ${secret}` },
+        signal: AbortSignal.timeout(120_000),
+      });
+      console.log(`[scheduler] прогрев кэша:`, warm.status);
+    })
     .catch((e) => console.error(`[scheduler] WB-синк (${mode}):`, e?.message ?? e));
 }
 

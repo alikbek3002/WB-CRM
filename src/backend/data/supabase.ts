@@ -57,6 +57,25 @@ function dayLabel(iso: string) {
   return `${d}.${m}`;
 }
 
+// PostgREST режет ЛЮБОЙ ответ (включая rpc!) до 1000 строк — большие выборки
+// тянем страницами через .range() до неполной страницы. Без этого agg_rnp_daily
+// (~4.5k строк) и agg_stock_sizes (~1.4k) молча теряли данные.
+async function rpcAll<T>(
+  db: SupabaseClient,
+  fn: string,
+  args: Record<string, unknown>,
+): Promise<T[]> {
+  const PAGE = 1000;
+  const all: T[] = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await db.rpc(fn, args).range(from, from + PAGE - 1);
+    if (error) throw new Error(`${fn}: ${error.message}`);
+    const rows = (data ?? []) as T[];
+    all.push(...rows);
+    if (rows.length < PAGE) return all;
+  }
+}
+
 const MONTHS_RU = [
   "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
   "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
@@ -910,24 +929,23 @@ export async function getRnpProducts(
   const windowStart = new Date(curMonday);
   windowStart.setDate(windowStart.getDate() - 28); // 5 недель окно
 
-  // Заказы/продажи/остатки — дневные агрегаты в Postgres (rpc 0016): с реальными
-  // объёмами WB сырые строки не тянем (PostgREST режет выборку до 1000).
-  const [plansRes, stockRes, rnpRes, funnelRes, advertRes] = await Promise.all([
+  // Заказы/продажи/остатки — дневные агрегаты в Postgres (rpc 0016/0022).
+  // agg_rnp_daily (~4.5k строк) и agg_stock_sizes (~1.4k) — через rpcAll:
+  // PostgREST режет и rpc-ответы до 1000 строк (терялись данные РНП!).
+  type StockSizeRow = { product_id: string; size: string | null; on_stock: number; in_transit: number; in_production: number };
+  type RnpDailyRow = { nm_id: number; day: string; orders_qty: number; orders_sum: number; sales_qty: number; sales_sum: number; spp_avg: number };
+  const [plansRes, stock, rnpDaily, funnelRes, advertRes] = await Promise.all([
     db.from("rnp_plans").select("product_id, iso_year, iso_week, plan_orders, plan_sales, plan_views, giveaways").in("product_id", pids),
-    db.rpc("agg_stock_sizes", { p_store: DEMO_STORE_ID }),
-    db.rpc("agg_rnp_daily", { p_store: DEMO_STORE_ID, p_since: windowStart.toISOString() }),
+    rpcAll<StockSizeRow>(db, "agg_stock_sizes", { p_store: DEMO_STORE_ID }),
+    rpcAll<RnpDailyRow>(db, "agg_rnp_daily", { p_store: DEMO_STORE_ID, p_since: windowStart.toISOString() }),
     db.from("raw_funnel_daily").select("nm_id, stat_date, open_card_count, add_to_cart_count, orders_count, buyouts_count").eq("store_id", DEMO_STORE_ID).gte("stat_date", isoDate(windowStart)),
     db.from("raw_advert_daily").select("nm_id, stat_date, views, clicks, sum").eq("store_id", DEMO_STORE_ID).gte("stat_date", isoDate(windowStart)),
   ]);
 
-  for (const res of [plansRes, stockRes, rnpRes, funnelRes, advertRes]) {
+  for (const res of [plansRes, funnelRes, advertRes]) {
     if (res.error) throw res.error;
   }
   const plans = plansRes.data ?? [];
-  type StockSizeRow = { product_id: string; size: string | null; on_stock: number; in_transit: number; in_production: number };
-  const stock = (stockRes.data ?? []) as StockSizeRow[];
-  type RnpDailyRow = { nm_id: number; day: string; orders_qty: number; orders_sum: number; sales_qty: number; sales_sum: number; spp_avg: number };
-  const rnpDaily = (rnpRes.data ?? []) as RnpDailyRow[];
   const funnel = funnelRes.data ?? [];
   const advert = advertRes.data ?? [];
 

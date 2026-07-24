@@ -373,6 +373,19 @@ export async function runWbSync(
     );
   }, counts, errors);
 
+  // ── Кэш дневных агрегатов (0022): тяжёлая агрегация raw_* один раз здесь,
+  // страницы читают готовую мини-таблицу мгновенно ─────────────────────────
+  if (want.has("orders") || want.has("sales")) {
+    await runSource(db, "aggregates", null, async () => {
+      const { data, error } = await db.rpc("refresh_agg_daily", {
+        p_store: DEMO_STORE_ID,
+        p_days: 60,
+      });
+      if (error) throw new Error(error.message);
+      return Number(data ?? 0);
+    }, counts, errors);
+  }
+
   // ── Статус интеграции ────────────────────────────────────────────────────
   const meta = decodeTokenMeta(token);
   await db.from("integration_credentials").upsert(
