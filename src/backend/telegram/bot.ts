@@ -289,8 +289,86 @@ function esc(s: unknown): string {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+// Текст от ИИ безопасно превращаем в Telegram-HTML: экранируем ВСЁ, затем
+// возвращаем только разрешённые теги. Так случайная «<» в ответе модели не
+// ломает сообщение (Telegram отвергает битый HTML целиком).
+const TG_TAGS = ["b", "strong", "i", "em", "u", "s", "code"];
+function sanitizeTgHtml(raw: string): string {
+  let out = esc(raw);
+  for (const tag of TG_TAGS) {
+    out = out
+      .replace(new RegExp(`&lt;${tag}&gt;`, "gi"), `<${tag}>`)
+      .replace(new RegExp(`&lt;/${tag}&gt;`, "gi"), `</${tag}>`);
+  }
+  return out;
+}
+
+// Ответ ИИ с разметкой; при любой проблеме с HTML — отправляем чистым текстом,
+// чтобы сообщение дошло в любом случае.
+async function replyRich(
+  ctx: Context,
+  text: string,
+  keyboard?: InlineKeyboard,
+): Promise<void> {
+  const body = text.slice(0, 3900);
+  try {
+    await ctx.reply(sanitizeTgHtml(body), {
+      parse_mode: "HTML",
+      reply_markup: keyboard,
+      link_preview_options: { is_disabled: true },
+    });
+  } catch (e) {
+    console.error("[telegram] HTML-ответ отклонён, шлю текстом:", e);
+    await ctx.reply(body.replace(/<[^>]{1,20}>/g, ""), { reply_markup: keyboard });
+  }
+}
+
+// ── Человеческие даты и приоритеты (читаемость списков) ────────────────────
+
+const MONTHS_SHORT = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
+
+// Разница в днях от сегодня (локальные сутки, пояс UTC+5/6)
+function daysUntil(iso: string): number {
+  const [y, m, d] = iso.slice(0, 10).split("-").map(Number);
+  const target = new Date(y, (m ?? 1) - 1, d ?? 1);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return Math.round((target.getTime() - today.getTime()) / 86_400_000);
+}
+
+// «⏰ сегодня» / «🔴 просрочено на 3 дн» / «⏰ до 27 июл»
+function dueLabel(iso: string | null): string {
+  if (!iso) return "";
+  const diff = daysUntil(iso);
+  if (diff < 0) return `🔴 просрочено на ${-diff} дн`;
+  if (diff === 0) return "⏰ сегодня";
+  if (diff === 1) return "⏰ завтра";
+  const [, m, d] = iso.slice(0, 10).split("-").map(Number);
+  return `⏰ до ${d} ${MONTHS_SHORT[(m ?? 1) - 1]}`;
+}
+
+const PRIORITY_EMOJI: Record<string, string> = {
+  urgent: "🔥",
+  high: "❗️",
+  normal: "▪️",
+  low: "▫️",
+};
+
+// Обрезка длинного названия для кнопки (лимит Telegram — 64 символа)
+function short(s: string, max = 28): string {
+  return s.length <= max ? s : s.slice(0, max - 1) + "…";
+}
+
+// Разделитель между смысловыми блоками сообщения
+const RULE = "──────────";
+
 function rub(n: number): string {
-  return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(n)) + " ₽";
+  return num(n) + " ₽";
+}
+
+// Количества тоже с разделителями разрядов: «131 809 шт», а не «131809 шт»
+function num(n: number): string {
+  return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(n));
 }
 
 const TASK_STATUS: Record<string, string> = {
@@ -392,6 +470,7 @@ async function handleAiQuestion(ctx: Context, user: AuthedUser, chatId: number, 
       snapshot,
       history,
       db: admin(), // инструменты-действия доступны и из Telegram
+      channel: "telegram", // короткие блоки, эмодзи, <b> вместо Markdown
     });
   } catch (e) {
     console.error("[telegram] AI ошибка:", e);
@@ -400,10 +479,8 @@ async function handleAiQuestion(ctx: Context, user: AuthedUser, chatId: number, 
   }
   const newHistory = [...history, { role: "assistant" as const, content: reply }].slice(-10);
   await writeSession(chatId, { step: "idle", aiHistory: newHistory, testProfileId: sess.testProfileId });
-  // Ответ ИИ — простым текстом (без parse_mode, чтобы спецсимволы не ломали HTML)
-  await ctx.reply(reply.slice(0, 4000), {
-    reply_markup: new InlineKeyboard().text("📋 Меню", "menu:home"),
-  });
+  // Разметка модели пропускается через белый список тегов (см. replyRich)
+  await replyRich(ctx, reply, new InlineKeyboard().text("📋 Меню", "menu:home"));
 }
 
 // Главное меню — только разделы, доступные роли (RBAC).
@@ -456,23 +533,48 @@ async function renderTasks(user: AuthedUser): Promise<{ body: string; kb: Inline
 
   if (error) return { body: "⚠️ Не удалось загрузить задачи.", kb: backKeyboard() };
   const tasks = (data ?? []) as unknown as TaskRow[];
-  if (!tasks.length) {
-    return { body: "🗒 <b>Мои задачи</b>\n\nНазначенных задач нет — можно выдохнуть 🙂", kb: backKeyboard() };
+  const active = tasks.filter((t) => t.status !== "done" && t.status !== "cancelled");
+  if (!active.length) {
+    return {
+      body: "🗒 <b>Мои задачи</b>\n\n✅ Открытых задач нет — можно выдохнуть 🙂",
+      kb: backKeyboard(),
+    };
   }
 
-  const lines = ["🗒 <b>Мои задачи</b>", ""];
-  tasks.forEach((t, i) => {
-    const prod = t.product?.title ? ` · ${esc(t.product.title)}` : "";
-    const due = t.due_date ? ` · до ${esc(t.due_date)}` : "";
-    lines.push(`<b>#${i + 1}</b> ${TASK_STATUS[t.status] ?? esc(t.status)} — ${esc(t.title)}`);
-    lines.push(`   приоритет: ${TASK_PRIORITY[t.priority] ?? esc(t.priority)}${prod}${due}`);
-  });
+  // Группируем: сначала горит, потом в работе, потом остальное — так видно,
+  // за что хвататься, без чтения всего списка.
+  const overdue = active.filter((t) => t.due_date && daysUntil(t.due_date) < 0);
+  const rest = active.filter((t) => !overdue.includes(t));
+  const inProgress = rest.filter((t) => t.status === "in_progress");
+  const open = rest.filter((t) => t.status === "open");
 
+  const lines = [`🗒 <b>Мои задачи</b> · ${active.length}`];
+
+  const block = (title: string, items: TaskRow[]) => {
+    if (!items.length) return;
+    lines.push("", title);
+    for (const t of items) {
+      const meta = [dueLabel(t.due_date), t.product?.title ? `📦 ${esc(t.product.title)}` : ""]
+        .filter(Boolean)
+        .join(" · ");
+      lines.push("", `${PRIORITY_EMOJI[t.priority] ?? "▪️"} <b>${esc(t.title)}</b>`);
+      if (meta) lines.push(`     ${meta}`);
+    }
+  };
+
+  block(`🔴 <b>ПРОСРОЧЕНО</b> — ${overdue.length}`, overdue);
+  block(`🟡 <b>В РАБОТЕ</b> — ${inProgress.length}`, inProgress);
+  block(`🔵 <b>ОТКРЫТЫЕ</b> — ${open.length}`, open);
+
+  lines.push("", RULE, "<i>Кнопки ниже. При закрытии попрошу отчёт — можно голосовым.</i>");
+
+  // Кнопки подписаны названием задачи, а не «#1» — не надо сверяться со списком
   const kb = new InlineKeyboard();
-  tasks.forEach((t, i) => {
-    if (t.status === "open") kb.text(`#${i + 1} ▶️ В работу`, `task:${t.id}:start`).row();
-    else if (t.status === "in_progress") kb.text(`#${i + 1} ✅ Завершить`, `task:${t.id}:done`).row();
-  });
+  for (const t of [...overdue, ...inProgress, ...open]) {
+    const label = short(t.title);
+    if (t.status === "open") kb.text(`▶️ ${label}`, `task:${t.id}:start`).row();
+    else kb.text(`✅ ${label}`, `task:${t.id}:done`).row();
+  }
   kb.text("⬅️ В меню", "menu:home");
   return { body: lines.join("\n"), kb };
 }
@@ -506,14 +608,16 @@ async function renderDashboard(_user: AuthedUser): Promise<string> {
     "📊 <b>Сводка магазина</b>",
     "",
     "<b>За 7 дней</b>",
-    `Заказы: ${o7qty} шт · ${rub(o7sum)}`,
-    `Продажи: ${Number(s7row?.qty ?? 0)} шт · ${rub(Number(s7row?.sum_rub ?? 0))}`,
-    `Выкуп: ${buyout(o7qty, Number(s7row?.qty ?? 0))}%`,
+    `🛒 Заказы — <b>${num(o7qty)}</b> шт · ${rub(o7sum)}`,
+    `💰 Продажи — <b>${num(Number(s7row?.qty ?? 0))}</b> шт · ${rub(Number(s7row?.sum_rub ?? 0))}`,
+    `📈 Выкуп — <b>${buyout(o7qty, Number(s7row?.qty ?? 0))}%</b>`,
+    "",
+    RULE,
     "",
     "<b>За 30 дней</b>",
-    `Заказы: ${o30qty} шт · ${rub(o30sum)}`,
-    `Продажи: ${Number(s30row?.qty ?? 0)} шт · ${rub(Number(s30row?.sum_rub ?? 0))}`,
-    `Выкуп: ${buyout(o30qty, Number(s30row?.qty ?? 0))}%`,
+    `🛒 Заказы — <b>${num(o30qty)}</b> шт · ${rub(o30sum)}`,
+    `💰 Продажи — <b>${num(Number(s30row?.qty ?? 0))}</b> шт · ${rub(Number(s30row?.sum_rub ?? 0))}`,
+    `📈 Выкуп — <b>${buyout(o30qty, Number(s30row?.qty ?? 0))}%</b>`,
   ].join("\n");
 }
 
@@ -545,17 +649,35 @@ async function renderDuties(user: AuthedUser): Promise<{ body: string; kb: Inlin
   if (!rows.length) {
     return { body: "📋 <b>Регламент сегодня</b>\n\nЗадач на сегодня нет.", kb: backKeyboard() };
   }
-  const icon: Record<string, string> = { pending: "🔵", done: "✅", missed: "🔴" };
-  const lines = ["📋 <b>Регламент сегодня</b>", ""];
-  rows.forEach((r, i) => {
-    const time = new Date(r.due_at).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
-    lines.push(`<b>#${i + 1}</b> ${icon[r.status] ?? "•"} ${esc(dutyTitle(r))} — до ${time}`);
-  });
-  lines.push("", "Нажмите «Выполнено» — попрошу короткий отчёт текстом.");
+  const done = rows.filter((r) => r.status === "done");
+  const left = rows.filter((r) => r.status !== "done");
+  const lines = [`📋 <b>Регламент сегодня</b> · сделано ${done.length} из ${rows.length}`];
+
+  if (left.length) {
+    lines.push("", "<b>ОСТАЛОСЬ</b>");
+    for (const r of left) {
+      const dueMs = new Date(r.due_at).getTime();
+      const time = new Date(r.due_at).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+      const late = dueMs < Date.now();
+      const mins = Math.round((dueMs - Date.now()) / 60_000);
+      const when = late
+        ? "🔴 срок вышел"
+        : mins <= 60
+          ? `⏰ осталось ${mins} мин`
+          : `⏰ до ${time}`;
+      lines.push("", `${late ? "🔴" : "🔵"} <b>${esc(dutyTitle(r))}</b>`, `     ${when}`);
+    }
+  }
+  if (done.length) {
+    lines.push("", "<b>ГОТОВО</b>");
+    for (const r of done) lines.push(`✅ <s>${esc(dutyTitle(r))}</s>`);
+  }
+  lines.push("", RULE, "<i>Нажмите «Выполнено» — попрошу короткий отчёт (можно голосовым).</i>");
+
   const kb = new InlineKeyboard();
-  rows.forEach((r, i) => {
-    if (r.status !== "done") kb.text(`#${i + 1} ✅ Выполнено`, `duty:${r.id}`).row();
-  });
+  for (const r of left) {
+    kb.text(`✅ ${short(dutyTitle(r))}`, `duty:${r.id}`).row();
+  }
   kb.text("⬅️ В меню", "menu:home");
   return { body: lines.join("\n"), kb };
 }
@@ -614,17 +736,20 @@ async function renderSupplies(user: AuthedUser): Promise<string> {
   const counts: Record<string, number> = {};
   rows.forEach((r) => (counts[r.eff] = (counts[r.eff] ?? 0) + 1));
 
-  const lines = ["🚚 <b>Поставки</b>", "", "<b>По статусам:</b>"];
-  Object.entries(counts).forEach(([st, n]) => lines.push(`${SUPPLY_STATUS_LABELS[st] ?? st}: ${n}`));
-  lines.push("", "<b>Последние отгрузки:</b>");
+  const lines = ["🚚 <b>Поставки</b>", "", "<b>ПО СТАТУСАМ</b>"];
+  Object.entries(counts).forEach(([st, n]) =>
+    lines.push(`${SUPPLY_STATUS_LABELS[st] ?? st} — <b>${n}</b>`),
+  );
+  lines.push("", RULE, "", "<b>ПОСЛЕДНИЕ ОТГРУЗКИ</b>");
   rows.slice(0, 8).forEach((r) => {
     const extra =
       r.eff === "in_transit"
-        ? ` · ${daysSince(r.ship_date)} дн в пути`
+        ? `🕐 ${daysSince(r.ship_date)} дн в пути`
         : r.received_qty != null && r.received_qty < r.quantity
-          ? ` · ⚠️ недостача ${r.quantity - r.received_qty}`
+          ? `⚠️ недостача ${r.quantity - r.received_qty} шт`
           : "";
-    lines.push(`• ${esc(r.title)} — ${r.quantity} шт · ${SUPPLY_STATUS_LABELS[r.eff] ?? r.eff}${extra}`);
+    lines.push("", `📦 <b>${esc(r.title)}</b> — ${num(r.quantity)} шт`);
+    lines.push(`     ${SUPPLY_STATUS_LABELS[r.eff] ?? r.eff}${extra ? ` · ${extra}` : ""}`);
   });
   return lines.join("\n");
 }
@@ -641,14 +766,19 @@ async function renderProducts(user: AuthedUser): Promise<string> {
   if (error) throw error;
   const rows = (data ?? []) as Array<{ title: string; status: string | null; cost_price: number | null }>;
   if (!rows.length) return "📦 <b>Товары</b>\n\nКарточек товаров нет.";
-  const lines = ["📦 <b>Товары</b>", ""];
-  rows.forEach((p) =>
-    lines.push(
-      `• ${esc(p.title)}${p.status ? ` · ${esc(p.status)}` : ""}${
-        p.cost_price != null ? ` · себест. ${rub(Number(p.cost_price))}` : ""
-      }`,
-    ),
-  );
+  const lines = [`📦 <b>Товары</b> · показано ${rows.length}`, ""];
+  rows.forEach((p) => {
+    const meta = [
+      p.status ? esc(p.status) : "",
+      p.cost_price != null ? `себест. ${rub(Number(p.cost_price))}` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    lines.push(`📦 <b>${esc(p.title)}</b>`);
+    if (meta) lines.push(`     ${meta}`);
+    lines.push("");
+  });
+  lines.push(RULE, "<i>Подробные цифры по товару — спросите текстом или голосом.</i>");
   return lines.join("\n");
 }
 
@@ -685,15 +815,23 @@ async function renderFinance(_user: AuthedUser): Promise<string> {
   const pct = planToDate ? Math.round((fact / planToDate) * 100) : 0;
   const needDaily = Math.max(0, Math.round((amount - fact) / Math.max(1, totalDays - passed)));
 
+  // Светофор по выполнению плана — видно с одного взгляда
+  const mark = pct >= 100 ? "🟢" : pct >= 90 ? "🟡" : "🔴";
   return [
     "💰 <b>Финансы · план WB</b>",
-    `Период: ${esc(start)} — ${esc(end)}`,
+    `<i>${esc(start)} — ${esc(end)}</i>`,
     "",
-    `План на период: ${rub(amount)}`,
-    `Факт с начала: ${rub(fact)}`,
-    `Выполнение на сегодня: <b>${pct}%</b>`,
-    `Сегодня продано: ${rub(todayFact)} (план ${rub(dailyPlan)}/дн)`,
-    `Нужно в день до конца: ${rub(needDaily)}`,
+    `${mark} Выполнение на сегодня — <b>${pct}%</b>`,
+    "",
+    `🎯 План на период — ${rub(amount)}`,
+    `✅ Факт с начала — <b>${rub(fact)}</b>`,
+    "",
+    RULE,
+    "",
+    `📅 Сегодня продано — <b>${rub(todayFact)}</b>`,
+    `     план ${rub(dailyPlan)}/день`,
+    "",
+    `🚀 Нужно в день до конца — <b>${rub(needDaily)}</b>`,
   ].join("\n");
 }
 
@@ -710,11 +848,14 @@ async function renderTeam(user: AuthedUser): Promise<string> {
   if (!rows.length) return "👥 <b>Команда</b>\n\nУчастников нет.";
   const rank: Record<string, number> = { owner: 0, admin: 1, manager: 2, analyst: 3, viewer: 4 };
   rows.sort((a, b) => (rank[a.role] ?? 9) - (rank[b.role] ?? 9));
-  const lines = ["👥 <b>Команда</b>", ""];
+  const lines = [`👥 <b>Команда</b> · ${rows.length} чел.`, ""];
   rows.forEach((m) => {
     const label = ROLE_LABELS[m.role as MemberRole] ?? m.role;
-    const login = m.profile?.login ? ` · логин: <code>${esc(m.profile.login)}</code>` : "";
-    lines.push(`• ${esc(m.profile?.full_name ?? "—")} — ${esc(label)}${login}`);
+    lines.push(`👤 <b>${esc(m.profile?.full_name ?? "—")}</b>`);
+    lines.push(
+      `     ${esc(label)}${m.profile?.login ? ` · вход: <code>${esc(m.profile.login)}</code>` : ""}`,
+    );
+    lines.push("");
   });
   return lines.join("\n");
 }
