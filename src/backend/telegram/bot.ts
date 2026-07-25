@@ -15,7 +15,9 @@ import { ROLE_LABELS, can, isMemberRole, type MemberRole } from "../../shared/rb
 import { SUPPLY_AUTO_ARRIVE_DAYS, DEMO_ORG_ID, DEMO_STORE_ID } from "../../shared/constants";
 import { askAssistant, aiConfigured, type ChatMessage } from "../ai/assistant";
 import { buildSnapshot } from "../ai/snapshot";
+import { transcribeTelegramVoice } from "../ai/transcribe";
 import { ensureDutyAssignments, localIsoDate } from "../data/duties-core";
+import { completeTask, startTask } from "../data/tasks-core";
 import { buildDailyReportPdf } from "../reports/daily-pdf";
 
 // ───────────────────────── Supabase-клиенты ─────────────────────────
@@ -52,14 +54,15 @@ async function verifyPassword(email: string, password: string): Promise<boolean>
 
 // ───────────────────────── Состояние диалога входа ─────────────────────────
 
-type Step = "idle" | "await_login" | "await_password" | "await_duty_report";
+type Step = "idle" | "await_login" | "await_password" | "await_duty_report" | "await_task_report";
 type SessionData = {
   step: Step;
   login?: string;
   fails?: number;
   lockUntil?: number;
   aiHistory?: ChatMessage[]; // короткая история диалога с ИИ
-  dutyId?: string; // назначение, по которому ждём текст отчёта
+  dutyId?: string; // назначение регламента, по которому ждём текст отчёта
+  taskId?: string; // задача, по которой ждём текст отчёта (отчёт обязателен)
   testProfileId?: string; // тестовый режим: под каким сотрудником смотрим бот
 };
 
@@ -81,6 +84,7 @@ async function readSession(chatId: number): Promise<SessionData> {
     lockUntil: d.lockUntil,
     aiHistory: d.aiHistory,
     dutyId: d.dutyId,
+    taskId: d.taskId,
     testProfileId: d.testProfileId,
   };
 }
@@ -336,9 +340,17 @@ export const BOT_COMMANDS = [
 ];
 
 const HELP_TEXT = [
-  "🤖 <b>WB CRM — бот</b>",
+  "🤖 <b>WB CRM — бот-помощник</b>",
   "",
-  "Вход по логину и паролю сотрудника. После входа выдаётся меню по вашей роли.",
+  "Вход по логину и паролю сотрудника. После входа можно <b>просто писать боту</b> " +
+    "или отправлять <b>голосовые</b> — он поймёт и сделает.",
+  "",
+  "<b>Примеры:</b>",
+  "• «какие у меня задачи?»",
+  "• «поставь Феликсу задачу обновить фото кимоно до пятницы»",
+  "• «закрой задачу про фото, отчёт: обновил 5 карточек, отправил на модерацию»",
+  "• «что команда сделала сегодня?» (для руководителя)",
+  "• «что скоро закончится на складах?»",
   "",
   "Команды:",
   "/start — вход или главное меню",
@@ -355,7 +367,8 @@ function greeting(user: AuthedUser, test = false): string {
     `Организация: ${esc(user.orgName)}`,
     "",
     aiConfigured()
-      ? "Выберите раздел или просто напишите вопрос — ответит ИИ-ассистент 🤖"
+      ? "💬 Просто напишите или наговорите голосовое — ассистент ответит и сделает: " +
+        "поставит задачу, закроет её с отчётом, покажет цифры.\n\nИли выберите раздел:"
       : "Выберите раздел:",
   ].join("\n");
 }
@@ -777,16 +790,39 @@ async function handleLogout(ctx: Context): Promise<void> {
   await ctx.reply("🚪 Вы вышли из аккаунта. Чтобы войти снова — /start");
 }
 
-async function handleText(ctx: Context): Promise<void> {
+// Единый вход для ЛЮБОГО сообщения сотрудника — печатного или голосового.
+// Порядок: незавершённый шаг (отчёт по задаче/регламенту) → иначе ИИ-агент,
+// который сам решает, ответить или выполнить действие в системе.
+async function handleUserInput(ctx: Context, text: string): Promise<void> {
   const tgId = ctx.from?.id;
   const chatId = ctx.chat?.id;
-  const text = (ctx.message?.text ?? "").trim();
   if (!tgId || chatId == null) return;
 
-  // Уже вошёл: сначала — незавершённые шаги (отчёт по регламенту), затем ИИ.
+  // Уже вошёл: сначала — незавершённые шаги (отчёты), затем ИИ.
   const linked = await getLinkedUser(tgId);
   if (linked) {
     const sess0 = await readSession(chatId);
+
+    // Отчёт по обычной задаче (обязателен — правило tasks-core)
+    if (sess0.step === "await_task_report" && sess0.taskId) {
+      if (!text) {
+        await ctx.reply("Отчёт не может быть пустым — напишите пару предложений о том, что сделано.");
+        return;
+      }
+      const result = await completeTask(
+        admin(),
+        sess0.taskId,
+        { id: linked.id, name: linked.name, role: linked.role, roleLabel: linked.roleLabel },
+        text,
+      );
+      await writeSession(chatId, { step: "idle", aiHistory: sess0.aiHistory, testProfileId: sess0.testProfileId });
+      await ctx.reply(result.ok ? `✅ ${esc(result.message)}` : `⚠️ ${esc(result.message)}`, { parse_mode: "HTML" });
+      const { body, kb } = await renderTasks(linked);
+      await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
+      return;
+    }
+
+    // Отчёт по задаче регламента
     if (sess0.step === "await_duty_report" && sess0.dutyId) {
       if (!text) {
         await ctx.reply("Отчёт не может быть пустым — напишите пару предложений.");
@@ -799,6 +835,7 @@ async function handleText(ctx: Context): Promise<void> {
       await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
       return;
     }
+
     if (aiConfigured() && text) {
       await handleAiQuestion(ctx, linked, chatId, text);
       return;
@@ -881,6 +918,45 @@ async function handleText(ctx: Context): Promise<void> {
   await ctx.reply("Чтобы войти, введите ваш <b>логин</b>:", { parse_mode: "HTML" });
 }
 
+// Обычное текстовое сообщение
+async function handleText(ctx: Context): Promise<void> {
+  await handleUserInput(ctx, (ctx.message?.text ?? "").trim());
+}
+
+// ── Голосовое / аудио / кружочек: распознаём речь и дальше — как текст ──────
+// Claude аудио не принимает, поэтому речь → текст делает Whisper (transcribe.ts).
+// Пароль голосом не принимаем: он ушёл бы во внешний сервис распознавания.
+async function handleVoice(ctx: Context): Promise<void> {
+  const tgId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
+  if (!tgId || chatId == null) return;
+
+  const msg = ctx.message;
+  const media = msg?.voice ?? msg?.audio ?? msg?.video_note;
+  if (!media) return;
+
+  const linked = await getLinkedUser(tgId);
+  if (!linked) {
+    await ctx.reply("Сначала войдите: /start (логин и пароль — текстом).");
+    return;
+  }
+
+  await ctx.replyWithChatAction("typing").catch(() => {});
+  const result = await transcribeTelegramVoice(
+    media.file_id,
+    Number(media.duration ?? 0),
+    ("mime_type" in media && media.mime_type) || "audio/ogg",
+  );
+  if (!result.ok) {
+    await ctx.reply(`🎤 ${result.message}`);
+    return;
+  }
+
+  // Показываем расшифровку — сотрудник видит, что именно услышал бот
+  await ctx.reply(`🎤 <i>${esc(result.text)}</i>`, { parse_mode: "HTML" });
+  await handleUserInput(ctx, result.text);
+}
+
 const SECTION_GUARD: Record<string, Parameters<typeof can>[1]> = {
   tasks: "tasks:view",
   duties: "duty:view",
@@ -923,37 +999,41 @@ async function showSection(ctx: Context, user: AuthedUser, section: string): Pro
   }
 }
 
+// «В работу» — сразу; «Завершить» — только через отчёт (шаг await_task_report).
+// Правила и уведомление руководству живут в data/tasks-core (общие с вебом и ИИ).
 async function changeTaskStatus(
   ctx: Context,
   user: AuthedUser,
   taskId: string,
   action: string,
 ): Promise<void> {
-  const { data: t } = await admin()
-    .from("tasks")
-    .select("id, assignee_id, status, org_id")
-    .eq("id", taskId)
-    .maybeSingle();
-  if (!t || String(t.org_id) !== user.orgId) {
-    await ctx.answerCallbackQuery({ text: "Задача не найдена", show_alert: true });
+  const actor = { id: user.id, name: user.name, role: user.role, roleLabel: user.roleLabel };
+
+  if (action === "done") {
+    if (ctx.chat?.id != null) {
+      const sess = await readSession(ctx.chat.id);
+      await writeSession(ctx.chat.id, { ...sess, step: "await_task_report", taskId });
+    }
+    await ctx.answerCallbackQuery();
+    await ctx.reply(
+      "✍️ Напишите <b>отчёт</b>: что именно сделано (можно голосовым).\n\n" +
+        "<i>Без отчёта задача не закрывается — его увидят директор и старшие менеджеры.</i>",
+      { parse_mode: "HTML" },
+    );
     return;
   }
-  const canEditAny = can(user.role, "team:manage"); // owner/admin — любые задачи
-  const isAssignee = String(t.assignee_id) === user.id;
-  if (!isAssignee && !canEditAny) {
-    await ctx.answerCallbackQuery({ text: "Можно менять только свои задачи", show_alert: true });
-    return;
-  }
-  const next = action === "start" ? "in_progress" : action === "done" ? "done" : null;
-  if (!next) {
+
+  if (action !== "start") {
     await ctx.answerCallbackQuery();
     return;
   }
-  await admin()
-    .from("tasks")
-    .update({ status: next, updated_at: new Date().toISOString() })
-    .eq("id", taskId);
-  await ctx.answerCallbackQuery({ text: next === "done" ? "Задача завершена ✅" : "Взято в работу ▶️" });
+
+  const result = await startTask(admin(), taskId, actor);
+  if (!result.ok) {
+    await ctx.answerCallbackQuery({ text: result.message, show_alert: true });
+    return;
+  }
+  await ctx.answerCallbackQuery({ text: "Взято в работу ▶️" });
   const { body, kb } = await renderTasks(user);
   await editText(ctx, body, kb);
 }
@@ -1023,12 +1103,21 @@ async function handleCallback(ctx: Context): Promise<void> {
     await editText(
       ctx,
       [
-        "🤖 <b>ИИ-ассистент</b>",
+        "🤖 <b>ИИ-помощник</b>",
         "",
-        "Просто напишите вопрос сообщением — отвечу по актуальным данным вашего магазина. Например:",
+        "Отдельно открывать меня не нужно: пишите или наговаривайте <b>голосовое</b> " +
+          "в любой момент — отвечу по актуальным данным и выполню действие.",
+        "",
+        "<b>Спросить:</b>",
         "• Какой товар продаётся лучше всего?",
         "• Что скоро закончится на складах?",
         can(user.role, "finance:view") ? "• Выполняем ли план продаж?" : "• Какие у меня задачи сегодня?",
+        "",
+        "<b>Сделать:</b>",
+        can(user.role, "team:manage")
+          ? "• Поставь Назире задачу проверить SEO до среды"
+          : "• Закрой задачу про отзывы, отчёт: обработала 34 отзыва",
+        can(user.role, "team:manage") ? "• Что команда сделала сегодня?" : "• Какие у меня задачи?",
       ].join("\n"),
       backKeyboard(),
     );
@@ -1129,6 +1218,8 @@ export function createBot(): Bot {
 
   bot.on("callback_query:data", guard(handleCallback));
   bot.on("message:text", guard(handleText));
+  // Голосовые/аудио/кружочки — распознаём и обрабатываем как обычное сообщение
+  bot.on(["message:voice", "message:audio", "message:video_note"], guard(handleVoice));
 
   return bot;
 }

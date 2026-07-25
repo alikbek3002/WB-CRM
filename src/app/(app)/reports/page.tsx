@@ -5,7 +5,7 @@ import { NoAccess } from "@/frontend/components/layout/no-access";
 import { can } from "@/shared/rbac";
 import { cn } from "@/shared/utils";
 import { getSession } from "@/backend/auth/session";
-import { getReportsBoard } from "@/backend/data";
+import { getReportsBoard, getTaskReports } from "@/backend/data";
 
 export const dynamic = "force-dynamic";
 
@@ -31,7 +31,10 @@ export default async function ReportsPage({
 
   const { date } = await searchParams;
   const valid = date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : undefined;
-  const board = await getReportsBoard(valid);
+  const [board, taskReports] = await Promise.all([
+    getReportsBoard(valid),
+    getTaskReports(valid),
+  ]);
 
   const dayLabel = new Date(`${board.date}T12:00:00`).toLocaleDateString("ru-RU", {
     day: "numeric",
@@ -60,7 +63,7 @@ export default async function ReportsPage({
         <div>
           <h1 className="text-xl font-semibold tracking-tight">Отчёты команды</h1>
           <p className="text-sm text-muted-foreground">
-            {dayLabel} · выполнение регламента и отчёты менеджеров
+            {dayLabel} · отчёты по задачам и выполнение регламента
           </p>
         </div>
         <div className="flex items-center gap-2 text-sm">
@@ -91,6 +94,59 @@ export default async function ReportsPage({
           </Card>
         ))}
       </div>
+
+      {/* Отчёты по задачам: что сотрудники написали при закрытии */}
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="flex items-center justify-between text-sm">
+            <span>Отчёты по задачам</span>
+            <span className="text-xs font-normal text-muted-foreground">
+              закрыто за день: {taskReports.length}
+            </span>
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {taskReports.length === 0 && (
+            <p className="py-4 text-center text-sm text-muted-foreground">
+              За этот день задач не закрывали.
+            </p>
+          )}
+          {taskReports.map((t) => (
+            <div key={t.id} className="rounded-lg border border-border/60 px-3 py-2.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-medium">{t.title}</span>
+                <Badge
+                  variant="outline"
+                  className={cn(
+                    "text-[10px]",
+                    t.onTime === false
+                      ? "border-amber-500/50 text-amber-400"
+                      : "border-emerald-500/50 text-emerald-400",
+                  )}
+                >
+                  {t.onTime === false ? "После срока" : "Выполнено"}
+                </Badge>
+                <span className="ml-auto text-xs text-muted-foreground">
+                  {t.assignee} ·{" "}
+                  {new Date(t.completedAt).toLocaleTimeString("ru-RU", {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}
+                </span>
+              </div>
+              {t.report ? (
+                <p className="mt-1.5 whitespace-pre-line text-sm text-muted-foreground">
+                  {t.report}
+                </p>
+              ) : (
+                <p className="mt-1.5 text-xs italic text-muted-foreground">
+                  Закрыта до введения обязательных отчётов
+                </p>
+              )}
+            </div>
+          ))}
+        </CardContent>
+      </Card>
 
       {board.items.length === 0 && (
         <Card>

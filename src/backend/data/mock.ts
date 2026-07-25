@@ -541,14 +541,21 @@ export function getFinanceRows(): FinanceRow[] {
 // ─── Задачи ─────────────────────────────────────────────────────────────────
 
 export function getTasks(): TaskItem[] {
+  const base = {
+    description: null,
+    assigneeId: null,
+    report: null,
+    completedAt: null,
+    completedOnTime: null,
+  };
   return [
-    { id: "t1", title: "Заполнить план РНП на следующую неделю", status: "open", priority: "urgent", assignee: "Марат Менеджеров", dueDate: "2026-07-10", productLabel: null },
-    { id: "t2", title: "Обновить фото карточки — Кимоно", status: "in_progress", priority: "high", assignee: "Алия Сатпаева", dueDate: "2026-07-08", productLabel: "Кимоно" },
-    { id: "t3", title: "Проверить ставки рекламы (ДРР выше 12%)", status: "open", priority: "high", assignee: "Марат Менеджеров", dueDate: "2026-07-07", productLabel: "костюм_гипюр_айвори" },
-    { id: "t4", title: "Отгрузка на Коледино — 120 шт", status: "in_progress", priority: "normal", assignee: "Алия Сатпаева", dueDate: "2026-07-11", productLabel: "Рубашка" },
-    { id: "t5", title: "Пересчитать себестоимость после новой закупки ткани", status: "open", priority: "normal", assignee: "Марат Менеджеров", dueDate: null, productLabel: null },
-    { id: "t6", title: "Ответить на отзывы за неделю", status: "done", priority: "low", assignee: "Алия Сатпаева", dueDate: "2026-07-04", productLabel: null },
-    { id: "t7", title: "Согласовать бюджет рекламы на июль", status: "done", priority: "high", assignee: "Айгерим Директорова", dueDate: "2026-07-01", productLabel: null },
+    { ...base, id: "t1", title: "Заполнить план РНП на следующую неделю", status: "open", priority: "urgent", assignee: "Марат Менеджеров", dueDate: "2026-07-10", productLabel: null },
+    { ...base, id: "t2", title: "Обновить фото карточки — Кимоно", status: "in_progress", priority: "high", assignee: "Алия Сатпаева", dueDate: "2026-07-08", productLabel: "Кимоно" },
+    { ...base, id: "t3", title: "Проверить ставки рекламы (ДРР выше 12%)", status: "open", priority: "high", assignee: "Марат Менеджеров", dueDate: "2026-07-07", productLabel: "костюм_гипюр_айвори" },
+    { ...base, id: "t4", title: "Отгрузка на Коледино — 120 шт", status: "in_progress", priority: "normal", assignee: "Алия Сатпаева", dueDate: "2026-07-11", productLabel: "Рубашка" },
+    { ...base, id: "t5", title: "Пересчитать себестоимость после новой закупки ткани", status: "open", priority: "normal", assignee: "Марат Менеджеров", dueDate: null, productLabel: null },
+    { ...base, id: "t6", title: "Ответить на отзывы за неделю", status: "done", priority: "low", assignee: "Алия Сатпаева", dueDate: "2026-07-04", productLabel: null, report: "Обработала 34 отзыва: 28 положительных, 6 с претензией к размеру — передала в контент правку размерной сетки.", completedAt: "2026-07-04T17:40:00Z", completedOnTime: true },
+    { ...base, id: "t7", title: "Согласовать бюджет рекламы на июль", status: "done", priority: "high", assignee: "Айгерим Директорова", dueDate: "2026-07-01", productLabel: null, report: "Бюджет утверждён: 450 000 ₽, приоритет — топ-5 SKU по марже.", completedAt: "2026-07-01T12:10:00Z", completedOnTime: true },
   ];
 }
 

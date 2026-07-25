@@ -158,11 +158,17 @@ export type FinanceRow = {
 export type TaskItem = {
   id: string;
   title: string;
+  description: string | null;
   status: "open" | "in_progress" | "done";
   priority: "low" | "normal" | "high" | "urgent";
   assignee: string;
+  assigneeId: string | null; // кто может закрывать (исполнитель) — для UI-кнопок
   dueDate: string | null;
   productLabel: string | null;
+  // Отчёт о выполнении (обязателен при закрытии — миграция 0023)
+  report: string | null;
+  completedAt: string | null;
+  completedOnTime: boolean | null; // null — срока не было
 };
 
 export type TeamMember = {
@@ -296,6 +302,17 @@ export type DutyItem = {
 };
 
 // Сводка дня для вкладки «Отчёты» (директор / старший менеджер)
+// Отчёт по закрытой задаче (страница «Отчёты» — руководству)
+export type TaskReportItem = {
+  id: string;
+  title: string;
+  assignee: string;
+  report: string | null;
+  completedAt: string;
+  onTime: boolean | null;
+  dueDate: string | null;
+};
+
 export type ReportsBoard = {
   date: string; // yyyy-mm-dd (выбранный день)
   total: number;

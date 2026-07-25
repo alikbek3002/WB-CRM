@@ -31,6 +31,7 @@ import type {
   SupplyStatus,
   Tariff,
   TaskItem,
+  TaskReportItem,
   TeamMember,
   WarehouseStock,
   WbDistribution,
@@ -524,7 +525,7 @@ export async function getTasks(db: SupabaseClient): Promise<TaskItem[]> {
   const { data, error } = await db
     .from("tasks")
     .select(
-      "id, title, status, priority, due_date, assignee:profiles!tasks_assignee_id_fkey(full_name), product:products(title)",
+      "id, title, description, status, priority, due_date, assignee_id, completion_report, completed_at, completed_on_time, assignee:profiles!tasks_assignee_id_fkey(full_name), product:products(title)",
     )
     .eq("org_id", DEMO_ORG_ID)
     .neq("status", "cancelled")
@@ -538,11 +539,16 @@ export async function getTasks(db: SupabaseClient): Promise<TaskItem[]> {
     return {
       id: t.id as string,
       title: t.title as string,
+      description: (t.description as string) ?? null,
       status: t.status as TaskItem["status"],
       priority: t.priority as TaskItem["priority"],
       assignee: assignee?.full_name ?? "—",
+      assigneeId: (t.assignee_id as string) ?? null,
       dueDate: (t.due_date as string) ?? null,
       productLabel: product?.title ?? null,
+      report: (t.completion_report as string) ?? null,
+      completedAt: (t.completed_at as string) ?? null,
+      completedOnTime: (t.completed_on_time as boolean) ?? null,
     };
   });
 }
@@ -905,6 +911,38 @@ export async function getReportsBoard(
     pending: items.filter((i) => i.status === "pending").length,
     items,
   };
+}
+
+// Отчёты по задачам, закрытым за день (руководству — страница «Отчёты»)
+export async function getTaskReports(
+  db: SupabaseClient,
+  date?: string,
+): Promise<TaskReportItem[]> {
+  const day = date ?? isoDate(new Date());
+  const { data, error } = await db
+    .from("tasks")
+    .select(
+      "id, title, due_date, completion_report, completed_at, completed_on_time, assignee:profiles!tasks_assignee_id_fkey(full_name)",
+    )
+    .eq("org_id", DEMO_ORG_ID)
+    .eq("status", "done")
+    .gte("completed_at", `${day}T00:00:00`)
+    .lte("completed_at", `${day}T23:59:59.999`)
+    .order("completed_at", { ascending: false })
+    .limit(200);
+  if (error) throw error;
+  return (data ?? []).map((t) => {
+    const assignee = t.assignee as { full_name?: string } | null;
+    return {
+      id: t.id as string,
+      title: t.title as string,
+      assignee: assignee?.full_name ?? "—",
+      report: (t.completion_report as string) ?? null,
+      completedAt: t.completed_at as string,
+      onTime: (t.completed_on_time as boolean) ?? null,
+      dueDate: (t.due_date as string) ?? null,
+    };
+  });
 }
 
 // ─── РНП (недельная сетка план/факт из raw_*) ────────────────────────────────

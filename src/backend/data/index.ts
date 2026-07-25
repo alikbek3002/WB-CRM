@@ -187,6 +187,10 @@ export async function warmReadCache(): Promise<{ ms: number; failed: number }> {
   return { ms: Date.now() - t, failed };
 }
 
+// Отчёты по задачам за день — параметризованы датой, без кэша
+export const getTaskReports = (date?: string) =>
+  fromDb((client) => db.getTaskReports(client, date), () => []);
+
 export const getReportsBoard = (date?: string) =>
   fromDb(
     (client) => db.getReportsBoard(client, date),
