@@ -8,19 +8,42 @@
 // Без OPENAI_API_KEY функция не падает: бот вежливо просит написать текстом.
 // Чистый модуль (fetch + относительные импорты) — работает и в боте (tsx).
 
-const OPENAI_URL = "https://api.openai.com/v1/audio/transcriptions";
+// ── Провайдер выбирается автоматически по наличию ключа ─────────────────────
+// GROQ_API_KEY — бесплатный тариф (2000 запросов/сутки), Whisper large-v3-turbo,
+//   API полностью OpenAI-совместим → тот же код, другой базовый URL.
+// OPENAI_API_KEY — платный запасной вариант (~$0.006/мин).
+// Ни одного ключа — бот вежливо просит написать текстом.
+type Provider = { url: string; key: string; model: string; label: string };
 
-// whisper-1 доступен на любом аккаунте OpenAI; при желании можно перевести на
-// gpt-4o-mini-transcribe через env, не трогая код.
-const MODEL = process.env.OPENAI_TRANSCRIBE_MODEL?.trim() || "whisper-1";
+function pickProvider(): Provider | null {
+  const groq = process.env.GROQ_API_KEY?.trim();
+  if (groq) {
+    return {
+      url: "https://api.groq.com/openai/v1/audio/transcriptions",
+      key: groq,
+      model: process.env.TRANSCRIBE_MODEL?.trim() || "whisper-large-v3-turbo",
+      label: "groq",
+    };
+  }
+  const openai = process.env.OPENAI_API_KEY?.trim();
+  if (openai) {
+    return {
+      url: "https://api.openai.com/v1/audio/transcriptions",
+      key: openai,
+      model: process.env.TRANSCRIBE_MODEL?.trim() || process.env.OPENAI_TRANSCRIBE_MODEL?.trim() || "whisper-1",
+      label: "openai",
+    };
+  }
+  return null;
+}
 
-// Голосовые длиннее этого не принимаем: и Whisper-лимит (25 МБ), и здравый
-// смысл — задача голосом обычно укладывается в минуту-две.
+// Голосовые длиннее этого не принимаем: лимит провайдеров (25 МБ у Groq на
+// бесплатном тарифе) и здравый смысл — задача голосом укладывается в пару минут.
 const MAX_BYTES = 20 * 1024 * 1024;
 const MAX_SECONDS = 600;
 
 export function transcribeConfigured(): boolean {
-  return Boolean(process.env.OPENAI_API_KEY?.trim());
+  return pickProvider() !== null;
 }
 
 export type TranscribeResult =
@@ -52,8 +75,8 @@ export async function transcribeTelegramVoice(
   durationSec: number,
   mimeType = "audio/ogg",
 ): Promise<TranscribeResult> {
-  const apiKey = process.env.OPENAI_API_KEY?.trim();
-  if (!apiKey) {
+  const provider = pickProvider();
+  if (!provider) {
     return {
       ok: false,
       reason: "not_configured",
@@ -86,23 +109,28 @@ export async function transcribeTelegramVoice(
   const ext = mimeType.includes("mpeg") ? "mp3" : mimeType.includes("wav") ? "wav" : "ogg";
   const form = new FormData();
   form.append("file", new Blob([audio], { type: mimeType }), `voice.${ext}`);
-  form.append("model", MODEL);
+  form.append("model", provider.model);
   form.append("language", "ru"); // кабинет русскоязычный — точность заметно выше
+  form.append("response_format", "json");
 
   try {
-    const res = await fetch(OPENAI_URL, {
+    const res = await fetch(provider.url, {
       method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}` },
+      headers: { Authorization: `Bearer ${provider.key}` },
       body: form,
       signal: AbortSignal.timeout(120_000),
     });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
-      console.error(`[transcribe] OpenAI ${res.status}:`, body.slice(0, 300));
+      console.error(`[transcribe] ${provider.label} ${res.status}:`, body.slice(0, 300));
+      // 429 у Groq — исчерпан бесплатный дневной лимит: говорим об этом честно
       return {
         ok: false,
         reason: "api_error",
-        message: "Не смог распознать голосовое, попробуйте ещё раз или напишите текстом.",
+        message:
+          res.status === 429
+            ? "Лимит распознавания голоса на сегодня исчерпан — напишите текстом."
+            : "Не смог распознать голосовое, попробуйте ещё раз или напишите текстом.",
       };
     }
     const data = (await res.json()) as { text?: string };
