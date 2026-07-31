@@ -34,6 +34,8 @@ export type Permission =
   | "products:edit" // себестоимость, статусы, группы
   | "finance:view"
   | "finance:plan" // задать план продаж WB на период
+  | "finance:cash" // касса: остатки по счетам, движение денег, ОПиУ
+  | "finance:expense" // вносить расходы/приходы и править кассу
   | "tasks:view" // viewer видит только свои — фильтрация на уровне данных/RLS
   | "team:manage"
   | "integrations:manage" // API-ключи
@@ -64,6 +66,8 @@ const ALL: Permission[] = [
   "products:edit",
   "finance:view",
   "finance:plan",
+  "finance:cash",
+  "finance:expense",
   "tasks:view",
   "team:manage",
   "integrations:manage",
@@ -95,6 +99,8 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
     "products:edit",
     "finance:view",
     "finance:plan",
+    "finance:cash",
+    "finance:expense",
     "tasks:view",
     "factory:view",
     "factory:edit",

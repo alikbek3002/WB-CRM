@@ -155,6 +155,110 @@ export type FinanceRow = {
   profitRub: number;
 };
 
+// ─── Касса и расходы (миграция 0024) ─────────────────────────────────────────
+
+export type CashAccountKind = "cash" | "bank" | "card" | "wb" | "other";
+export type CashTxKind = "in" | "out" | "transfer";
+
+export type CashAccount = {
+  id: string;
+  name: string;
+  kind: CashAccountKind;
+  currency: Currency; // валюта счёта
+  balance: number; // остаток в валюте счёта
+  balanceRub: number; // он же в рублях (по общему курсу)
+  txCount: number;
+  lastTx: string | null; // дата последней операции, yyyy-mm-dd
+};
+
+export type ExpenseCategory = {
+  id: string;
+  name: string;
+  direction: "in" | "out";
+  inPnl: boolean; // влияет ли на прибыль периода
+  emoji: string | null;
+};
+
+export type CashTx = {
+  id: string;
+  kind: CashTxKind;
+  accountId: string;
+  accountName: string;
+  toAccountName: string | null; // для перевода
+  categoryId: string | null;
+  categoryName: string | null;
+  categoryEmoji: string | null;
+  amount: number; // в валюте счёта
+  currency: Currency;
+  amountRub: number;
+  occurredOn: string; // yyyy-mm-dd
+  note: string | null;
+  authorName: string | null;
+  source: "manual" | "bot" | "ai" | "supply_payment" | "wb_payout";
+};
+
+export type CashFlowMonth = {
+  month: string; // yyyy-mm-01
+  label: string; // «Июль»
+  inRub: number;
+  outRub: number;
+};
+
+export type CashOverview = {
+  accounts: CashAccount[];
+  totalRub: number; // всего денег в кассе, ₽
+  monthInRub: number; // приход за текущий месяц
+  monthOutRub: number; // расход за текущий месяц
+  flow: CashFlowMonth[]; // помесячно за последние 6 мес
+  recent: CashTx[]; // лента последних операций
+};
+
+export type ExpenseCategorySlice = {
+  categoryId: string | null;
+  name: string;
+  emoji: string | null;
+  inPnl: boolean;
+  amountRub: number;
+  txCount: number;
+  sharePct: number;
+};
+
+export type ExpensesView = {
+  from: string; // yyyy-mm-dd
+  to: string;
+  totalRub: number; // все расходы периода
+  opexRub: number; // из них влияющих на прибыль
+  categories: ExpenseCategorySlice[];
+  items: CashTx[]; // операции периода (kind = out)
+  monthly: { month: string; label: string; totalRub: number }[];
+};
+
+// ─── ОПиУ (отчёт о прибылях и убытках) ───────────────────────────────────────
+
+export type PnlMonth = {
+  month: string; // yyyy-mm-01
+  label: string; // «Июль 2026»
+  revenueRub: number; // выручка (продажи по цене со скидкой, минус возвраты)
+  wbFeesRub: number; // удержания WB (выручка − к перечислению)
+  cogsRub: number; // себестоимость проданного товара
+  grossRub: number; // валовая прибыль
+  opexRub: number; // операционные расходы (касса, статьи с in_pnl)
+  otherIncomeRub: number; // прочие доходы
+  netRub: number; // чистая прибыль
+  marginPct: number; // рентабельность к выручке
+  qty: number; // продано штук
+  costCoveragePct: number; // % продаж с заполненной себестоимостью
+};
+
+export type PnlView = {
+  months: PnlMonth[]; // от старого к новому
+  total: PnlMonth; // итог за период
+  expenseSlices: ExpenseCategorySlice[]; // расходы периода по статьям
+  costCoveragePct: number; // покрытие себестоимостью за период
+  hasExpenses: boolean; // заведены ли расходы вообще
+  advertSpendRub: number; // расход на рекламу из кабинета WB (если синхронизирован)
+};
+
 export type TaskItem = {
   id: string;
   title: string;

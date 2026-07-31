@@ -6,6 +6,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { DEMO_ORG_ID, DEMO_STORE_ID } from "../../shared/constants";
 import { can, type MemberRole } from "../../shared/rbac";
+import { getCashOverview, getExpensesView, getPnlView } from "../data/cash-core";
 
 export type SnapshotUser = {
   id: string;
@@ -148,6 +149,57 @@ export async function buildSnapshot(
         `- Выполнение плана на сегодня: ${pct}%`,
         `- Нужно продавать в день до конца: ${rub(needDaily)}`,
       ].join("\n");
+    }, "");
+    if (block) sections.push(block);
+  }
+
+  // ── Деньги компании: касса, расходы, прибыль (finance:cash) ──
+  // Директор спрашивает «сколько денег» и «сколько заработали» чаще всего —
+  // держим ответ прямо в снимке, без вызова инструментов.
+  if (can(user.role, "finance:cash")) {
+    const block = await safe(async () => {
+      const [cash, expenses, pnl] = await Promise.all([
+        getCashOverview(db),
+        getExpensesView(db),
+        getPnlView(db, 3),
+      ]);
+      const lines: string[] = [];
+
+      if (cash.accounts.length) {
+        lines.push(
+          `КАССА: всего ${rub(cash.totalRub)} по ${cash.accounts.length} счетам ` +
+            `(${cash.accounts.map((a) => `${a.name} — ${rub(a.balanceRub)}`).join("; ")}).`,
+          `- За текущий месяц пришло ${rub(cash.monthInRub)}, ушло ${rub(cash.monthOutRub)}.`,
+        );
+      } else {
+        lines.push("КАССА: счета не заведены (CRM → Финансы → Касса).");
+      }
+
+      if (expenses.items.length) {
+        const top = expenses.categories
+          .slice(0, 5)
+          .map((c) => `${c.name} ${rub(c.amountRub)} (${c.sharePct}%)`)
+          .join("; ");
+        lines.push(`РАСХОДЫ с начала месяца: ${rub(expenses.totalRub)}. Крупнейшие статьи: ${top}.`);
+      } else {
+        lines.push("РАСХОДЫ: в этом месяце ещё ничего не внесено.");
+      }
+
+      const t = pnl.total;
+      lines.push(
+        `ПРИБЫЛЬ за 3 месяца: выручка ${rub(t.revenueRub)}, удержания WB ${rub(t.wbFeesRub)}, ` +
+          `себестоимость ${rub(t.cogsRub)}, расходы ${rub(t.opexRub)} → чистая прибыль ${rub(t.netRub)} ` +
+          `(рентабельность ${t.marginPct}%).`,
+      );
+      if (pnl.costCoveragePct < 95) {
+        lines.push(
+          `- ОГОВОРКА: себестоимость заполнена у ${pnl.costCoveragePct}% продаж, прибыль завышена.`,
+        );
+      }
+      if (!pnl.hasExpenses) {
+        lines.push("- ОГОВОРКА: расходы компании не внесены, прибыль без них.");
+      }
+      return lines.join("\n");
     }, "");
     if (block) sections.push(block);
   }

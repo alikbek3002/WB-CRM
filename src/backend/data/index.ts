@@ -87,6 +87,74 @@ export const getSalesPlanView = cachedRead(
   }),
 );
 
+// ─── Касса, расходы, ОПиУ ─────────────────────────────────────────────────────
+// Без БД (демо-режим) — честные нули: выдумывать деньги компании нельзя.
+
+export const getCashOverview = cachedRead("cash", db.getCashOverview, () => ({
+  accounts: [],
+  totalRub: 0,
+  monthInRub: 0,
+  monthOutRub: 0,
+  flow: [],
+  recent: [],
+}));
+
+export const getFinanceRefs = cachedRead("finance-refs", db.getFinanceRefs, () => ({
+  accounts: [],
+  categories: [],
+}));
+
+// Параметризованы периодом — кэшируем по ключу периода
+export const getExpensesView = (from?: string, to?: string) =>
+  unstable_cache(
+    () =>
+      fromDb(
+        (client) => db.getExpensesView(client, from, to),
+        () => ({
+          from: from ?? "",
+          to: to ?? "",
+          totalRub: 0,
+          opexRub: 0,
+          categories: [],
+          items: [],
+          monthly: [],
+        }),
+      ),
+    ["wb-data", "expenses", from ?? "", to ?? ""],
+    { revalidate: READ_TTL_SECONDS, tags: [WB_DATA_TAG, `${WB_DATA_TAG}:expenses`] },
+  )();
+
+export const getPnlView = (monthsBack = 6) =>
+  unstable_cache(
+    () =>
+      fromDb(
+        (client) => db.getPnlView(client, monthsBack),
+        () => ({
+          months: [],
+          total: {
+            month: "",
+            label: "Итого",
+            revenueRub: 0,
+            wbFeesRub: 0,
+            cogsRub: 0,
+            grossRub: 0,
+            opexRub: 0,
+            otherIncomeRub: 0,
+            netRub: 0,
+            marginPct: 0,
+            qty: 0,
+            costCoveragePct: 0,
+          },
+          expenseSlices: [],
+          costCoveragePct: 0,
+          hasExpenses: false,
+          advertSpendRub: 0,
+        }),
+      ),
+    ["wb-data", "pnl", String(monthsBack)],
+    { revalidate: READ_TTL_SECONDS, tags: [WB_DATA_TAG, `${WB_DATA_TAG}:pnl`] },
+  )();
+
 export const getTasks = cachedRead("tasks", db.getTasks, mock.getTasks);
 
 export const getIntegrations = cachedRead(
@@ -171,6 +239,7 @@ export async function warmReadCache(): Promise<{ ms: number; failed: number }> {
     getStocksOverview,
     getFinanceRows,
     getSalesPlanView,
+    getCashOverview,
     getTasks,
     getIntegrations,
     getTariffs,

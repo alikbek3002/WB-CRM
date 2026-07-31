@@ -16,8 +16,16 @@ import { SUPPLY_AUTO_ARRIVE_DAYS, DEMO_ORG_ID, DEMO_STORE_ID } from "../../share
 import { askAssistant, aiConfigured, type ChatMessage } from "../ai/assistant";
 import { buildSnapshot } from "../ai/snapshot";
 import { transcribeTelegramVoice } from "../ai/transcribe";
+import {
+  createCashTx,
+  getCashOverview,
+  getExpensesView,
+  getFinanceRefs,
+  getPnlView,
+} from "../data/cash-core";
 import { ensureDutyAssignments, localIsoDate } from "../data/duties-core";
 import { completeTask, startTask } from "../data/tasks-core";
+import { invalidateRemote } from "../data/revalidate-remote";
 import { buildDailyReportPdf } from "../reports/daily-pdf";
 
 // ───────────────────────── Supabase-клиенты ─────────────────────────
@@ -54,7 +62,14 @@ async function verifyPassword(email: string, password: string): Promise<boolean>
 
 // ───────────────────────── Состояние диалога входа ─────────────────────────
 
-type Step = "idle" | "await_login" | "await_password" | "await_duty_report" | "await_task_report";
+type Step =
+  | "idle"
+  | "await_login"
+  | "await_password"
+  | "await_duty_report"
+  | "await_task_report"
+  | "await_expense_amount" // мастер расхода: ждём сумму
+  | "await_expense_note"; // мастер расхода: ждём комментарий
 type SessionData = {
   step: Step;
   login?: string;
@@ -64,6 +79,17 @@ type SessionData = {
   dutyId?: string; // назначение регламента, по которому ждём текст отчёта
   taskId?: string; // задача, по которой ждём текст отчёта (отчёт обязателен)
   testProfileId?: string; // тестовый режим: под каким сотрудником смотрим бот
+  expense?: ExpenseDraft; // черновик расхода (мастер «сумма → статья → счёт → коммент»)
+};
+
+// Черновик расхода живёт в сессии чата: мастер идёт в несколько сообщений,
+// а бот может перезапуститься между ними (webhook/Railway).
+type ExpenseDraft = {
+  amount?: number;
+  categoryId?: string;
+  categoryName?: string;
+  accountId?: string;
+  accountName?: string;
 };
 
 // Анти-брутфорс: после MAX_FAILS неудачных попыток — пауза LOCK_MS.
@@ -86,6 +112,7 @@ async function readSession(chatId: number): Promise<SessionData> {
     dutyId: d.dutyId,
     taskId: d.taskId,
     testProfileId: d.testProfileId,
+    expense: d.expense,
   };
 }
 
@@ -417,38 +444,96 @@ export const BOT_COMMANDS = [
   { command: "help", description: "Помощь" },
 ];
 
-const HELP_TEXT = [
-  "🤖 <b>WB CRM — бот-помощник</b>",
-  "",
-  "Вход по логину и паролю сотрудника. После входа можно <b>просто писать боту</b> " +
-    "или отправлять <b>голосовые</b> — он поймёт и сделает.",
-  "",
-  "<b>Примеры:</b>",
-  "• «какие у меня задачи?»",
-  "• «поставь Феликсу задачу обновить фото кимоно до пятницы»",
-  "• «закрой задачу про фото, отчёт: обновил 5 карточек, отправил на модерацию»",
-  "• «что команда сделала сегодня?» (для руководителя)",
-  "• «что скоро закончится на складах?»",
-  "",
-  "Команды:",
-  "/start — вход или главное меню",
-  "/menu — показать меню",
-  "/logout — выйти",
-].join("\n");
-
-function greeting(user: AuthedUser, test = false): string {
-  return [
-    test
-      ? `🧪 Тестовый режим: вы смотрите бот глазами <b>${esc(user.name)}</b>`
-      : `✅ Вы вошли как <b>${esc(user.name)}</b>`,
-    `Роль: <b>${esc(user.roleLabel)}</b>`,
-    `Организация: ${esc(user.orgName)}`,
+// Помощь под роль: показываем только те примеры, которые сотрудник реально
+// может выполнить. Универсальный список раздражает («попробовал — нет прав»).
+function helpText(user?: AuthedUser): string {
+  const lines = [
+    "🤖 <b>WB CRM — бот-помощник</b>",
     "",
-    aiConfigured()
-      ? "💬 Просто напишите или наговорите голосовое — ассистент ответит и сделает: " +
-        "поставит задачу, закроет её с отчётом, покажет цифры.\n\nИли выберите раздел:"
-      : "Выберите раздел:",
-  ].join("\n");
+    "Я понимаю обычную речь. <b>Пишите или наговаривайте голосовое</b> — " +
+      "отвечу по свежим данным и сделаю дело в системе. Кнопки — просто быстрый путь.",
+  ];
+
+  if (user) {
+    const ask: string[] = [];
+    const act: string[] = [];
+
+    if (can(user.role, "tasks:view")) {
+      ask.push("«какие у меня задачи?»");
+      act.push("«закрой задачу про фото — отчёт: обновил 5 карточек»");
+    }
+    if (can(user.role, "duty:complete")) {
+      act.push("«отметь регламент по отзывам — обработала 34 отзыва»");
+    }
+    if (can(user.role, "products:view")) {
+      ask.push("«что скоро закончится на складах?»");
+      ask.push("«как продаётся пижама с длинным рукавом?»");
+    }
+    if (can(user.role, "finance:view")) ask.push("«выполняем ли план продаж?»");
+    if (can(user.role, "finance:cash")) {
+      ask.push("«сколько денег в кассе?»");
+      ask.push("«какая прибыль за месяц?»");
+    }
+    if (can(user.role, "finance:expense")) {
+      act.push("«потратил 15 тысяч на рекламу»");
+      act.push("«пришло 800 тысяч от WB на расчётный счёт»");
+    }
+    if (can(user.role, "supply:view")) ask.push("«сколько потратили на закупку за месяц?»");
+    if (can(user.role, "supply:pay")) {
+      act.push("«запиши расход: 5 000 юаней за товар по поставке кимоно»");
+    }
+    if (can(user.role, "supply:receive")) {
+      act.push("«прими поставку кимоно — пришло 480 из 500»");
+    }
+    if (can(user.role, "products:edit")) act.push("«поставь себестоимость 450 на пижаму»");
+    if (can(user.role, "design:request")) act.push("«закажи дизайн слайдов для кимоно»");
+    if (["owner", "admin", "manager"].includes(user.role)) {
+      ask.push("«что команда сделала сегодня?»");
+      act.push("«поставь Феликсу задачу обновить фото кимоно до пятницы»");
+    }
+
+    if (ask.length) lines.push("", "<b>Спросить:</b>", ...ask.slice(0, 4).map((s) => `• ${s}`));
+    if (act.length) lines.push("", "<b>Сделать:</b>", ...act.slice(0, 4).map((s) => `• ${s}`));
+  }
+
+  lines.push(
+    "",
+    RULE,
+    "",
+    "<b>Команды:</b>",
+    "/menu — главное меню",
+    "/help — эта справка",
+    "/logout — выйти из аккаунта",
+  );
+  return lines.join("\n");
+}
+
+// Приветствие + подсказка. Главная мысль, которую надо донести с первого экрана:
+// кнопки — не единственный (и не основной) способ работы, бот сам по себе ИИ —
+// можно просто написать или наговорить, что нужно.
+function greeting(user: AuthedUser, test = false): string {
+  const lines = [
+    test
+      ? `🧪 <b>Тестовый режим</b> — смотрите глазами <b>${esc(user.name)}</b>`
+      : `👋 <b>${esc(user.name)}</b>`,
+    `${esc(user.roleLabel)} · ${esc(user.orgName)}`,
+  ];
+  if (aiConfigured()) {
+    lines.push(
+      "",
+      "💬 <b>Просто напишите или наговорите голосовое</b> — я пойму и сделаю:",
+      "<i>«поставь Феликсу задачу обновить фото до пятницы»</i>",
+      "<i>«оплатили фабрике 5000 юаней за пижамы»</i>",
+      "<i>«что скоро закончится на складах?»</i>",
+      "",
+      RULE,
+      "",
+      "Или откройте раздел 👇",
+    );
+  } else {
+    lines.push("", "Выберите раздел:");
+  }
+  return lines.join("\n");
 }
 
 // ── ИИ-ассистент: свободный вопрос от вошедшего сотрудника ──
@@ -471,6 +556,8 @@ async function handleAiQuestion(ctx: Context, user: AuthedUser, chatId: number, 
       history,
       db: admin(), // инструменты-действия доступны и из Telegram
       channel: "telegram", // короткие блоки, эмодзи, <b> вместо Markdown
+      // Бот — отдельный процесс: сбросить кэш веба можно только по HTTP
+      onMutation: () => void invalidateRemote(),
     });
   } catch (e) {
     console.error("[telegram] AI ошибка:", e);
@@ -484,24 +571,47 @@ async function handleAiQuestion(ctx: Context, user: AuthedUser, chatId: number, 
 }
 
 // Главное меню — только разделы, доступные роли (RBAC).
+// Отдельной кнопки «ИИ-ассистент» нет намеренно: бот и ЕСТЬ ассистент — любое
+// сообщение или голосовое уходит агенту. Кнопка была лишним шагом и создавала
+// ложное впечатление, что ИИ живёт в отдельном режиме.
 function mainMenu(user: AuthedUser, test = false): InlineKeyboard {
   const kb = new InlineKeyboard();
-  if (aiConfigured()) kb.text("🤖 ИИ-ассистент", "menu:ai").row();
-  if (can(user.role, "duty:view")) kb.text("📋 Регламент сегодня", "menu:duties").row();
+
+  // Личная работа — в одну колонку: сюда сотрудник заходит каждый день
+  if (can(user.role, "duty:view")) kb.text("📋 Регламент на сегодня", "menu:duties").row();
   if (can(user.role, "tasks:view")) kb.text("🗒 Мои задачи", "menu:tasks").row();
-  if (can(user.role, "dashboard:view")) kb.text("📊 Сводка магазина", "menu:dashboard").row();
-  if (can(user.role, "supply:view")) kb.text("🚚 Поставки", "menu:supplies").row();
-  if (can(user.role, "products:view")) kb.text("📦 Товары", "menu:products").row();
-  if (can(user.role, "finance:view")) kb.text("💰 Финансы", "menu:finance").row();
-  if (can(user.role, "team:manage")) kb.text("👥 Команда", "menu:team").row();
-  if (can(user.role, "dashboard:view")) kb.text("📄 Отчёт PDF за день", "menu:pdf").row();
-  if (test) kb.text("🔄 Сменить сотрудника", "test:switch").row();
+
+  // Справочные разделы — по два в ряд, чтобы меню помещалось на экран телефона
+  const info: Array<[string, string]> = [];
+  if (can(user.role, "dashboard:view")) info.push(["📊 Сводка", "menu:dashboard"]);
+  if (can(user.role, "finance:view")) info.push(["💰 Финансы", "menu:finance"]);
+  if (can(user.role, "products:view")) info.push(["📦 Товары", "menu:products"]);
+  if (can(user.role, "supply:view")) info.push(["🚚 Поставки", "menu:supplies"]);
+  if (can(user.role, "team:manage")) info.push(["👥 Команда", "menu:team"]);
+  if (can(user.role, "dashboard:view")) info.push(["📄 Отчёт PDF", "menu:pdf"]);
+  info.forEach(([label, data], i) => {
+    kb.text(label, data);
+    if (i % 2 === 1) kb.row();
+  });
+  if (info.length % 2 === 1) kb.row();
+
+  // Служебное — мелким рядом внизу, чтобы не конкурировало с рабочими кнопками
+  kb.text("❓ Помощь", "menu:help");
+  if (test) kb.text("🔄 Сменить", "test:switch");
   kb.text("🚪 Выйти", "action:logout");
   return kb;
 }
 
 function backKeyboard(): InlineKeyboard {
   return new InlineKeyboard().text("⬅️ В меню", "menu:home");
+}
+
+// Клавиатура раздела с данными: «Обновить» перечитывает раздел, не гоняя
+// сотрудника через главное меню.
+function sectionKeyboard(section: string): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("🔄 Обновить", `menu:${section}`)
+    .text("⬅️ В меню", "menu:home");
 }
 
 // ───────────────────────── Разделы (реальные данные из БД) ─────────────────────────
@@ -575,7 +685,7 @@ async function renderTasks(user: AuthedUser): Promise<{ body: string; kb: Inline
     if (t.status === "open") kb.text(`▶️ ${label}`, `task:${t.id}:start`).row();
     else kb.text(`✅ ${label}`, `task:${t.id}:done`).row();
   }
-  kb.text("⬅️ В меню", "menu:home");
+  kb.text("🔄 Обновить", "menu:tasks").text("⬅️ В меню", "menu:home");
   return { body: lines.join("\n"), kb };
 }
 
@@ -678,7 +788,7 @@ async function renderDuties(user: AuthedUser): Promise<{ body: string; kb: Inlin
   for (const r of left) {
     kb.text(`✅ ${short(dutyTitle(r))}`, `duty:${r.id}`).row();
   }
-  kb.text("⬅️ В меню", "menu:home");
+  kb.text("🔄 Обновить", "menu:duties").text("⬅️ В меню", "menu:home");
   return { body: lines.join("\n"), kb };
 }
 
@@ -835,6 +945,288 @@ async function renderFinance(_user: AuthedUser): Promise<string> {
   ].join("\n");
 }
 
+// ── Финансы: подменю (план WB · прибыль · касса · расходы · записать расход) ──
+
+function financeMenu(user: AuthedUser): InlineKeyboard {
+  const kb = new InlineKeyboard().text("🎯 План WB", "fin:plan").row();
+  if (can(user.role, "finance:cash")) {
+    kb.text("📊 Прибыль (ОПиУ)", "fin:pnl").row();
+    kb.text("👛 Касса — сколько денег", "fin:cash").row();
+    kb.text("🧾 Расходы за месяц", "fin:expenses").row();
+  }
+  if (can(user.role, "finance:expense")) {
+    kb.text("➕ Записать расход", "fin:add").row();
+  }
+  kb.text("⬅️ В меню", "menu:home");
+  return kb;
+}
+
+// Короткая сводка: выполнение плана + деньги и расходы месяца (по правам)
+async function renderFinanceHome(user: AuthedUser): Promise<string> {
+  const lines = ["💰 <b>Финансы</b>"];
+
+  const plan = await financePlanShort();
+  if (plan) {
+    lines.push("", `${plan.mark} План WB — <b>${plan.pct}%</b> на сегодня`, `     факт ${rub(plan.fact)} из ${rub(plan.amount)}`);
+  }
+
+  if (can(user.role, "finance:cash")) {
+    const [cash, expenses] = await Promise.all([
+      getCashOverview(admin()).catch(() => null),
+      getExpensesView(admin()).catch(() => null),
+    ]);
+    if (cash) {
+      lines.push("", RULE, "", `👛 Денег в кассе — <b>${rub(cash.totalRub)}</b>`);
+      if (cash.accounts.length === 0) {
+        lines.push("     <i>счета не заведены — CRM → Финансы → Касса</i>");
+      }
+    }
+    if (expenses) {
+      lines.push(`🧾 Расходы за месяц — <b>${rub(expenses.totalRub)}</b>`);
+    }
+  }
+
+  lines.push("", RULE, "<i>Выберите раздел кнопкой ниже. Расход можно просто продиктовать: «отдал 15 тысяч за рекламу».</i>");
+  return lines.join("\n");
+}
+
+// Выполнение плана WB одной строкой (нужно и в сводке, и в разделе)
+async function financePlanShort(): Promise<
+  { pct: number; mark: string; fact: number; amount: number } | null
+> {
+  const today = localIsoDate();
+  const { data: plans } = await admin()
+    .from("sales_plans")
+    .select("period_start, period_end, amount_rub")
+    .eq("store_id", DEMO_STORE_ID)
+    .order("period_start", { ascending: false })
+    .limit(5);
+  const plan =
+    (plans ?? []).find(
+      (p) => (p.period_start as string) <= today && today <= (p.period_end as string),
+    ) ?? (plans ?? [])[0];
+  if (!plan) return null;
+
+  const start = plan.period_start as string;
+  const end = plan.period_end as string;
+  const amount = Number(plan.amount_rub);
+  const { data: daily } = await admin().rpc("agg_sales_daily", {
+    p_store: DEMO_STORE_ID,
+    p_since: `${start}T00:00:00`,
+  });
+  const fact = ((daily ?? []) as { sum_rub: number }[]).reduce((t, r) => t + Number(r.sum_rub), 0);
+  const totalDays = Math.max(1, Math.round((new Date(end).getTime() - new Date(start).getTime()) / 86_400_000) + 1);
+  const passed = Math.max(1, Math.round((new Date(today).getTime() - new Date(start).getTime()) / 86_400_000) + 1);
+  const planToDate = Math.round((amount / totalDays) * passed);
+  const pct = planToDate ? Math.round((fact / planToDate) * 100) : 0;
+  return { pct, mark: pct >= 100 ? "🟢" : pct >= 90 ? "🟡" : "🔴", fact, amount };
+}
+
+// ОПиУ за 3 месяца: сколько реально заработали
+async function renderPnl(): Promise<string> {
+  const view = await getPnlView(admin(), 3);
+  const t = view.total;
+  const mark = t.netRub >= 0 ? "🟢" : "🔴";
+
+  const lines = [
+    "📊 <b>Прибыль за 3 месяца</b>",
+    "",
+    `${mark} Чистая прибыль — <b>${rub(t.netRub)}</b>`,
+    `     рентабельность ${t.marginPct}%`,
+    "",
+    RULE,
+    "",
+    `💵 Выручка — ${rub(t.revenueRub)}`,
+    `➖ Удержания WB — ${rub(t.wbFeesRub)}`,
+    `➖ Себестоимость — ${rub(t.cogsRub)}`,
+    `➖ Расходы компании — ${rub(t.opexRub)}`,
+  ];
+  if (t.otherIncomeRub > 0) lines.push(`➕ Прочие доходы — ${rub(t.otherIncomeRub)}`);
+
+  lines.push("", RULE, "", "<b>ПО МЕСЯЦАМ</b>");
+  for (const m of view.months) {
+    const sign = m.netRub >= 0 ? "🟢" : "🔴";
+    lines.push("", `${sign} <b>${esc(m.label)}</b> — ${rub(m.netRub)}`, `     выручка ${rub(m.revenueRub)} · ${m.marginPct}%`);
+  }
+
+  // Без этих оговорок цифра прибыли обманывает — предупреждаем прямо в чате
+  const notes: string[] = [];
+  if (view.costCoveragePct < 95) {
+    notes.push(`⚠️ Себестоимость заполнена у ${view.costCoveragePct}% продаж — прибыль завышена.`);
+  }
+  if (!view.hasExpenses) {
+    notes.push("⚠️ Расходы не внесены — прибыль без рекламы, зарплат и налогов.");
+  }
+  if (notes.length) lines.push("", RULE, "", ...notes);
+  return lines.join("\n");
+}
+
+const ACCOUNT_EMOJI: Record<string, string> = {
+  cash: "💵",
+  bank: "🏦",
+  card: "💳",
+  wb: "🟣",
+  other: "👛",
+};
+
+async function renderCash(): Promise<string> {
+  const view = await getCashOverview(admin());
+  if (!view.accounts.length) {
+    return (
+      "👛 <b>Касса</b>\n\nСчета не заведены.\n" +
+      "Добавьте их в CRM → Финансы → Касса → «Новый счёт» и укажите, сколько денег есть сейчас."
+    );
+  }
+
+  const net = view.monthInRub - view.monthOutRub;
+  const lines = [
+    "👛 <b>Касса</b>",
+    "",
+    `💰 Всего денег — <b>${rub(view.totalRub)}</b>`,
+    "",
+    RULE,
+    "",
+    "<b>ПО СЧЕТАМ</b>",
+  ];
+  for (const a of view.accounts) {
+    const emoji = ACCOUNT_EMOJI[a.kind] ?? "👛";
+    const amount = a.currency === "rub" ? rub(a.balance) : `${num(a.balance)} ${a.currency === "cny" ? "¥" : "сум"}`;
+    lines.push("", `${emoji} <b>${esc(a.name)}</b> — ${amount}`);
+    if (a.currency !== "rub") lines.push(`     ≈ ${rub(a.balanceRub)}`);
+  }
+
+  lines.push(
+    "",
+    RULE,
+    "",
+    "<b>ЭТОТ МЕСЯЦ</b>",
+    `📥 Пришло — ${rub(view.monthInRub)}`,
+    `📤 Ушло — ${rub(view.monthOutRub)}`,
+    `${net >= 0 ? "🟢" : "🔴"} Итог — <b>${net >= 0 ? "+" : ""}${rub(net)}</b>`,
+  );
+
+  if (view.recent.length) {
+    lines.push("", RULE, "", "<b>ПОСЛЕДНИЕ ОПЕРАЦИИ</b>");
+    for (const t of view.recent.slice(0, 5)) {
+      const icon = t.kind === "in" ? "📥" : t.kind === "out" ? "📤" : "🔁";
+      const what =
+        t.kind === "transfer"
+          ? `перевод → ${esc(t.toAccountName ?? "—")}`
+          : esc(t.categoryName ?? (t.kind === "in" ? "поступление" : "расход"));
+      lines.push("", `${icon} ${what} — <b>${rub(t.amountRub)}</b>`, `     ${esc(humanDate(t.occurredOn))} · ${esc(t.accountName)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+// «31 июля» вместо «2026-07-31» — так читается с телефона
+function humanDate(iso: string): string {
+  const [, m, d] = iso.slice(0, 10).split("-").map(Number);
+  return `${d} ${MONTHS_SHORT[(m ?? 1) - 1]}`;
+}
+
+async function renderExpenses(): Promise<string> {
+  const view = await getExpensesView(admin());
+  if (!view.items.length) {
+    return (
+      "🧾 <b>Расходы за месяц</b>\n\nЗаписей пока нет.\n" +
+      "Нажмите «➕ Записать расход» или просто напишите: <i>«потратил 15 тысяч на рекламу»</i>."
+    );
+  }
+
+  const lines = [
+    "🧾 <b>Расходы за месяц</b>",
+    "",
+    `💸 Всего — <b>${rub(view.totalRub)}</b> · ${view.items.length} операций`,
+    "",
+    RULE,
+    "",
+    "<b>ПО СТАТЬЯМ</b>",
+  ];
+  for (const c of view.categories.slice(0, 8)) {
+    lines.push("", `${c.emoji ?? "▪️"} <b>${esc(c.name)}</b> — ${rub(c.amountRub)}`, `     ${c.sharePct}% расходов · ${c.txCount} оп.`);
+  }
+
+  lines.push("", RULE, "", "<b>ПОСЛЕДНИЕ</b>");
+  for (const t of view.items.slice(0, 6)) {
+    lines.push(
+      "",
+      `📤 <b>${esc(t.categoryName ?? "Без статьи")}</b> — ${rub(t.amountRub)}`,
+      `     ${esc(humanDate(t.occurredOn))}${t.note ? ` · ${esc(short(t.note, 40))}` : ""}${t.authorName ? ` · ${esc(t.authorName)}` : ""}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+// ── Мастер расхода: сумма → статья → счёт → комментарий ──────────────────────
+
+// «25 000», «25к», «25 тыс», «1.5 млн» — как пишут в чате
+function parseAmount(raw: string): number | null {
+  const text = raw.toLowerCase().replace(/\s/g, "").replace(",", "."); // \s покрывает и неразрывный пробел
+  const m = text.match(/(\d+(?:\.\d+)?)(к|k|тыс|тысяч|млн|млнов)?/);
+  if (!m) return null;
+  const value = Number(m[1]);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const suffix = m[2] ?? "";
+  const mult = suffix.startsWith("млн") ? 1_000_000 : suffix ? 1_000 : 1;
+  return value * mult;
+}
+
+async function expenseCategoryKeyboard(): Promise<InlineKeyboard> {
+  const { categories } = await getFinanceRefs(admin());
+  const kb = new InlineKeyboard();
+  for (const c of categories.filter((x) => x.direction === "out")) {
+    kb.text(`${c.emoji ?? "▪️"} ${short(c.name, 24)}`, `fin:cat:${c.id}`).row();
+  }
+  kb.text("✖️ Отмена", "fin:cancel");
+  return kb;
+}
+
+async function expenseAccountKeyboard(): Promise<InlineKeyboard> {
+  const { accounts } = await getFinanceRefs(admin());
+  const kb = new InlineKeyboard();
+  for (const a of accounts) {
+    const cur = a.currency === "rub" ? "" : a.currency === "cny" ? " ¥" : " сум";
+    kb.text(`${ACCOUNT_EMOJI[a.kind] ?? "👛"} ${short(a.name, 22)}${cur}`, `fin:acc:${a.id}`).row();
+  }
+  kb.text("✖️ Отмена", "fin:cancel");
+  return kb;
+}
+
+// Финальная запись расхода из черновика сессии
+async function saveExpenseDraft(
+  user: AuthedUser,
+  draft: ExpenseDraft,
+  note: string | null,
+): Promise<string> {
+  if (!draft.amount || !draft.categoryId || !draft.accountId) {
+    return "⚠️ Черновик расхода потерялся. Начните заново: /menu → 💰 Финансы → ➕ Записать расход.";
+  }
+  const result = await createCashTx(
+    admin(),
+    { id: user.id, name: user.name, role: user.role, roleLabel: user.roleLabel },
+    {
+      kind: "out",
+      accountId: draft.accountId,
+      categoryId: draft.categoryId,
+      amount: draft.amount,
+      note,
+      source: "bot",
+    },
+  );
+  if (!result.ok) return `⚠️ ${esc(result.message)}`;
+  void invalidateRemote();
+  return [
+    "✅ <b>Расход записан</b>",
+    "",
+    `💸 ${rub(result.amountRub)} · ${esc(draft.categoryName ?? "статья")}`,
+    `👛 Счёт: ${esc(draft.accountName ?? "—")}`,
+    note ? `📝 ${esc(note)}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 async function renderTeam(user: AuthedUser): Promise<string> {
   const { data, error } = await admin()
     .from("org_members")
@@ -923,6 +1315,17 @@ async function handleMenu(ctx: Context): Promise<void> {
   await ctx.reply(greeting(linked, test), { parse_mode: "HTML", reply_markup: mainMenu(linked, test) });
 }
 
+// Справка знает, кто спрашивает: примеры подбираются под права роли.
+async function handleHelp(ctx: Context): Promise<void> {
+  const tgId = ctx.from?.id;
+  const user = tgId ? await getLinkedUser(tgId) : null;
+  await ctx.reply(helpText(user ?? undefined), {
+    parse_mode: "HTML",
+    reply_markup: user ? backKeyboard() : undefined,
+    link_preview_options: { is_disabled: true },
+  });
+}
+
 async function handleLogout(ctx: Context): Promise<void> {
   const tgId = ctx.from?.id;
   const chatId = ctx.chat?.id;
@@ -956,10 +1359,42 @@ async function handleUserInput(ctx: Context, text: string): Promise<void> {
         { id: linked.id, name: linked.name, role: linked.role, roleLabel: linked.roleLabel },
         text,
       );
+      if (result.ok) void invalidateRemote();
       await writeSession(chatId, { step: "idle", aiHistory: sess0.aiHistory, testProfileId: sess0.testProfileId });
       await ctx.reply(result.ok ? `✅ ${esc(result.message)}` : `⚠️ ${esc(result.message)}`, { parse_mode: "HTML" });
       const { body, kb } = await renderTasks(linked);
       await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
+      return;
+    }
+
+    // Мастер расхода: сумма (текстом или голосом) → выбор статьи кнопками
+    if (sess0.step === "await_expense_amount") {
+      const amount = parseAmount(text);
+      if (!amount) {
+        await ctx.reply(
+          "Не понял сумму. Напишите числом — например <code>25000</code> или <code>25 тыс</code>.",
+          { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("✖️ Отмена", "fin:cancel") },
+        );
+        return;
+      }
+      await writeSession(chatId, { ...sess0, expense: { ...sess0.expense, amount } });
+      await ctx.reply(`💸 <b>${rub(amount)}</b>\n\nНа что потратили?`, {
+        parse_mode: "HTML",
+        reply_markup: await expenseCategoryKeyboard(),
+      });
+      return;
+    }
+
+    // Мастер расхода: комментарий — последний шаг, сразу пишем в кассу
+    if (sess0.step === "await_expense_note") {
+      const draft = sess0.expense ?? {};
+      await writeSession(chatId, {
+        step: "idle",
+        aiHistory: sess0.aiHistory,
+        testProfileId: sess0.testProfileId,
+      });
+      const body = await saveExpenseDraft(linked, draft, text.trim() || null);
+      await ctx.reply(body, { parse_mode: "HTML", reply_markup: financeMenu(linked) });
       return;
     }
 
@@ -970,6 +1405,7 @@ async function handleUserInput(ctx: Context, text: string): Promise<void> {
         return;
       }
       const result = await completeDuty(linked, sess0.dutyId, text.slice(0, 2000));
+      void invalidateRemote();
       await writeSession(chatId, { step: "idle", aiHistory: sess0.aiHistory, testProfileId: sess0.testProfileId });
       await ctx.reply(result, { parse_mode: "HTML" });
       const { body, kb } = await renderDuties(linked);
@@ -1127,16 +1563,158 @@ async function showSection(ctx: Context, user: AuthedUser, section: string): Pro
       await editText(ctx, body, kb);
       return;
     }
+    // Финансы — не один экран, а подменю: план WB, прибыль, касса, расходы
+    if (section === "finance") {
+      await editText(ctx, await renderFinanceHome(user), financeMenu(user));
+      return;
+    }
     let body = "";
     if (section === "dashboard") body = await renderDashboard(user);
     else if (section === "supplies") body = await renderSupplies(user);
     else if (section === "products") body = await renderProducts(user);
-    else if (section === "finance") body = await renderFinance(user);
     else if (section === "team") body = await renderTeam(user);
-    await editText(ctx, body, backKeyboard());
+    await editText(ctx, body, sectionKeyboard(section));
   } catch (e) {
     console.error(`[telegram] раздел ${section}:`, e);
     await editText(ctx, "⚠️ Не удалось загрузить раздел. Попробуйте ещё раз.", backKeyboard());
+  }
+}
+
+// Разделы финансов и мастер расхода «сумма → статья → счёт → комментарий».
+// Каждый шаг проверяет право заново: кнопка могла остаться в старом сообщении.
+async function handleFinanceCallback(
+  ctx: Context,
+  user: AuthedUser,
+  action: string,
+): Promise<void> {
+  const chatId = ctx.chat?.id;
+  const needCash = () => can(user.role, "finance:cash");
+  const needEdit = () => can(user.role, "finance:expense");
+
+  try {
+    if (action === "plan") {
+      await ctx.answerCallbackQuery();
+      await editText(ctx, await renderFinance(user), financeMenu(user));
+      return;
+    }
+    if (action === "pnl" || action === "cash" || action === "expenses") {
+      if (!needCash()) {
+        await ctx.answerCallbackQuery({ text: "Нет доступа к этому разделу", show_alert: true });
+        return;
+      }
+      await ctx.answerCallbackQuery();
+      const body =
+        action === "pnl" ? await renderPnl() : action === "cash" ? await renderCash() : await renderExpenses();
+      await editText(ctx, body, financeMenu(user));
+      return;
+    }
+
+    if (action === "cancel") {
+      if (chatId != null) {
+        const sess = await readSession(chatId);
+        await writeSession(chatId, {
+          step: "idle",
+          aiHistory: sess.aiHistory,
+          testProfileId: sess.testProfileId,
+        });
+      }
+      await ctx.answerCallbackQuery({ text: "Отменено" });
+      await editText(ctx, await renderFinanceHome(user), financeMenu(user));
+      return;
+    }
+
+    if (!needEdit()) {
+      await ctx.answerCallbackQuery({ text: "Нет права вносить расходы", show_alert: true });
+      return;
+    }
+
+    // Старт мастера: спрашиваем сумму
+    if (action === "add") {
+      if (chatId != null) {
+        const sess = await readSession(chatId);
+        await writeSession(chatId, { ...sess, step: "await_expense_amount", expense: {} });
+      }
+      await ctx.answerCallbackQuery();
+      await ctx.reply(
+        "💸 <b>Новый расход</b>\n\nСколько потратили? Напишите сумму — например <code>25000</code>, " +
+          "<code>25 тыс</code> или <code>1.5 млн</code>.",
+        { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("✖️ Отмена", "fin:cancel") },
+      );
+      return;
+    }
+
+    // Выбрана статья → спрашиваем счёт
+    if (action.startsWith("cat:")) {
+      const categoryId = action.slice("cat:".length);
+      if (chatId == null) return;
+      const sess = await readSession(chatId);
+      const { categories } = await getFinanceRefs(admin());
+      const category = categories.find((c) => c.id === categoryId);
+      if (!category || !sess.expense?.amount) {
+        await ctx.answerCallbackQuery({ text: "Начните заново: ➕ Записать расход", show_alert: true });
+        return;
+      }
+      await writeSession(chatId, {
+        ...sess,
+        expense: { ...sess.expense, categoryId, categoryName: category.name },
+      });
+      await ctx.answerCallbackQuery({ text: category.name });
+      await editText(
+        ctx,
+        `💸 <b>${rub(sess.expense.amount)}</b> · ${esc(category.name)}\n\nС какого счёта платили?`,
+        await expenseAccountKeyboard(),
+      );
+      return;
+    }
+
+    // Выбран счёт → просим комментарий (или пропускаем)
+    if (action.startsWith("acc:")) {
+      const accountId = action.slice("acc:".length);
+      if (chatId == null) return;
+      const sess = await readSession(chatId);
+      const { accounts } = await getFinanceRefs(admin());
+      const account = accounts.find((a) => a.id === accountId);
+      if (!account || !sess.expense?.amount || !sess.expense.categoryId) {
+        await ctx.answerCallbackQuery({ text: "Начните заново: ➕ Записать расход", show_alert: true });
+        return;
+      }
+      await writeSession(chatId, {
+        ...sess,
+        step: "await_expense_note",
+        expense: { ...sess.expense, accountId, accountName: account.name },
+      });
+      await ctx.answerCallbackQuery({ text: account.name });
+      await editText(
+        ctx,
+        `💸 <b>${rub(sess.expense.amount)}</b> · ${esc(sess.expense.categoryName ?? "")}\n` +
+          `👛 ${esc(account.name)}\n\nДобавьте комментарий (за что именно) — или пропустите.`,
+        new InlineKeyboard()
+          .text("⏭ Без комментария", "fin:save")
+          .row()
+          .text("✖️ Отмена", "fin:cancel"),
+      );
+      return;
+    }
+
+    // Записать без комментария
+    if (action === "save") {
+      if (chatId == null) return;
+      const sess = await readSession(chatId);
+      const draft = sess.expense ?? {};
+      await writeSession(chatId, {
+        step: "idle",
+        aiHistory: sess.aiHistory,
+        testProfileId: sess.testProfileId,
+      });
+      await ctx.answerCallbackQuery({ text: "Записываю…" });
+      await editText(ctx, await saveExpenseDraft(user, draft, null), financeMenu(user));
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+  } catch (e) {
+    console.error("[telegram] финансы:", e);
+    await ctx.answerCallbackQuery({ text: "⚠️ Ошибка, попробуйте ещё раз", show_alert: true }).catch(() => {});
   }
 }
 
@@ -1174,6 +1752,7 @@ async function changeTaskStatus(
     await ctx.answerCallbackQuery({ text: result.message, show_alert: true });
     return;
   }
+  void invalidateRemote();
   await ctx.answerCallbackQuery({ text: "Взято в работу ▶️" });
   const { body, kb } = await renderTasks(user);
   await editText(ctx, body, kb);
@@ -1239,29 +1818,9 @@ async function handleCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  if (data === "menu:ai") {
+  if (data === "menu:help") {
     await ctx.answerCallbackQuery();
-    await editText(
-      ctx,
-      [
-        "🤖 <b>ИИ-помощник</b>",
-        "",
-        "Отдельно открывать меня не нужно: пишите или наговаривайте <b>голосовое</b> " +
-          "в любой момент — отвечу по актуальным данным и выполню действие.",
-        "",
-        "<b>Спросить:</b>",
-        "• Какой товар продаётся лучше всего?",
-        "• Что скоро закончится на складах?",
-        can(user.role, "finance:view") ? "• Выполняем ли план продаж?" : "• Какие у меня задачи сегодня?",
-        "",
-        "<b>Сделать:</b>",
-        can(user.role, "team:manage")
-          ? "• Поставь Назире задачу проверить SEO до среды"
-          : "• Закрой задачу про отзывы, отчёт: обработала 34 отзыва",
-        can(user.role, "team:manage") ? "• Что команда сделала сегодня?" : "• Какие у меня задачи?",
-      ].join("\n"),
-      backKeyboard(),
-    );
+    await editText(ctx, helpText(user), backKeyboard());
     return;
   }
 
@@ -1287,6 +1846,12 @@ async function handleCallback(ctx: Context): Promise<void> {
 
   if (data.startsWith("menu:")) {
     await showSection(ctx, user, data.slice("menu:".length));
+    return;
+  }
+
+  // ── Финансы: разделы и мастер расхода ──
+  if (data.startsWith("fin:")) {
+    await handleFinanceCallback(ctx, user, data.slice("fin:".length));
     return;
   }
 
@@ -1355,7 +1920,7 @@ export function createBot(): Bot {
   bot.command("start", guard(handleStart));
   bot.command("menu", guard(handleMenu));
   bot.command("logout", guard(handleLogout));
-  bot.command("help", guard((ctx) => ctx.reply(HELP_TEXT, { parse_mode: "HTML" })));
+  bot.command("help", guard(handleHelp));
 
   bot.on("callback_query:data", guard(handleCallback));
   bot.on("message:text", guard(handleText));

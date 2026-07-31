@@ -3,6 +3,7 @@ import { z } from "zod";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
+import { mirrorSupplyPaymentToCash } from "@/backend/data/cash-core";
 import { invalidateWbData } from "@/backend/data/revalidate";
 
 export const runtime = "nodejs";
@@ -42,19 +43,44 @@ export async function POST(
     return NextResponse.json({ ok: true, persisted: false, payment: parsed.data });
   }
 
-  const { error } = await admin.from("supply_payments").insert({
-    supply_id: id,
-    kind: parsed.data.kind,
-    amount: parsed.data.amount,
-    currency: parsed.data.currency,
-    paid_at: parsed.data.paidAt,
-    note: parsed.data.note ?? null,
-  });
+  const { data: payment, error } = await admin
+    .from("supply_payments")
+    .insert({
+      supply_id: id,
+      kind: parsed.data.kind,
+      amount: parsed.data.amount,
+      currency: parsed.data.currency,
+      paid_at: parsed.data.paidAt,
+      note: parsed.data.note ?? null,
+    })
+    .select("id, supply:supplies(title)")
+    .single();
 
-  if (error) {
+  if (error || !payment) {
     console.error("[supplies/payments] insert failed:", error);
     return NextResponse.json({ error: "db_error" }, { status: 500 });
   }
+
+  // Деньги ушли со счёта — отражаем это в кассе (см. mirrorSupplyPaymentToCash)
+  const supply = Array.isArray(payment.supply) ? payment.supply[0] : payment.supply;
+  await mirrorSupplyPaymentToCash(
+    admin,
+    {
+      id: session.user.id,
+      name: session.user.name,
+      role: session.role,
+      roleLabel: session.roleLabel,
+    },
+    {
+      id: String(payment.id),
+      kind: parsed.data.kind,
+      amount: parsed.data.amount,
+      currency: parsed.data.currency,
+      paidAt: parsed.data.paidAt,
+      note: parsed.data.note ?? null,
+      supplyTitle: (supply as { title?: string } | null)?.title ?? null,
+    },
+  );
 
   invalidateWbData();
   return NextResponse.json({ ok: true, persisted: true });

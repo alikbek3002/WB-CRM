@@ -4,6 +4,7 @@ import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
 import { askAssistant, aiConfigured, type ChatMessage } from "@/backend/ai/assistant";
 import { buildSnapshot } from "@/backend/ai/snapshot";
+import { invalidateWbData } from "@/backend/data/revalidate";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -54,6 +55,9 @@ export async function POST(request: Request) {
       snapshot,
       history: parsed.data.messages as ChatMessage[],
       db: admin, // включает инструменты-действия (создать задачу и т.д.)
+      // Ассистент пишет в БД так же, как обычные API-роуты, — значит обязан
+      // сбросить кэш чтения, иначе страницы покажут данные до действия.
+      onMutation: () => invalidateWbData(),
     });
     return NextResponse.json({ reply });
   } catch (e) {

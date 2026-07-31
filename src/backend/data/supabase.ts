@@ -519,6 +519,17 @@ export async function getSalesPlanView(
   };
 }
 
+// ─── Касса, расходы и ОПиУ (миграция 0024) ───────────────────────────────────
+// Логика живёт в чистом модуле cash-core (его же использует Telegram-бот и ИИ) —
+// здесь только ре-экспорт, чтобы страницы читали данные через общий data-слой.
+
+export {
+  getCashOverview,
+  getExpensesView,
+  getFinanceRefs,
+  getPnlView,
+} from "./cash-core";
+
 // ─── Задачи ──────────────────────────────────────────────────────────────────
 
 export async function getTasks(db: SupabaseClient): Promise<TaskItem[]> {
