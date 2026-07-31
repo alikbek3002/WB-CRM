@@ -47,3 +47,7 @@ next-env.d.ts
 # Локальные креды (не коммитить)
 КРЕДЫ-*.txt
 DB_LOGINS.md
+
+# Артефакты локальных тестов
+.playwright-mcp/
+scripts/tmp/

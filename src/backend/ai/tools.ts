@@ -13,7 +13,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { DEMO_ORG_ID, DEMO_STORE_ID, toRub } from "../../shared/constants";
 import { can, type MemberRole, type Permission } from "../../shared/rbac";
-import type { Currency } from "../../shared/types";
+import type { Currency, PayoutKind } from "../../shared/types";
 import {
   createCashTx,
   findAccounts,
@@ -25,6 +25,14 @@ import {
   pickDefaultAccount,
   type CashActor,
 } from "../data/cash-core";
+import {
+  createPayoutRequest,
+  decidePayout,
+  getPayouts,
+  payPayout,
+  PAYOUT_KIND_LABELS,
+  PAYOUT_STATUS_LABELS,
+} from "../data/payouts-core";
 import { localIsoDate } from "../data/duties-core";
 import { cancelTask, completeTask, startTask, type TaskActor } from "../data/tasks-core";
 import { notifyProfile, notifyRoles, tgEsc } from "../telegram/notify";
@@ -297,6 +305,69 @@ const CATALOG: ToolSpec[] = [
     input_schema: obj({
       days: int("За сколько последних дней (по умолчанию — с начала месяца)"),
     }),
+  },
+
+  {
+    name: "request_payout",
+    permission: "payout:request",
+    description:
+      "Создать ЗАЯВКУ НА ВЫПЛАТУ: зарплата и аванс, оплата подрядчику или фотографу, счёт фабрики, возмещение расходов сотруднику. " +
+      "Используй на «нужно оплатить фотографу 15 тысяч», «попроси аванс 30 000», «фабрика просит 5000 юаней за партию». " +
+      "Заявка уходит руководителю на согласование — деньги сами не списываются.",
+    input_schema: obj(
+      {
+        amount: int("Сумма выплаты"),
+        title: str("За что выплата (коротко): «съёмка карточек», «аванс за июль», «остаток за партию пижам»"),
+        kind: {
+          type: "string",
+          enum: ["salary", "contractor", "factory", "reimbursement", "other"],
+          description: "Тип: salary — зарплата/аванс, contractor — подрядчик/услуги, factory — счёт фабрики, reimbursement — возместить сотруднику, other — прочее",
+        },
+        currency: { type: "string", enum: ["rub", "kgs", "cny", "uzs"], description: "Валюта (по умолчанию рубли)" },
+        payee: str("Кому платим, если не самому заявителю"),
+        due_date: str("Оплатить до, yyyy-mm-dd (необязательно)"),
+        supply: str("Часть названия поставки, если это счёт фабрики (необязательно)"),
+      },
+      ["amount", "title"],
+    ),
+  },
+  {
+    name: "payouts_list",
+    permission: "payout:request",
+    description:
+      "Показать заявки на выплату: что ждёт согласования, что согласовано и ещё не оплачено, что уже выплачено. " +
+      "Сотруднику показываются только его заявки, руководителю — все. Используй на «что по выплатам», «кому мы должны», «согласуй мои заявки».",
+    input_schema: obj({}),
+  },
+  {
+    name: "decide_payout",
+    permission: "payout:approve",
+    description:
+      "Согласовать или отклонить заявку на выплату. Заявку ищем по части названия. " +
+      "Используй на «согласуй выплату фотографу», «откажи по заявке на аванс».",
+    input_schema: obj(
+      {
+        payout: str("Часть названия заявки"),
+        decision: { type: "string", enum: ["approve", "reject"], description: "approve — согласовать, reject — отклонить" },
+        note: str("Комментарий или причина отказа (необязательно)"),
+      },
+      ["payout", "decision"],
+    ),
+  },
+  {
+    name: "pay_payout",
+    permission: "payout:approve",
+    description:
+      "Оплатить согласованную заявку: деньги списываются со счёта кассы и попадают в расходы. " +
+      "Используй на «оплати заявку фотографу с карты», «выплати аванс наличными».",
+    input_schema: obj(
+      {
+        payout: str("Часть названия заявки"),
+        account: str("Название счёта, с которого платим (необязательно — возьмём основной)"),
+        paid_on: str("Дата оплаты yyyy-mm-dd (по умолчанию сегодня)"),
+      },
+      ["payout"],
+    ),
   },
 
   // ────────────────── Цепочка поставок и РАСХОДЫ ──────────────────
@@ -1325,20 +1396,48 @@ async function execPnlReport(ctx: ToolCtx, input: { months?: number }): Promise<
   const months = Math.min(12, Math.max(1, Math.round(Number(input.months) || 3)));
   const view = await getPnlView(ctx.db, months);
   const t = view.total;
+  const cur = view.currency === "RUB" ? "₽" : view.currency;
+  const money = (v: number) => `${num(v)} ${cur}`;
   const lines = [
-    `ПРИБЫЛЬ ЗА ${months} МЕС.:`,
-    `- Выручка (продажи WB): ${num(t.revenueRub)} ₽ (${num(t.qty)} шт)`,
-    `- Удержания WB (комиссия и эквайринг): ${num(t.wbFeesRub)} ₽`,
-    `- Себестоимость проданного: ${num(t.cogsRub)} ₽`,
-    `- Валовая прибыль: ${num(t.grossRub)} ₽`,
-    `- Расходы компании: ${num(t.opexRub)} ₽`,
-    ...(t.otherIncomeRub > 0 ? [`- Прочие доходы: ${num(t.otherIncomeRub)} ₽`] : []),
-    `- ЧИСТАЯ ПРИБЫЛЬ: ${num(t.netRub)} ₽ (рентабельность ${t.marginPct}%)`,
+    `ПРИБЫЛЬ ЗА ${months} МЕС.${view.hasWbReport ? " (удержания — из отчёта о реализации WB)" : " (отчёт WB не загружен, удержания оценочные)"}:`,
+    `- Выручка: ${money(t.revenueRub)} (${num(t.qty)} шт)`,
+    `- Удержания WB всего: ${money(t.wbFeesRub)}`,
+  ];
+  if (view.hasWbReport) {
+    lines.push(
+      `  · комиссия: ${money(t.commissionRub)}`,
+      ...(t.acquiringRub > 0 ? [`  · эквайринг: ${money(t.acquiringRub)}`] : []),
+      ...(t.logisticsRub > 0 ? [`  · логистика: ${money(t.logisticsRub)}`] : []),
+      ...(t.storageRub > 0 ? [`  · хранение: ${money(t.storageRub)}`] : []),
+      ...(t.penaltyRub > 0 ? [`  · штрафы: ${money(t.penaltyRub)}`] : []),
+      ...(t.acceptanceRub > 0 ? [`  · платная приёмка: ${money(t.acceptanceRub)}`] : []),
+    );
+  }
+  lines.push(
+    `- Себестоимость проданного: ${money(t.cogsRub)}`,
+    `- Валовая прибыль: ${money(t.grossRub)}`,
+    ...(t.advertRub > 0
+      ? [
+          `- Реклама WB: ${money(t.advertRub)} (ДРР ${
+            t.revenueRub > 0 ? ((t.advertRub / t.revenueRub) * 100).toFixed(1) : "0"
+          }%)`,
+        ]
+      : []),
+    `- Расходы компании: ${money(t.opexRub)}`,
+    ...(t.otherIncomeRub > 0 ? [`- Прочие доходы: ${money(t.otherIncomeRub)}`] : []),
+    `- ЧИСТАЯ ПРИБЫЛЬ: ${money(t.netRub)} (рентабельность ${t.marginPct}%)`,
     "По месяцам:",
     ...view.months.map(
-      (m) => `- ${m.label}: выручка ${num(m.revenueRub)} ₽, чистая прибыль ${num(m.netRub)} ₽ (${m.marginPct}%)`,
+      (m) =>
+        `- ${m.label}: выручка ${money(m.revenueRub)}, чистая прибыль ${money(m.netRub)} (${m.marginPct}%)` +
+        (m.revenueRub > 0 && m.source === "estimate" ? " — отчёт WB ещё не закрыт, оценка" : ""),
     ),
-  ];
+  );
+  if (view.wbBalance) {
+    lines.push(
+      `На балансе кабинета WB (ещё не перечислено): ${num(view.wbBalance.current)} ${view.wbBalance.currency}.`,
+    );
+  }
   // Оговорки обязательны: без них цифра прибыли вводит в заблуждение
   if (view.costCoveragePct < 95) {
     lines.push(
@@ -1346,12 +1445,10 @@ async function execPnlReport(ctx: ToolCtx, input: { months?: number }): Promise<
     );
   }
   if (!view.hasExpenses) {
-    lines.push("ВАЖНО: расходы компании не внесены — прибыль без рекламы, зарплат и налогов. Скажи об этом.");
+    lines.push("ВАЖНО: расходы компании не внесены — прибыль без зарплат, налогов и внешней рекламы.");
   }
-  if (view.advertSpendRub > 0) {
-    lines.push(
-      `Справочно: по данным кабинета WB на рекламу потрачено ${num(view.advertSpendRub)} ₽ за период.`,
-    );
+  if (view.currency !== "RUB") {
+    lines.push(`ВАЖНО: кабинет ведёт расчёты в ${view.currency} — суммы выше в этой валюте, не в рублях.`);
   }
   return lines.join("\n");
 }
@@ -1385,6 +1482,125 @@ async function execCompanyExpenses(ctx: ToolCtx, input: { days?: number }): Prom
           `${t.note ? ` · ${t.note}` : ""}${t.authorName ? ` · внёс ${t.authorName}` : ""}`,
       ),
   ].join("\n");
+}
+
+// ── Заявки на выплату (правила — в data/payouts-core) ───────────────────────
+
+async function execRequestPayout(
+  ctx: ToolCtx,
+  input: { amount?: number; title?: string; kind?: string; currency?: string; payee?: string; due_date?: string; supply?: string },
+): Promise<string> {
+  const kind = ["salary", "contractor", "factory", "reimbursement", "other"].includes(String(input.kind))
+    ? (String(input.kind) as PayoutKind)
+    : "contractor";
+
+  // Счёт фабрики стараемся привязать к поставке — тогда оплата закроет долг
+  let supplyId: string | null = null;
+  if (input.supply) {
+    const matches = await findSupplies(ctx.db, String(input.supply));
+    const picked = pickOne(matches, (m) => m.title, String(input.supply), "Поставки");
+    if ("ask" in picked) return picked.ask;
+    supplyId = picked.row.id;
+  }
+
+  const result = await createPayoutRequest(ctx.db, cashActorOf(ctx.user), {
+    kind,
+    title: String(input.title ?? "").trim(),
+    amount: Number(input.amount),
+    currency: (["rub", "kgs", "cny", "uzs"].includes(String(input.currency))
+      ? String(input.currency)
+      : "rub") as Currency,
+    payee: input.payee ? String(input.payee) : null,
+    dueDate: input.due_date ? String(input.due_date) : null,
+    supplyId,
+  });
+  if (!result.ok) return `Не удалось создать заявку: ${result.message}`;
+  ctx.touch();
+  return `${result.message} Руководителю ушло уведомление в Telegram.`;
+}
+
+async function execPayoutsList(ctx: ToolCtx): Promise<string> {
+  const view = await getPayouts(ctx.db, { id: ctx.user.id, role: ctx.user.role });
+  if (!view.items.length) return "ЗАЯВОК НА ВЫПЛАТУ нет.";
+  const money = (p: { amount: number; currency: string }) =>
+    `${num(p.amount)} ${CURRENCY_LABEL[p.currency] ?? p.currency}`;
+  const lines = [
+    `ЗАЯВКИ НА ВЫПЛАТУ: ждут решения ${view.pendingCount} на ${num(view.pendingRub)} ₽, ` +
+      `согласовано к оплате ${num(view.approvedRub)} ₽, выплачено за месяц ${num(view.paidMonthRub)} ₽.`,
+  ];
+  for (const p of view.items.slice(0, 15)) {
+    lines.push(
+      `- «${p.title}» ${money(p)} · ${PAYOUT_KIND_LABELS[p.kind]} · ${PAYOUT_STATUS_LABELS[p.status]} · ` +
+        `просит ${p.requesterName}` +
+        (p.payee ? ` · кому: ${p.payee}` : "") +
+        (p.dueDate ? ` · до ${p.dueDate}` : "") +
+        (p.supplyTitle ? ` · поставка «${p.supplyTitle}»` : ""),
+    );
+  }
+  return lines.join("\n");
+}
+
+// Поиск заявки по части названия среди тех, что видит пользователь
+async function findPayout(
+  ctx: ToolCtx,
+  query: string,
+  statuses: string[],
+): Promise<{ ask: string } | { row: { id: string; title: string } }> {
+  const view = await getPayouts(ctx.db, { id: ctx.user.id, role: ctx.user.role });
+  const pool = view.items.filter((p) => statuses.includes(p.status));
+  const norm = query.trim().toLowerCase();
+  const matches = norm ? pool.filter((p) => p.title.toLowerCase().includes(norm)) : pool;
+  if (!matches.length) {
+    return {
+      ask: `Заявка «${query}» не найдена среди тех, что ${statuses.includes("approved") ? "ждут оплаты" : "ждут решения"}.`,
+    };
+  }
+  if (matches.length > 1) {
+    return { ask: `Подходит несколько заявок: ${matches.map((m) => `«${m.title}»`).join(", ")}. Уточни, какая.` };
+  }
+  return { row: { id: matches[0].id, title: matches[0].title } };
+}
+
+async function execDecidePayout(
+  ctx: ToolCtx,
+  input: { payout?: string; decision?: string; note?: string },
+): Promise<string> {
+  const decision = input.decision === "reject" ? "reject" : "approve";
+  const found = await findPayout(ctx, String(input.payout ?? ""), ["pending"]);
+  if ("ask" in found) return found.ask;
+  const res = await decidePayout(ctx.db, cashActorOf(ctx.user), found.row.id, decision, input.note ?? null);
+  if (!res.ok) return `Не удалось: ${res.message}`;
+  ctx.touch();
+  return res.message;
+}
+
+async function execPayPayout(
+  ctx: ToolCtx,
+  input: { payout?: string; account?: string; paid_on?: string },
+): Promise<string> {
+  const found = await findPayout(ctx, String(input.payout ?? ""), ["approved", "pending"]);
+  if ("ask" in found) return found.ask;
+
+  let accountId: string | null = null;
+  if (input.account) {
+    const accounts = await findAccounts(ctx.db, String(input.account));
+    if (!accounts.length) return `Счёт «${input.account}» не найден.`;
+    if (accounts.length > 1) {
+      return `Подходит несколько счетов: ${accounts.map((a) => a.name).join(", ")}. Уточни, с какого платим.`;
+    }
+    accountId = accounts[0].id;
+  } else {
+    const fallback = await pickDefaultAccount(ctx.db);
+    if (!fallback) return "Счетов кассы ещё нет — заведите счёт в CRM → Финансы → Касса.";
+    accountId = fallback.id;
+  }
+
+  const res = await payPayout(ctx.db, cashActorOf(ctx.user), found.row.id, accountId, {
+    paidOn: input.paid_on ?? null,
+  });
+  if (!res.ok) return `Не удалось оплатить: ${res.message}`;
+  ctx.touch();
+  return `${res.message}${input.account ? "" : " Счёт выбран автоматически — скажи об этом сотруднику."}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2082,6 +2298,10 @@ const HANDLERS: Record<string, Handler> = {
   cash_balance: (ctx) => execCashBalance(ctx),
   pnl_report: execPnlReport as Handler,
   company_expenses: execCompanyExpenses as Handler,
+  request_payout: execRequestPayout as Handler,
+  payouts_list: (ctx) => execPayoutsList(ctx),
+  decide_payout: execDecidePayout as Handler,
+  pay_payout: execPayPayout as Handler,
   supplies_list: execSuppliesList as Handler,
   create_factory: execCreateFactory as Handler,
   create_supply: execCreateSupply as Handler,

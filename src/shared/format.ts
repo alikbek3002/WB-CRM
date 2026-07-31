@@ -22,18 +22,46 @@ export function formatPercent(value: number, digits = 1): string {
 }
 
 // Мультивалюта для цепочки поставок: ¥ (юань), ₽ (рубль), сум (Узбекистан).
-const cny = new Intl.NumberFormat("ru-RU", {
-  style: "currency",
-  currency: "CNY",
-  maximumFractionDigits: 0,
-});
+// Валюта кабинета WB. Юрлицо может быть не российским (у киргизского продавца
+// отчёт приходит в сомах), и подписывать такие суммы рублём — врать в отчёте.
+const CURRENCY_SIGN: Record<string, string> = {
+  RUB: "₽",
+  KGS: "сом",
+  KZT: "₸",
+  BYN: "Br",
+  UZS: "сум",
+  CNY: "¥",
+  USD: "$",
+};
+
+export function currencySign(currency = "RUB"): string {
+  return CURRENCY_SIGN[currency.toUpperCase()] ?? currency.toUpperCase();
+}
+
+// Сумма в валюте кабинета: «1 234 567 сом», «1 234 567 ₽»
+export function formatAmount(value: number, currency = "RUB"): string {
+  return `${num.format(Math.round(value))} ${currencySign(currency)}`;
+}
+
+// Компактно для осей и плотных мест: «220 млн», «1,5 млн», «830 тыс».
+// Дробную часть показываем только там, где она что-то значит: «220,0 млн» на
+// оси — визуальный шум.
+export function formatCompact(value: number): string {
+  const abs = Math.abs(value);
+  if (abs >= 10_000_000) return `${Math.round(value / 1_000_000)} млн`;
+  if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(1).replace(".", ",")} млн`;
+  if (abs >= 1_000) return `${Math.round(value / 1_000)} тыс`;
+  return String(Math.round(value));
+}
 
 export function formatMoney(value: number, currency: string): string {
   switch (currency) {
     case "cny":
-      return cny.format(value); // ¥ 1 234
+      return `${num.format(value)} ¥`;
     case "uzs":
       return `${num.format(value)} сум`; // у сума нет ISO-символа
+    case "kgs":
+      return `${num.format(value)} сом`;
     case "rub":
     default:
       return rub.format(value);

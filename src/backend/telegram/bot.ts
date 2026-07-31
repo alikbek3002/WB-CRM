@@ -23,6 +23,14 @@ import {
   getFinanceRefs,
   getPnlView,
 } from "../data/cash-core";
+import {
+  createPayoutRequest,
+  decidePayout,
+  getPayouts,
+  payPayout,
+  PAYOUT_KIND_LABELS,
+  PAYOUT_STATUS_LABELS,
+} from "../data/payouts-core";
 import { ensureDutyAssignments, localIsoDate } from "../data/duties-core";
 import { completeTask, startTask } from "../data/tasks-core";
 import { invalidateRemote } from "../data/revalidate-remote";
@@ -69,7 +77,9 @@ type Step =
   | "await_duty_report"
   | "await_task_report"
   | "await_expense_amount" // мастер расхода: ждём сумму
-  | "await_expense_note"; // мастер расхода: ждём комментарий
+  | "await_expense_note" // мастер расхода: ждём комментарий
+  | "await_payout_amount" // заявка на выплату: ждём сумму
+  | "await_payout_title"; // заявка на выплату: ждём «за что»
 type SessionData = {
   step: Step;
   login?: string;
@@ -80,6 +90,14 @@ type SessionData = {
   taskId?: string; // задача, по которой ждём текст отчёта (отчёт обязателен)
   testProfileId?: string; // тестовый режим: под каким сотрудником смотрим бот
   expense?: ExpenseDraft; // черновик расхода (мастер «сумма → статья → счёт → коммент»)
+  payout?: PayoutDraft; // черновик заявки на выплату
+};
+
+// Черновик заявки на выплату: мастер идёт в несколько сообщений
+type PayoutDraft = {
+  amount?: number;
+  kind?: "salary" | "contractor" | "factory" | "reimbursement" | "other";
+  payoutId?: string; // заявка, по которой выбираем счёт для оплаты
 };
 
 // Черновик расхода живёт в сессии чата: мастер идёт в несколько сообщений,
@@ -113,6 +131,7 @@ async function readSession(chatId: number): Promise<SessionData> {
     taskId: d.taskId,
     testProfileId: d.testProfileId,
     expense: d.expense,
+    payout: d.payout,
   };
 }
 
@@ -477,6 +496,13 @@ function helpText(user?: AuthedUser): string {
     if (can(user.role, "finance:expense")) {
       act.push("«потратил 15 тысяч на рекламу»");
       act.push("«пришло 800 тысяч от WB на расчётный счёт»");
+    }
+    if (can(user.role, "payout:request")) {
+      act.push("«нужно оплатить фотографу 15 тысяч»");
+    }
+    if (can(user.role, "payout:approve")) {
+      ask.push("«что по выплатам?»");
+      act.push("«согласуй выплату фотографу»");
     }
     if (can(user.role, "supply:view")) ask.push("«сколько потратили на закупку за месяц?»");
     if (can(user.role, "supply:pay")) {
@@ -957,6 +983,10 @@ function financeMenu(user: AuthedUser): InlineKeyboard {
   if (can(user.role, "finance:expense")) {
     kb.text("➕ Записать расход", "fin:add").row();
   }
+  if (can(user.role, "payout:request")) {
+    kb.text("💸 Выплаты", "fin:payouts").row();
+    kb.text("🙋 Запросить выплату", "fin:payreq").row();
+  }
   kb.text("⬅️ В меню", "menu:home");
   return kb;
 }
@@ -1022,31 +1052,59 @@ async function financePlanShort(): Promise<
   return { pct, mark: pct >= 100 ? "🟢" : pct >= 90 ? "🟡" : "🔴", fact, amount };
 }
 
-// ОПиУ за 3 месяца: сколько реально заработали
+// ОПиУ за 3 месяца: сколько реально заработали.
+// Удержания WB — из отчёта о реализации (комиссия, логистика, хранение,
+// штрафы), поэтому цифра совпадает с кабинетом, а не «примерно похожа».
 async function renderPnl(): Promise<string> {
   const view = await getPnlView(admin(), 3);
   const t = view.total;
   const mark = t.netRub >= 0 ? "🟢" : "🔴";
+  const cur = view.currency === "RUB" ? "₽" : view.currency === "KGS" ? "сом" : view.currency;
+  const money = (v: number) => `${num(v)} ${cur}`;
 
   const lines = [
     "📊 <b>Прибыль за 3 месяца</b>",
     "",
-    `${mark} Чистая прибыль — <b>${rub(t.netRub)}</b>`,
+    `${mark} Чистая прибыль — <b>${money(t.netRub)}</b>`,
     `     рентабельность ${t.marginPct}%`,
     "",
     RULE,
     "",
-    `💵 Выручка — ${rub(t.revenueRub)}`,
-    `➖ Удержания WB — ${rub(t.wbFeesRub)}`,
-    `➖ Себестоимость — ${rub(t.cogsRub)}`,
-    `➖ Расходы компании — ${rub(t.opexRub)}`,
+    `💵 Выручка — ${money(t.revenueRub)}`,
+    `➖ Удержания WB — ${money(t.wbFeesRub)}`,
   ];
-  if (t.otherIncomeRub > 0) lines.push(`➕ Прочие доходы — ${rub(t.otherIncomeRub)}`);
+  // Детализация удержаний есть только когда пришёл отчёт WB
+  if (view.hasWbReport) {
+    const parts = [
+      t.commissionRub > 0 ? `комиссия ${num(t.commissionRub)}` : "",
+      t.logisticsRub > 0 ? `логистика ${num(t.logisticsRub)}` : "",
+      t.storageRub > 0 ? `хранение ${num(t.storageRub)}` : "",
+      t.penaltyRub > 0 ? `штрафы ${num(t.penaltyRub)}` : "",
+    ].filter(Boolean);
+    if (parts.length) lines.push(`     <i>${esc(parts.join(" · "))}</i>`);
+  }
+  lines.push(`➖ Себестоимость — ${money(t.cogsRub)}`);
+  if (t.advertRub > 0) {
+    const drr = t.revenueRub > 0 ? ((t.advertRub / t.revenueRub) * 100).toFixed(1) : "0";
+    lines.push(`➖ Реклама WB — ${money(t.advertRub)}`, `     ДРР ${drr}%`);
+  }
+  lines.push(`➖ Расходы компании — ${money(t.opexRub)}`);
+  if (t.otherIncomeRub > 0) lines.push(`➕ Прочие доходы — ${money(t.otherIncomeRub)}`);
 
   lines.push("", RULE, "", "<b>ПО МЕСЯЦАМ</b>");
   for (const m of view.months) {
     const sign = m.netRub >= 0 ? "🟢" : "🔴";
-    lines.push("", `${sign} <b>${esc(m.label)}</b> — ${rub(m.netRub)}`, `     выручка ${rub(m.revenueRub)} · ${m.marginPct}%`);
+    const est = m.revenueRub > 0 && m.source === "estimate" ? " · <i>оценка</i>" : "";
+    lines.push(
+      "",
+      `${sign} <b>${esc(m.label)}</b> — ${money(m.netRub)}${est}`,
+      `     выручка ${money(m.revenueRub)} · ${m.marginPct}%`,
+    );
+  }
+
+  if (view.wbBalance) {
+    const bcur = view.wbBalance.currency === "RUB" ? "₽" : view.wbBalance.currency === "KGS" ? "сом" : view.wbBalance.currency;
+    lines.push("", RULE, "", `🟣 На балансе WB — <b>${num(view.wbBalance.current)} ${bcur}</b>`);
   }
 
   // Без этих оговорок цифра прибыли обманывает — предупреждаем прямо в чате
@@ -1054,8 +1112,14 @@ async function renderPnl(): Promise<string> {
   if (view.costCoveragePct < 95) {
     notes.push(`⚠️ Себестоимость заполнена у ${view.costCoveragePct}% продаж — прибыль завышена.`);
   }
+  if (!view.hasWbReport) {
+    notes.push("⚠️ Отчёт WB ещё не загружен — удержания показаны оценкой.");
+  }
   if (!view.hasExpenses) {
-    notes.push("⚠️ Расходы не внесены — прибыль без рекламы, зарплат и налогов.");
+    notes.push("⚠️ Расходы компании не внесены — прибыль без зарплат и налогов.");
+  }
+  if (view.currency !== "RUB") {
+    notes.push(`ℹ️ Кабинет считает в ${esc(view.currency)} — суммы в этой валюте.`);
   }
   if (notes.length) lines.push("", RULE, "", ...notes);
   return lines.join("\n");
@@ -1156,6 +1220,105 @@ async function renderExpenses(): Promise<string> {
     );
   }
   return lines.join("\n");
+}
+
+// ── Выплаты: заявки команды и фабрик ────────────────────────────────────────
+
+const PAYOUT_STATUS_EMOJI: Record<string, string> = {
+  pending: "🟡",
+  approved: "🔵",
+  paid: "🟢",
+  rejected: "🔴",
+  cancelled: "⚪️",
+};
+
+async function renderPayouts(user: AuthedUser): Promise<{ body: string; kb: InlineKeyboard }> {
+  const view = await getPayouts(admin(), { id: user.id, role: user.role });
+  const lead = can(user.role, "payout:approve");
+  const kb = new InlineKeyboard();
+
+  if (!view.items.length) {
+    kb.text("🙋 Запросить выплату", "fin:payreq").row().text("⬅️ В меню", "menu:home");
+    return {
+      body:
+        "💸 <b>Выплаты</b>\n\n" +
+        (lead
+          ? "Заявок нет — команда пока ничего не просила."
+          : "У вас нет заявок. Нажмите «Запросить выплату» или просто напишите: <i>«нужно оплатить фотографу 15 тысяч»</i>."),
+      kb,
+    };
+  }
+
+  const lines = ["💸 <b>Выплаты</b>"];
+  if (lead && view.pendingCount) {
+    lines.push("", `🟡 Ждут решения — <b>${view.pendingCount}</b> на ${rub(view.pendingRub)}`);
+  }
+  if (view.approvedRub > 0) lines.push(`🔵 Согласовано к оплате — <b>${rub(view.approvedRub)}</b>`);
+  if (view.paidMonthRub > 0) lines.push(`🟢 Выплачено за месяц — ${rub(view.paidMonthRub)}`);
+
+  const active = view.items.filter((i) => i.status === "pending" || i.status === "approved");
+  const done = view.items.filter((i) => i.status === "paid").slice(0, 3);
+
+  if (active.length) {
+    lines.push("", RULE, "", "<b>В РАБОТЕ</b>");
+    for (const p of active.slice(0, 8)) {
+      const cur = p.currency === "rub" ? "₽" : p.currency === "cny" ? "¥" : p.currency === "kgs" ? "сом" : "сум";
+      lines.push(
+        "",
+        `${PAYOUT_STATUS_EMOJI[p.status] ?? "▪️"} <b>${esc(p.title)}</b> — ${num(p.amount)} ${cur}`,
+        `     ${esc(p.requesterName)} · ${esc(PAYOUT_KIND_LABELS[p.kind])} · ${esc(PAYOUT_STATUS_LABELS[p.status])}` +
+          (p.dueDate ? ` · до ${esc(humanDate(p.dueDate))}` : ""),
+      );
+      if (p.payee) lines.push(`     кому: ${esc(p.payee)}`);
+    }
+  }
+  if (done.length) {
+    lines.push("", RULE, "", "<b>ВЫПЛАЧЕНО</b>");
+    for (const p of done) {
+      lines.push(`🟢 <s>${esc(p.title)}</s> — ${rub(p.amountRub)}`);
+    }
+  }
+
+  // Кнопки решений — только руководителю и только по тому, что реально ждёт
+  if (lead) {
+    for (const p of active.slice(0, 6)) {
+      if (p.status === "pending") {
+        kb.text(`✅ ${short(p.title, 18)}`, `pay:ok:${p.id}`)
+          .text("❌", `pay:no:${p.id}`)
+          .row();
+      } else {
+        kb.text(`💰 Оплатить: ${short(p.title, 18)}`, `pay:go:${p.id}`).row();
+      }
+    }
+  }
+  kb.text("🙋 Запросить выплату", "fin:payreq").row();
+  kb.text("⬅️ В меню", "menu:home");
+  return { body: lines.join("\n"), kb };
+}
+
+function payoutKindKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("💼 Зарплата / аванс", "pay:kind:salary")
+    .row()
+    .text("🧑‍💻 Подрядчик, услуги", "pay:kind:contractor")
+    .row()
+    .text("🏭 Счёт фабрики", "pay:kind:factory")
+    .row()
+    .text("🧾 Возмещение расходов", "pay:kind:reimbursement")
+    .row()
+    .text("✖️ Отмена", "fin:cancel");
+}
+
+// Счета для оплаты заявки (кнопки)
+async function payoutAccountKeyboard(payoutId: string): Promise<InlineKeyboard> {
+  const { accounts } = await getFinanceRefs(admin());
+  const kb = new InlineKeyboard();
+  for (const a of accounts) {
+    const cur = a.currency === "rub" ? "" : a.currency === "cny" ? " ¥" : a.currency === "kgs" ? " сом" : " сум";
+    kb.text(`${ACCOUNT_EMOJI[a.kind] ?? "👛"} ${short(a.name, 20)}${cur}`, `pay:acc:${payoutId}:${a.id}`).row();
+  }
+  kb.text("✖️ Отмена", "fin:cancel");
+  return kb;
 }
 
 // ── Мастер расхода: сумма → статья → счёт → комментарий ──────────────────────
@@ -1398,6 +1561,56 @@ async function handleUserInput(ctx: Context, text: string): Promise<void> {
       return;
     }
 
+    // Заявка на выплату: сумма → тип кнопками
+    if (sess0.step === "await_payout_amount") {
+      const amount = parseAmount(text);
+      if (!amount) {
+        await ctx.reply(
+          "Не понял сумму. Напишите числом — например <code>15000</code> или <code>15 тыс</code>.",
+          { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("✖️ Отмена", "fin:cancel") },
+        );
+        return;
+      }
+      await writeSession(chatId, { ...sess0, payout: { ...sess0.payout, amount } });
+      await ctx.reply(`🙋 <b>${rub(amount)}</b>\n\nЧто это за выплата?`, {
+        parse_mode: "HTML",
+        reply_markup: payoutKindKeyboard(),
+      });
+      return;
+    }
+
+    // Заявка на выплату: «за что» — последний шаг, сразу отправляем руководителю
+    if (sess0.step === "await_payout_title") {
+      const draft = sess0.payout ?? {};
+      await writeSession(chatId, {
+        step: "idle",
+        aiHistory: sess0.aiHistory,
+        testProfileId: sess0.testProfileId,
+      });
+      if (!draft.amount) {
+        await ctx.reply("⚠️ Черновик заявки потерялся. Начните заново: /menu → 💰 Финансы → 🙋 Запросить выплату");
+        return;
+      }
+      const res = await createPayoutRequest(
+        admin(),
+        { id: linked.id, name: linked.name, role: linked.role, roleLabel: linked.roleLabel },
+        {
+          kind: draft.kind ?? "contractor",
+          title: text.trim().slice(0, 140),
+          amount: draft.amount,
+          currency: "rub",
+        },
+      );
+      if (res.ok) void invalidateRemote();
+      await ctx.reply(
+        res.ok
+          ? `✅ <b>Заявка отправлена</b>\n\n💸 ${rub(draft.amount)} · ${esc(text.trim().slice(0, 100))}\n\n<i>Руководитель получил уведомление — ответ придёт сюда же.</i>`
+          : `⚠️ ${esc(res.message)}`,
+        { parse_mode: "HTML", reply_markup: financeMenu(linked) },
+      );
+      return;
+    }
+
     // Отчёт по задаче регламента
     if (sess0.step === "await_duty_report" && sess0.dutyId) {
       if (!text) {
@@ -1609,6 +1822,37 @@ async function handleFinanceCallback(
       return;
     }
 
+    // Список заявок доступен всем, у кого есть право просить выплату
+    if (action === "payouts") {
+      if (!can(user.role, "payout:request")) {
+        await ctx.answerCallbackQuery({ text: "Нет доступа", show_alert: true });
+        return;
+      }
+      await ctx.answerCallbackQuery();
+      const { body, kb } = await renderPayouts(user);
+      await editText(ctx, body, kb);
+      return;
+    }
+
+    // Заявка на выплату: сумма → тип → за что
+    if (action === "payreq") {
+      if (!can(user.role, "payout:request")) {
+        await ctx.answerCallbackQuery({ text: "Нет доступа", show_alert: true });
+        return;
+      }
+      if (chatId != null) {
+        const sess = await readSession(chatId);
+        await writeSession(chatId, { ...sess, step: "await_payout_amount", payout: {} });
+      }
+      await ctx.answerCallbackQuery();
+      await ctx.reply(
+        "🙋 <b>Заявка на выплату</b>\n\nСколько нужно выплатить? Напишите сумму — " +
+          "например <code>15000</code> или <code>15 тыс</code>.",
+        { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("✖️ Отмена", "fin:cancel") },
+      );
+      return;
+    }
+
     if (action === "cancel") {
       if (chatId != null) {
         const sess = await readSession(chatId);
@@ -1714,6 +1958,96 @@ async function handleFinanceCallback(
     await ctx.answerCallbackQuery();
   } catch (e) {
     console.error("[telegram] финансы:", e);
+    await ctx.answerCallbackQuery({ text: "⚠️ Ошибка, попробуйте ещё раз", show_alert: true }).catch(() => {});
+  }
+}
+
+// Решения по заявкам на выплату. Право проверяем на каждом шаге: кнопка могла
+// остаться в старом сообщении, а роль — смениться.
+async function handlePayoutCallback(
+  ctx: Context,
+  user: AuthedUser,
+  action: string,
+): Promise<void> {
+  const chatId = ctx.chat?.id;
+  try {
+    // Выбор типа в мастере заявки
+    if (action.startsWith("kind:")) {
+      const kind = action.slice("kind:".length) as
+        | "salary"
+        | "contractor"
+        | "factory"
+        | "reimbursement"
+        | "other";
+      if (chatId == null) return;
+      const sess = await readSession(chatId);
+      if (!sess.payout?.amount) {
+        await ctx.answerCallbackQuery({ text: "Начните заново: 🙋 Запросить выплату", show_alert: true });
+        return;
+      }
+      await writeSession(chatId, {
+        ...sess,
+        step: "await_payout_title",
+        payout: { ...sess.payout, kind },
+      });
+      await ctx.answerCallbackQuery({ text: PAYOUT_KIND_LABELS[kind] });
+      await editText(
+        ctx,
+        `🙋 <b>${rub(sess.payout.amount)}</b> · ${esc(PAYOUT_KIND_LABELS[kind])}\n\n` +
+          "За что выплата? Напишите одним сообщением — можно голосовым.\n" +
+          "<i>Например: «съёмка карточек, фотограф Азамат» или «остаток за партию пижам».</i>",
+      );
+      return;
+    }
+
+    const [verb, id, accountId] = action.split(":");
+    if (!id) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    const actor = { id: user.id, name: user.name, role: user.role, roleLabel: user.roleLabel };
+
+    if (verb === "ok" || verb === "no") {
+      if (!can(user.role, "payout:approve")) {
+        await ctx.answerCallbackQuery({ text: "Решать может только руководитель", show_alert: true });
+        return;
+      }
+      const res = await decidePayout(admin(), actor, id, verb === "ok" ? "approve" : "reject");
+      void invalidateRemote();
+      await ctx.answerCallbackQuery({ text: res.ok ? "Готово" : res.message, show_alert: !res.ok });
+      const { body, kb } = await renderPayouts(user);
+      await editText(ctx, body, kb);
+      return;
+    }
+
+    // «Оплатить» → показываем счета
+    if (verb === "go") {
+      if (!can(user.role, "payout:approve") || !can(user.role, "finance:expense")) {
+        await ctx.answerCallbackQuery({ text: "Оплачивать может только руководитель", show_alert: true });
+        return;
+      }
+      await ctx.answerCallbackQuery();
+      await editText(ctx, "💰 <b>Оплата заявки</b>\n\nС какого счёта платим?", await payoutAccountKeyboard(id));
+      return;
+    }
+
+    // Счёт выбран — проводим оплату
+    if (verb === "acc" && accountId) {
+      if (!can(user.role, "payout:approve") || !can(user.role, "finance:expense")) {
+        await ctx.answerCallbackQuery({ text: "Оплачивать может только руководитель", show_alert: true });
+        return;
+      }
+      const res = await payPayout(admin(), actor, id, accountId);
+      void invalidateRemote();
+      await ctx.answerCallbackQuery({ text: res.ok ? "Оплачено" : res.message, show_alert: !res.ok });
+      const { body, kb } = await renderPayouts(user);
+      await editText(ctx, res.ok ? `✅ ${esc(res.message)}\n\n${body}` : body, kb);
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+  } catch (e) {
+    console.error("[telegram] выплаты:", e);
     await ctx.answerCallbackQuery({ text: "⚠️ Ошибка, попробуйте ещё раз", show_alert: true }).catch(() => {});
   }
 }
@@ -1852,6 +2186,12 @@ async function handleCallback(ctx: Context): Promise<void> {
   // ── Финансы: разделы и мастер расхода ──
   if (data.startsWith("fin:")) {
     await handleFinanceCallback(ctx, user, data.slice("fin:".length));
+    return;
+  }
+
+  // ── Выплаты: тип заявки, согласование, отказ, оплата ──
+  if (data.startsWith("pay:")) {
+    await handlePayoutCallback(ctx, user, data.slice("pay:".length));
     return;
   }
 

@@ -17,6 +17,7 @@ import {
   Truck,
   Users,
   Wallet,
+  HandCoins,
   Warehouse,
   type LucideIcon,
 } from "lucide-react";
@@ -44,6 +45,7 @@ const NAV: NavGroup[] = [
       { href: "/products", label: "Товары", icon: Package, permission: "products:view" },
       { href: "/stocks", label: "Остатки", icon: Boxes, permission: "products:view" },
       { href: "/finance", label: "Финансы", icon: Wallet, permission: "finance:view" },
+      { href: "/payouts", label: "Выплаты", icon: HandCoins, permission: "payout:request" },
       { href: "/tasks", label: "Задачи", icon: ListChecks, permission: "tasks:view" },
       { href: "/duties", label: "Регламент", icon: ClipboardCheck, permission: "duty:view" },
       { href: "/design", label: "Дизайн", icon: Palette, permission: "design:view" },

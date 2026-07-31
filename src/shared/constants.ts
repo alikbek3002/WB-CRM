@@ -41,6 +41,7 @@ export const SUPPLY_AUTO_ARRIVE_DAYS = 15;
 export const EXCHANGE_RATES: Record<string, number> = {
   cny: 12.5, // юань
   uzs: 0.0068, // сум
+  kgs: 0.93, // сом (валюта кабинета WB у киргизского юрлица)
   rub: 1,
 };
 

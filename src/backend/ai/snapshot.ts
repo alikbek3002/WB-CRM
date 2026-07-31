@@ -7,6 +7,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { DEMO_ORG_ID, DEMO_STORE_ID } from "../../shared/constants";
 import { can, type MemberRole } from "../../shared/rbac";
 import { getCashOverview, getExpensesView, getPnlView } from "../data/cash-core";
+import { getPayouts } from "../data/payouts-core";
 
 export type SnapshotUser = {
   id: string;
@@ -186,11 +187,23 @@ export async function buildSnapshot(
       }
 
       const t = pnl.total;
+      const cur = pnl.currency === "RUB" ? "₽" : pnl.currency;
+      const amt = (v: number) =>
+        `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(v))} ${cur}`;
       lines.push(
-        `ПРИБЫЛЬ за 3 месяца: выручка ${rub(t.revenueRub)}, удержания WB ${rub(t.wbFeesRub)}, ` +
-          `себестоимость ${rub(t.cogsRub)}, расходы ${rub(t.opexRub)} → чистая прибыль ${rub(t.netRub)} ` +
+        `ПРИБЫЛЬ за 3 месяца${pnl.hasWbReport ? " (удержания из отчёта WB)" : " (отчёт WB не загружен, оценка)"}: ` +
+          `выручка ${amt(t.revenueRub)}, удержания WB ${amt(t.wbFeesRub)}, себестоимость ${amt(t.cogsRub)}, ` +
+          `реклама WB ${amt(t.advertRub)}, расходы компании ${amt(t.opexRub)} → чистая прибыль ${amt(t.netRub)} ` +
           `(рентабельность ${t.marginPct}%).`,
       );
+      if (pnl.wbBalance) {
+        lines.push(
+          `- На балансе кабинета WB (ещё не перечислено): ${amt(pnl.wbBalance.current)}.`,
+        );
+      }
+      if (pnl.currency !== "RUB") {
+        lines.push(`- ВНИМАНИЕ: кабинет считает в ${pnl.currency}, суммы выше в этой валюте.`);
+      }
       if (pnl.costCoveragePct < 95) {
         lines.push(
           `- ОГОВОРКА: себестоимость заполнена у ${pnl.costCoveragePct}% продаж, прибыль завышена.`,
@@ -198,6 +211,29 @@ export async function buildSnapshot(
       }
       if (!pnl.hasExpenses) {
         lines.push("- ОГОВОРКА: расходы компании не внесены, прибыль без них.");
+      }
+      return lines.join("\n");
+    }, "");
+    if (block) sections.push(block);
+  }
+
+  // ── Заявки на выплату: руководителю — что ждёт решения, сотруднику — свои ──
+  if (can(user.role, "payout:request")) {
+    const block = await safe(async () => {
+      const view = await getPayouts(db, { id: user.id, role: user.role });
+      if (!view.items.length) return "";
+      const lead = can(user.role, "payout:approve");
+      const lines = [
+        lead
+          ? `ЗАЯВКИ НА ВЫПЛАТУ: ждут решения ${view.pendingCount} на ${rub(view.pendingRub)}, ` +
+            `согласовано к оплате ${rub(view.approvedRub)}, выплачено за месяц ${rub(view.paidMonthRub)}.`
+          : "МОИ ЗАЯВКИ НА ВЫПЛАТУ:",
+      ];
+      for (const p of view.items.slice(0, 8)) {
+        lines.push(
+          `- «${p.title}» ${Math.round(p.amount)} ${p.currency} · ${p.status} · просит ${p.requesterName}` +
+            (p.dueDate ? ` · до ${p.dueDate}` : ""),
+        );
       }
       return lines.join("\n");
     }, "");

@@ -24,13 +24,22 @@ export async function GET(request: Request) {
     );
   }
 
-  // mode=live → только живые данные (остатки/заказы/продажи): инкрементально и часто.
-  // Иначе полный синк (+ карточки/цены) — реже. Разводит их планировщик бота.
+  // Три трека, чтобы ни один запуск не упирался в таймаут:
+  //   live    — остатки/заказы/продажи: инкрементально и часто;
+  //   full    — то же + карточки и цены: реже;
+  //   finance — отчёт о реализации, реклама и баланс: раз в сутки. Отдельно,
+  //             потому что statistics и advert-api дают 1 запрос в минуту —
+  //             прогон идёт минутами и не должен блокировать живые данные.
   const mode = new URL(request.url).searchParams.get("mode");
   const sources: WbSyncSource[] | undefined =
-    mode === "live" ? ["stocks", "orders", "sales"] : undefined;
+    mode === "live"
+      ? ["stocks", "orders", "sales"]
+      : mode === "finance"
+        ? ["finance", "advert"]
+        : ["cards", "stocks", "orders", "sales"];
 
-  const result = await runWbSync(admin, 2, 3, sources);
+  // Финансам нужно окно шире: отчёты WB приходят неделями, а не днями
+  const result = await runWbSync(admin, mode === "finance" ? 60 : 2, 3, sources);
   // Прогрев кэша здесь НЕ делаем: revalidateTag сбрасывает тег в конце ЭТОГО
   // запроса, прогретое выбрасывается. Планировщик бота после синка дёргает
   // отдельный /api/cron/warm — там прогрев реально сохраняется.

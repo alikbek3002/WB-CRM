@@ -43,6 +43,7 @@ const CURRENCY_LABEL: Record<Currency, string> = {
   cny: "¥ юань",
   uzs: "сум",
   rub: "₽ рубль",
+  kgs: "сом", // валюта кабинета WB (киргизское юрлицо)
 };
 
 const STATUS_ORDER: (SupplyStatus | "all")[] = [

@@ -49,13 +49,14 @@ import {
   TableRow,
 } from "@/frontend/components/ui/table";
 import { AddTxButton } from "@/frontend/components/finance/tx-dialog";
+import { StatRow } from "@/frontend/components/finance/stat-row";
 import {
   AXIS_TICK,
   GRID_STROKE,
   SERIES,
   TOOLTIP_STYLE,
 } from "@/frontend/components/charts/palette";
-import { formatMoney, formatRub } from "@/shared/format";
+import { formatAmount, formatMoney, formatRub } from "@/shared/format";
 import { cn } from "@/shared/utils";
 import type {
   CashAccountKind,
@@ -290,49 +291,41 @@ export function CashBoard({
         )}
       </div>
 
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Card>
-          <CardContent className="py-4">
-            <div className="text-xs text-muted-foreground">Всего денег</div>
-            <div className="text-xl font-semibold tabular-nums">
-              {formatRub(overview.totalRub)}
-            </div>
-            <div className="text-[11px] text-muted-foreground">
-              по {overview.accounts.length} счетам
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="py-4">
-            <div className="text-xs text-muted-foreground">Пришло за месяц</div>
-            <div className="text-xl font-semibold tabular-nums text-emerald-400">
-              {formatRub(overview.monthInRub)}
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="py-4">
-            <div className="text-xs text-muted-foreground">Потрачено за месяц</div>
-            <div className="text-xl font-semibold tabular-nums text-red-400">
-              {formatRub(overview.monthOutRub)}
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="py-4">
-            <div className="text-xs text-muted-foreground">Итог месяца</div>
-            <div
-              className={cn(
-                "text-xl font-semibold tabular-nums",
-                monthNet >= 0 ? "text-emerald-400" : "text-red-400",
-              )}
-            >
-              {monthNet >= 0 ? "+" : ""}
-              {formatRub(monthNet)}
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+      <StatRow
+        stats={[
+          {
+            label: "Всего денег",
+            value: formatRub(overview.totalRub),
+            hint: `по ${overview.accounts.length} счетам`,
+          },
+          {
+            label: "Пришло за месяц",
+            value: formatRub(overview.monthInRub),
+            tone: "good",
+          },
+          {
+            label: "Потрачено за месяц",
+            value: formatRub(overview.monthOutRub),
+            tone: "bad",
+          },
+          {
+            label: "Итог месяца",
+            value: `${monthNet >= 0 ? "+" : ""}${formatRub(monthNet)}`,
+            tone: monthNet >= 0 ? "good" : "bad",
+            hint: "приход минус расход",
+          },
+          ...(overview.wbBalance
+            ? [
+                {
+                  label: "В кабинете WB",
+                  value: formatAmount(overview.wbBalance.current, overview.wbBalance.currency),
+                  hint: "маркетплейс ещё не перечислил",
+                  tone: "muted" as const,
+                },
+              ]
+            : []),
+        ]}
+      />
 
       <div className="grid gap-3 lg:grid-cols-2">
         <Card>
@@ -344,6 +337,27 @@ export function CashBoard({
               <p className="py-6 text-center text-sm text-muted-foreground">
                 Счетов пока нет. Нажмите «Новый счёт» и укажите, сколько денег есть сейчас.
               </p>
+            )}
+            {overview.wbBalance && (
+              <div className="flex items-center justify-between rounded-lg border border-dashed border-border/60 px-3 py-2">
+                <div className="flex items-center gap-2">
+                  <Wallet className="size-4 text-muted-foreground" />
+                  <div>
+                    <div className="text-sm font-medium">Кабинет Wildberries</div>
+                    <div className="text-[11px] text-muted-foreground">
+                      ещё не перечислено · проверено {dmy(overview.wbBalance.checkedAt.slice(0, 10))}
+                    </div>
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="font-medium tabular-nums">
+                    {formatAmount(overview.wbBalance.current, overview.wbBalance.currency)}
+                  </div>
+                  <div className="text-[11px] text-muted-foreground tabular-nums">
+                    к выводу {formatAmount(overview.wbBalance.forWithdraw, overview.wbBalance.currency)}
+                  </div>
+                </div>
+              </div>
             )}
             {overview.accounts.map((a) => {
               const Icon = ACCOUNT_ICON[a.kind];

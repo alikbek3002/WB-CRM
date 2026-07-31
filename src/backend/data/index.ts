@@ -15,7 +15,10 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { unstable_cache } from "next/cache";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
+import type { MemberRole } from "@/shared/rbac";
+import type { PnlMonth, PnlView } from "@/shared/types";
 import * as mock from "./mock";
+import * as payouts from "./payouts-core";
 import * as db from "./supabase";
 
 export const dataSource = () => (getSupabaseAdmin() ? "supabase" : "mock");
@@ -92,6 +95,7 @@ export const getSalesPlanView = cachedRead(
 
 export const getCashOverview = cachedRead("cash", db.getCashOverview, () => ({
   accounts: [],
+  wbBalance: null,
   totalRub: 0,
   monthInRub: 0,
   monthOutRub: 0,
@@ -124,36 +128,59 @@ export const getExpensesView = (from?: string, to?: string) =>
     { revalidate: READ_TTL_SECONDS, tags: [WB_DATA_TAG, `${WB_DATA_TAG}:expenses`] },
   )();
 
+const EMPTY_PNL_MONTH: PnlMonth = {
+  month: "",
+  label: "Итого",
+  revenueRub: 0,
+  wbFeesRub: 0,
+  commissionRub: 0,
+  acquiringRub: 0,
+  logisticsRub: 0,
+  storageRub: 0,
+  penaltyRub: 0,
+  acceptanceRub: 0,
+  deductionRub: 0,
+  advertRub: 0,
+  cogsRub: 0,
+  grossRub: 0,
+  opexRub: 0,
+  otherIncomeRub: 0,
+  netRub: 0,
+  marginPct: 0,
+  qty: 0,
+  costCoveragePct: 0,
+  source: "estimate",
+};
+
 export const getPnlView = (monthsBack = 6) =>
   unstable_cache(
     () =>
-      fromDb(
+      fromDb<PnlView>(
         (client) => db.getPnlView(client, monthsBack),
         () => ({
           months: [],
-          total: {
-            month: "",
-            label: "Итого",
-            revenueRub: 0,
-            wbFeesRub: 0,
-            cogsRub: 0,
-            grossRub: 0,
-            opexRub: 0,
-            otherIncomeRub: 0,
-            netRub: 0,
-            marginPct: 0,
-            qty: 0,
-            costCoveragePct: 0,
-          },
+          total: EMPTY_PNL_MONTH,
           expenseSlices: [],
           costCoveragePct: 0,
           hasExpenses: false,
+          hasWbReport: false,
+          reportUntil: null,
           advertSpendRub: 0,
+          currency: "RUB",
+          wbBalance: null,
         }),
       ),
     ["wb-data", "pnl", String(monthsBack)],
     { revalidate: READ_TTL_SECONDS, tags: [WB_DATA_TAG, `${WB_DATA_TAG}:pnl`] },
   )();
+
+// Заявки на выплату: список зависит от того, кто смотрит (свои vs все),
+// и меняется каждым решением — кэшировать нечего.
+export const getPayouts = (viewer: { id: string; role: MemberRole }) =>
+  fromDb(
+    (client) => payouts.getPayouts(client, viewer),
+    () => ({ items: [], pendingCount: 0, pendingRub: 0, approvedRub: 0, paidMonthRub: 0 }),
+  );
 
 export const getTasks = cachedRead("tasks", db.getTasks, mock.getTasks);
 
@@ -240,6 +267,9 @@ export async function warmReadCache(): Promise<{ ms: number; failed: number }> {
     getFinanceRows,
     getSalesPlanView,
     getCashOverview,
+    getFinanceRefs,
+    () => getPnlView(6), // ОПиУ — самая тяжёлая вкладка финансов
+    () => getExpensesView(), // расходы текущего месяца
     getTasks,
     getIntegrations,
     getTariffs,

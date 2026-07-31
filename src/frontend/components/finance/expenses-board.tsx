@@ -15,8 +15,10 @@ import {
   TableRow,
 } from "@/frontend/components/ui/table";
 import { AddTxButton, type AccountOpt } from "@/frontend/components/finance/tx-dialog";
+import { StatRow } from "@/frontend/components/finance/stat-row";
+import { StructureBar } from "@/frontend/components/finance/structure-bar";
+import { SERIES } from "@/frontend/components/charts/palette";
 import { formatMoney, formatRub } from "@/shared/format";
-import { cn } from "@/shared/utils";
 import type { ExpenseCategory, ExpensesView } from "@/shared/types";
 
 // Готовые периоды: месяц открывается по умолчанию, остальное — в один клик
@@ -106,77 +108,58 @@ export function ExpensesBoard({
         )}
       </div>
 
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Card>
-          <CardContent className="py-4">
-            <div className="text-xs text-muted-foreground">
-              Расходы за {dmy(view.from)} — {dmy(view.to)}
-            </div>
-            <div className="text-xl font-semibold tabular-nums">{formatRub(view.totalRub)}</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="py-4">
-            <div className="text-xs text-muted-foreground">Влияют на прибыль</div>
-            <div className="text-xl font-semibold tabular-nums">{formatRub(view.opexRub)}</div>
-            <div className="text-[11px] text-muted-foreground">
-              без закупа товара и выплат владельцу
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="py-4">
-            <div className="text-xs text-muted-foreground">Операций</div>
-            <div className="text-xl font-semibold tabular-nums">{view.items.length}</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="py-4">
-            <div className="text-xs text-muted-foreground">Самая крупная статья</div>
-            <div className="truncate text-xl font-semibold">
-              {view.categories[0]
-                ? `${view.categories[0].emoji ?? ""} ${view.categories[0].name}`.trim()
-                : "—"}
-            </div>
-            {view.categories[0] && (
-              <div className="text-[11px] text-muted-foreground">
-                {formatRub(view.categories[0].amountRub)} · {view.categories[0].sharePct}%
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
+      <StatRow
+        stats={[
+          {
+            label: `Расходы · ${dmy(view.from)} — ${dmy(view.to)}`,
+            value: formatRub(view.totalRub),
+            hint: `${view.items.length} операций`,
+          },
+          {
+            label: "Влияют на прибыль",
+            value: formatRub(view.opexRub),
+            hint: "без закупа товара и выплат владельцу",
+          },
+          {
+            label: "Крупнейшая статья",
+            value: view.categories[0]
+              ? `${view.categories[0].emoji ?? ""} ${view.categories[0].name}`.trim()
+              : "—",
+            hint: view.categories[0]
+              ? `${formatRub(view.categories[0].amountRub)} · ${view.categories[0].sharePct}%`
+              : undefined,
+          },
+          {
+            label: "Средний расход",
+            value: view.items.length
+              ? formatRub(Math.round(view.totalRub / view.items.length))
+              : "—",
+            hint: "на одну операцию",
+            tone: "muted",
+          },
+        ]}
+      />
 
-      {view.categories.length > 0 && (
+      {view.categories.length > 1 && (
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm">По статьям</CardTitle>
+            <CardTitle className="text-sm">
+              Структура расходов
+              <span className="ml-2 font-normal text-muted-foreground">
+                доля каждой статьи от {formatRub(view.totalRub)}
+              </span>
+            </CardTitle>
           </CardHeader>
-          <CardContent className="space-y-2">
-            {view.categories.map((c) => (
-              <div key={c.name} className="space-y-1">
-                <div className="flex items-center justify-between text-sm">
-                  <span>
-                    {c.emoji ? `${c.emoji} ` : ""}
-                    {c.name}
-                    <span className="ml-2 text-xs text-muted-foreground">
-                      {c.txCount} оп.
-                      {!c.inPnl && " · не влияет на прибыль"}
-                    </span>
-                  </span>
-                  <span className="tabular-nums">
-                    {formatRub(c.amountRub)}
-                    <span className="ml-2 text-xs text-muted-foreground">{c.sharePct}%</span>
-                  </span>
-                </div>
-                <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                  <div
-                    className={cn("h-full rounded-full", c.inPnl ? "bg-primary/70" : "bg-muted-foreground/40")}
-                    style={{ width: `${Math.min(100, c.sharePct)}%` }}
-                  />
-                </div>
-              </div>
-            ))}
+          <CardContent>
+            <StructureBar
+              total={view.totalRub}
+              formatValue={(v) => formatRub(v)}
+              segments={view.categories.slice(0, 6).map((c, i) => ({
+                label: c.name,
+                value: c.amountRub,
+                color: SERIES[i % SERIES.length],
+              }))}
+            />
           </CardContent>
         </Card>
       )}

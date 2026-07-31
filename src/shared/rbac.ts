@@ -36,6 +36,8 @@ export type Permission =
   | "finance:plan" // задать план продаж WB на период
   | "finance:cash" // касса: остатки по счетам, движение денег, ОПиУ
   | "finance:expense" // вносить расходы/приходы и править кассу
+  | "payout:request" // попросить выплату (зарплата, подрядчик, счёт фабрики)
+  | "payout:approve" // согласовать и оплатить заявку
   | "tasks:view" // viewer видит только свои — фильтрация на уровне данных/RLS
   | "team:manage"
   | "integrations:manage" // API-ключи
@@ -68,6 +70,8 @@ const ALL: Permission[] = [
   "finance:plan",
   "finance:cash",
   "finance:expense",
+  "payout:request",
+  "payout:approve",
   "tasks:view",
   "team:manage",
   "integrations:manage",
@@ -101,6 +105,8 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
     "finance:plan",
     "finance:cash",
     "finance:expense",
+    "payout:request",
+    "payout:approve",
     "tasks:view",
     "factory:view",
     "factory:edit",
@@ -118,6 +124,7 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
   ],
   analyst: [
     "dashboard:view",
+    "payout:request",
     "rnp:view",
     "products:view",
     "finance:view",
@@ -129,6 +136,7 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
   ],
   viewer: [
     "dashboard:view",
+    "payout:request",
     "rnp:view",
     "tasks:view",
     "factory:view",
@@ -138,6 +146,7 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
   // ─── Специализации (реальная команда) ───
   designer: [
     "dashboard:view",
+    "payout:request",
     "products:view",
     "tasks:view",
     "duty:view",
@@ -147,6 +156,7 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
   ],
   seo: [
     "dashboard:view",
+    "payout:request",
     "products:view",
     "products:edit", // SEO правит карточки (ключи, тексты)
     "tasks:view",
@@ -158,6 +168,7 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
   ],
   kiz: [
     "dashboard:view",
+    "payout:request",
     "products:view",
     "supply:view",
     "fulfillment:view",
@@ -167,6 +178,7 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
   ],
   adv: [
     "dashboard:view",
+    "payout:request",
     "products:view",
     "rnp:view",
     "tasks:view",
@@ -177,6 +189,7 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
   ],
   shipping: [
     "dashboard:view",
+    "payout:request",
     "products:view",
     "supply:view",
     "supply:edit",

@@ -5,9 +5,14 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { DEMO_STORE_ID } from "@/shared/constants";
+import { syncWbPayoutsToCash } from "@/backend/data/cash-core";
 import {
   decodeTokenMeta,
+  fetchAccountBalance,
+  fetchAdvertCampaigns,
+  fetchAdvertStats,
   fetchAllCards,
+  fetchFinanceReport,
   fetchOrders,
   fetchPrices,
   fetchSales,
@@ -26,16 +31,31 @@ function isoDate(d: Date): string {
 
 const CHUNK = 500;
 
+// Финансовый отчёт: страница по 100k строк, до 6 страниц за прогон (между
+// страницами обязательная минутная пауза — лимит statistics 1 запрос/мин).
+// Хвост, который не влез, догрузится следующим запуском по курсору rr_dt.
+// 50k строк на страницу: при 100k выгрузка крупного кабинета не укладывалась в
+// таймаут запроса и обрывалась (ловили вживую — «operation was aborted»).
+const FINANCE_PAGE = 50_000;
+const FINANCE_MAX_PAGES = 10;
+const FINANCE_TIMEOUT_MS = 600_000;
+
+// Реклама: до 50 кампаний в запросе, 4 партии за прогон, окно 30 дней.
+const ADVERT_BATCH = 50;
+const ADVERT_MAX_BATCHES = 4;
+const ADVERT_WINDOW_DAYS = 30;
+
 async function chunkedUpsert(
   db: SupabaseClient,
   table: string,
   rows: Record<string, unknown>[],
   onConflict: string,
+  chunk = CHUNK,
 ): Promise<number> {
-  for (let i = 0; i < rows.length; i += CHUNK) {
+  for (let i = 0; i < rows.length; i += chunk) {
     const { error } = await db
       .from(table)
-      .upsert(rows.slice(i, i + CHUNK), { onConflict });
+      .upsert(rows.slice(i, i + chunk), { onConflict });
     if (error) throw new Error(`${table}: ${error.message}`);
   }
   return rows.length;
@@ -94,7 +114,14 @@ async function runSource(
 // Какие источники тянуть за прогон. Разделение нужно, чтобы частый авто-синк гонял
 // только «живые» данные (orders/sales/stocks — инкрементально, дёшево), а тяжёлую
 // полную выгрузку каталога (cards+prices) — редко.
-export const WB_SYNC_SOURCES = ["cards", "stocks", "orders", "sales"] as const;
+export const WB_SYNC_SOURCES = [
+  "cards",
+  "stocks",
+  "orders",
+  "sales",
+  "finance", // отчёт о реализации: фактические удержания WB (для ОПиУ)
+  "advert", // расход на внутреннюю рекламу по дням
+] as const;
 export type WbSyncSource = (typeof WB_SYNC_SOURCES)[number];
 
 // days — стартовое окно заказов/продаж при пустой БД (дальше — по курсору
@@ -373,8 +400,201 @@ export async function runWbSync(
     );
   }, counts, errors);
 
-  // ── Кэш дневных агрегатов (0022): тяжёлая агрегация raw_* один раз здесь,
-  // страницы читают готовую мини-таблицу мгновенно ─────────────────────────
+  // ── Финансовый отчёт о реализации → raw_finance_report ───────────────────
+  // Единственный источник фактических удержаний WB (комиссия, эквайринг,
+  // логистика, хранение, штрафы, приёмка) — на нём стоит ОПиУ.
+  // Тянем по дате расчёта: с последней имеющейся rr_dt минус неделя (WB
+  // досчитывает свежие отчёты) до сегодня, страницами по курсору rrdid.
+  if (want.has("finance")) await runSource(db, "finance", null, async () => {
+    const { data: last } = await db
+      .from("raw_finance_report")
+      .select("rr_dt")
+      .eq("store_id", DEMO_STORE_ID)
+      .not("rr_dt", "is", null)
+      .order("rr_dt", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const from = new Date();
+    if (last?.rr_dt) {
+      from.setTime(new Date(last.rr_dt as string).getTime());
+      from.setDate(from.getDate() - 7); // хвост отчёта WB ещё уточняется
+    } else {
+      from.setDate(from.getDate() - days); // первый запуск — стартовое окно
+    }
+    const dateFrom = isoDate(from);
+    const dateTo = isoDate(new Date());
+
+    let rrdid = 0;
+    let total = 0;
+    // Каждая страница — отдельный запрос под лимит «1 запрос/мин»
+    for (let page = 0; page < FINANCE_MAX_PAGES; page++) {
+      if (page > 0) await new Promise((r) => setTimeout(r, RATE_WAIT_MS));
+      const rows = await fetchFinanceReport(
+        token!,
+        dateFrom,
+        dateTo,
+        rrdid,
+        FINANCE_PAGE,
+        FINANCE_TIMEOUT_MS,
+      );
+      if (!rows.length) break;
+
+      const mapped = rows
+        .filter((r) => r.rrd_id != null)
+        .map((r) => ({
+          store_id: DEMO_STORE_ID,
+          rrd_id: r.rrd_id,
+          realizationreport_id: r.realizationreport_id ?? null,
+          nm_id: r.nm_id ?? null,
+          doc_type: r.doc_type_name ?? null,
+          oper_name: r.supplier_oper_name ?? null,
+          currency_name: r.currency_name ?? null,
+          quantity: r.quantity ?? 0,
+          // amount — сумма реализации строки (для возвратов WB отдаёт её же,
+          // знак задаёт doc_type; так считает и кабинет)
+          amount: r.retail_amount ?? r.retail_price_withdisc_rub ?? 0,
+          retail_price: r.retail_price ?? null,
+          commission: r.ppvz_sales_commission ?? 0,
+          for_pay: r.ppvz_for_pay ?? 0,
+          acquiring_fee: r.acquiring_fee ?? 0,
+          logistics: r.delivery_rub ?? 0,
+          rebill_logistic: r.rebill_logistic_cost ?? 0,
+          storage_fee: r.storage_fee ?? 0,
+          penalty: r.penalty ?? 0,
+          acceptance: r.acceptance ?? 0,
+          deduction: r.deduction ?? 0,
+          period_start: r.date_from || null,
+          period_end: r.date_to || null,
+          rr_dt: r.rr_dt || null,
+          sale_dt: r.sale_dt || null,
+        }));
+      // Строк в отчёте сотни тысяч — пишем крупными партиями, иначе один
+      // прогон превращается в сотни round-trip'ов к Supabase
+      total += await chunkedUpsert(db, "raw_finance_report", mapped, "store_id,rrd_id", 2000);
+
+      if (rows.length < FINANCE_PAGE) break; // хвост забрали
+      rrdid = rows[rows.length - 1].rrd_id;
+      if (page === FINANCE_MAX_PAGES - 1) {
+        errors.push("finance: отчёт длиннее лимита страниц — продолжится следующим запуском");
+      }
+    }
+    return total;
+  }, counts, errors);
+
+  // ── Расход на внутреннюю рекламу → raw_advert_daily ──────────────────────
+  // Статистику берём только по кампаниям, которых касались за последние 90
+  // дней: у кабинета их сотни, а лимит рекламного API — 1 запрос/мин.
+  if (want.has("advert")) await runSource(db, "advert", null, async () => {
+    const campaigns = await fetchAdvertCampaigns(token!);
+    const since = new Date();
+    since.setDate(since.getDate() - 90);
+    const ids = campaigns
+      .filter((c) => new Date(c.changeTime).getTime() >= since.getTime())
+      .map((c) => c.advertId);
+    if (!ids.length) return 0;
+
+    const begin = daysAgo(ADVERT_WINDOW_DAYS);
+    const end = isoDate(new Date());
+    const rows: Record<string, unknown>[] = [];
+
+    for (let i = 0, batch = 0; i < ids.length && batch < ADVERT_MAX_BATCHES; i += ADVERT_BATCH, batch++) {
+      if (batch > 0) await new Promise((r) => setTimeout(r, RATE_WAIT_MS));
+      const stats = await fetchAdvertStats(token!, ids.slice(i, i + ADVERT_BATCH), begin, end);
+      for (const c of stats) {
+        for (const d of c.days ?? []) {
+          const day = String(d.date).slice(0, 10);
+
+          // Один товар может встретиться в нескольких площадках (apps) за день —
+          // складываем, иначе upsert по ключу (кампания, товар, день) затрёт
+          // предыдущую площадку и расход окажется занижен.
+          const byNm = new Map<number, { views: number; clicks: number; sum: number; atbs: number; orders: number }>();
+          for (const app of d.apps ?? []) {
+            for (const nm of app.nms ?? []) {
+              const acc = byNm.get(nm.nmId) ?? { views: 0, clicks: 0, sum: 0, atbs: 0, orders: 0 };
+              acc.views += nm.views ?? 0;
+              acc.clicks += nm.clicks ?? 0;
+              acc.sum += nm.sum ?? 0;
+              acc.atbs += nm.atbs ?? 0;
+              acc.orders += nm.orders ?? 0;
+              byNm.set(nm.nmId, acc);
+            }
+          }
+
+          if (byNm.size) {
+            for (const [nmId, a] of byNm) {
+              rows.push({
+                store_id: DEMO_STORE_ID,
+                advert_id: c.advertId,
+                nm_id: nmId,
+                stat_date: day,
+                views: a.views,
+                clicks: a.clicks,
+                ctr: a.views > 0 ? Number(((a.clicks / a.views) * 100).toFixed(3)) : 0,
+                cpc: a.clicks > 0 ? Number((a.sum / a.clicks).toFixed(4)) : 0,
+                sum: a.sum,
+                atbs: a.atbs,
+                orders_count: a.orders,
+                cr: a.clicks > 0 ? Number(((a.orders / a.clicks) * 100).toFixed(3)) : 0,
+              });
+            }
+          } else {
+            // Разбивки по товарам нет (медийные форматы) — пишем итог кампании
+            rows.push({
+              store_id: DEMO_STORE_ID,
+              advert_id: c.advertId,
+              nm_id: 0,
+              stat_date: day,
+              views: d.views ?? 0,
+              clicks: d.clicks ?? 0,
+              ctr: d.ctr ?? 0,
+              cpc: d.cpc ?? 0,
+              sum: d.sum ?? 0,
+              atbs: d.atbs ?? 0,
+              orders_count: d.orders ?? 0,
+              cr: d.cr ?? 0,
+            });
+          }
+        }
+      }
+      if (i + ADVERT_BATCH < ids.length && batch === ADVERT_MAX_BATCHES - 1) {
+        errors.push("advert: кампаний больше лимита партий — остальные догрузятся следующим запуском");
+      }
+    }
+    return chunkedUpsert(db, "raw_advert_daily", rows, "store_id,advert_id,nm_id,stat_date");
+  }, counts, errors);
+
+  // ── Выплаты WB → приход в кассу ──────────────────────────────────────────
+  // Маркетплейс перечисляет деньги за отчётный период — заводим это приходом
+  // автоматически, иначе касса врёт до тех пор, пока кто-то не внесёт руками.
+  if (want.has("finance")) await runSource(db, "wb-payouts", null, async () => {
+    const res = await syncWbPayoutsToCash(
+      db,
+      { id: "", name: "Синхронизация WB", role: "owner", roleLabel: "Система" },
+      120,
+    );
+    return res.created;
+  }, counts, errors);
+
+  // ── Баланс кабинета WB (сколько маркетплейс должен продавцу) ─────────────
+  if (want.has("finance")) await runSource(db, "balance", null, async () => {
+    const b = await fetchAccountBalance(token!);
+    const { error } = await db.from("wb_balance").upsert(
+      {
+        store_id: DEMO_STORE_ID,
+        currency: b.currency ?? "RUB",
+        current_amount: Number(b.current ?? 0),
+        for_withdraw: Number(b.for_withdraw ?? 0),
+        checked_at: new Date().toISOString(),
+      },
+      { onConflict: "store_id" },
+    );
+    if (error) throw new Error(error.message);
+    return 1;
+  }, counts, errors);
+
+  // ── Кэш агрегатов (0022 + 0026): тяжёлая агрегация raw_* один раз здесь,
+  // страницы читают готовые мини-таблицы мгновенно ─────────────────────────
   if (want.has("orders") || want.has("sales")) {
     await runSource(db, "aggregates", null, async () => {
       const { data, error } = await db.rpc("refresh_agg_daily", {
@@ -382,7 +602,13 @@ export async function runWbSync(
         p_days: 60,
       });
       if (error) throw new Error(error.message);
-      return Number(data ?? 0);
+      // Месячный кэш продаж — основа ОПиУ (окно 3 месяца; старое WB не меняет)
+      const { data: months, error: mErr } = await db.rpc("refresh_sales_month", {
+        p_store: DEMO_STORE_ID,
+        p_months: 3,
+      });
+      if (mErr) throw new Error(mErr.message);
+      return Number(data ?? 0) + Number(months ?? 0);
     }, counts, errors);
   }
 

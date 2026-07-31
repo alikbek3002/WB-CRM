@@ -49,6 +49,12 @@ function monthStart(monthsBack = 0): Date {
   return d;
 }
 
+// Последний день месяца по его первому дню (yyyy-mm-01)
+function monthEndOf(month: string): string {
+  const [y, m] = month.split("-").map(Number);
+  return isoDay(new Date(y, m, 0));
+}
+
 function monthLabel(iso: string, withYear = false): string {
   const [y, m] = iso.split("-").map(Number);
   const name = MONTHS_RU[(m ?? 1) - 1] ?? "";
@@ -152,7 +158,7 @@ export async function getCashOverview(db: SupabaseClient): Promise<CashOverview>
   const flowSince = isoDay(monthStart(5)); // текущий месяц + 5 предыдущих
   const thisMonth = isoDay(monthStart(0));
 
-  const [balRes, flowRes, txRes] = await Promise.all([
+  const [balRes, flowRes, txRes, wbRes] = await Promise.all([
     db.rpc("agg_cash_balances", { p_org: DEMO_ORG_ID }),
     db.rpc("agg_cash_flow_monthly", { p_org: DEMO_ORG_ID, p_since: flowSince }),
     db
@@ -162,6 +168,11 @@ export async function getCashOverview(db: SupabaseClient): Promise<CashOverview>
       .order("occurred_on", { ascending: false })
       .order("created_at", { ascending: false })
       .limit(30),
+    db
+      .from("wb_balance")
+      .select("currency, current_amount, for_withdraw, checked_at")
+      .eq("store_id", DEMO_STORE_ID)
+      .maybeSingle(),
   ]);
   if (balRes.error) throw balRes.error;
   if (flowRes.error) throw flowRes.error;
@@ -199,8 +210,20 @@ export async function getCashOverview(db: SupabaseClient): Promise<CashOverview>
   }));
   const current = flow.find((f) => f.month === thisMonth);
 
+  const wb = wbRes.data as
+    | { currency: string; current_amount: number; for_withdraw: number; checked_at: string }
+    | null;
+
   return {
     accounts,
+    wbBalance: wb
+      ? {
+          currency: String(wb.currency ?? "RUB"),
+          current: Math.round(Number(wb.current_amount ?? 0)),
+          forWithdraw: Math.round(Number(wb.for_withdraw ?? 0)),
+          checkedAt: String(wb.checked_at),
+        }
+      : null,
     totalRub: accounts.reduce((t, a) => t + a.balanceRub, 0),
     monthInRub: current?.inRub ?? 0,
     monthOutRub: current?.outRub ?? 0,
@@ -278,23 +301,34 @@ export async function getExpensesView(
   };
 }
 
-// ОПиУ: выручка − удержания WB − себестоимость − расходы = чистая прибыль.
-// Удержания WB = выручка − «к перечислению» (raw_sales.for_pay): реальная
-// комиссия маркетплейса по фактическим продажам, доступна всегда.
-// Логистику/хранение/штрафы вносят статьями расходов — двойного счёта нет.
+// ОПиУ: выручка − удержания WB − себестоимость − реклама − расходы = прибыль.
+//
+// Удержания берём из отчёта о реализации WB (v5/reportDetailByPeriod, синк
+// 0026): комиссия, эквайринг, логистика, хранение, штрафы, приёмка, прочие
+// удержания — каждая строка фактическая, а не выведенная. Пока отчёт за месяц
+// не пришёл (WB закрывает неделю с задержкой), для этого месяца остаётся оценка
+// «выручка − к перечислению» — она помечается source: "estimate", и интерфейс
+// показывает это явно, чтобы цифру не принимали за окончательную.
 export async function getPnlView(db: SupabaseClient, monthsBack = 6): Promise<PnlView> {
   const sinceDate = isoDay(monthStart(monthsBack - 1));
   const today = isoDay(new Date());
 
-  const [salesRes, cogsRes, expRes, incomeRes, advRes, slicesRes] = await Promise.all([
-    db.rpc("agg_sales_monthly", { p_store: DEMO_STORE_ID, p_since: `${sinceDate}T00:00:00` }),
-    db.rpc("agg_cogs_monthly", { p_store: DEMO_STORE_ID, p_since: `${sinceDate}T00:00:00` }),
-    db.rpc("agg_expenses_monthly", { p_org: DEMO_ORG_ID, p_since: sinceDate }),
-    db.rpc("agg_other_income_monthly", { p_org: DEMO_ORG_ID, p_since: sinceDate }),
-    db.rpc("agg_advert_monthly", { p_store: DEMO_STORE_ID, p_since: sinceDate }),
-    db.rpc("agg_expenses_by_category", { p_org: DEMO_ORG_ID, p_from: sinceDate, p_to: today }),
-  ]);
-  for (const r of [salesRes, cogsRes, expRes, incomeRes, advRes, slicesRes]) {
+  const [salesRes, cogsRes, expRes, incomeRes, advRes, slicesRes, wbRes, balRes] =
+    await Promise.all([
+      db.rpc("agg_sales_monthly", { p_store: DEMO_STORE_ID, p_since: `${sinceDate}T00:00:00` }),
+      db.rpc("agg_cogs_monthly", { p_store: DEMO_STORE_ID, p_since: `${sinceDate}T00:00:00` }),
+      db.rpc("agg_expenses_monthly", { p_org: DEMO_ORG_ID, p_since: sinceDate }),
+      db.rpc("agg_other_income_monthly", { p_org: DEMO_ORG_ID, p_since: sinceDate }),
+      db.rpc("agg_advert_monthly", { p_store: DEMO_STORE_ID, p_since: sinceDate }),
+      db.rpc("agg_expenses_by_category", { p_org: DEMO_ORG_ID, p_from: sinceDate, p_to: today }),
+      db.rpc("agg_wb_finance_monthly", { p_store: DEMO_STORE_ID, p_since: sinceDate }),
+      db
+        .from("wb_balance")
+        .select("currency, current_amount, for_withdraw, checked_at")
+        .eq("store_id", DEMO_STORE_ID)
+        .maybeSingle(),
+    ]);
+  for (const r of [salesRes, cogsRes, expRes, incomeRes, advRes, slicesRes, wbRes]) {
     if (r.error) throw r.error;
   }
 
@@ -302,11 +336,38 @@ export async function getPnlView(db: SupabaseClient, monthsBack = 6): Promise<Pn
   type CogsRow = { month: string; cogs_rub: number; covered_qty: number; total_qty: number };
   type ExpRow = { month: string; opex_rub: number; total_rub: number };
   type IncomeRow = { month: string; income_rub: number };
+  type AdvRow = { month: string; spend_rub: number };
+  type WbRow = {
+    month: string;
+    revenue_rub: number;
+    for_pay_rub: number;
+    commission_rub: number;
+    acquiring_rub: number;
+    logistics_rub: number;
+    storage_rub: number;
+    penalty_rub: number;
+    acceptance_rub: number;
+    deduction_rub: number;
+    qty: number;
+    rows_count: number;
+    report_until: string | null;
+  };
 
   const sales = new Map(((salesRes.data ?? []) as SalesRow[]).map((r) => [String(r.month), r]));
   const cogs = new Map(((cogsRes.data ?? []) as CogsRow[]).map((r) => [String(r.month), r]));
   const opex = new Map(((expRes.data ?? []) as ExpRow[]).map((r) => [String(r.month), r]));
   const income = new Map(((incomeRes.data ?? []) as IncomeRow[]).map((r) => [String(r.month), r]));
+  const advert = new Map(((advRes.data ?? []) as AdvRow[]).map((r) => [String(r.month), r]));
+  const wb = new Map(((wbRes.data ?? []) as WbRow[]).map((r) => [String(r.month), r]));
+
+  // До какой даты WB посчитал: месяц считается закрытым, если отчёт доходит
+  // до его последнего дня.
+  const reportUntilRaw =
+    ((wbRes.data ?? []) as WbRow[])
+      .map((r) => r.report_until)
+      .filter(Boolean)
+      .sort()
+      .pop() ?? null;
 
   // Месяцы периода — сплошным рядом, даже если данных за месяц нет
   const months: PnlMonth[] = [];
@@ -316,15 +377,49 @@ export async function getPnlView(db: SupabaseClient, monthsBack = 6): Promise<Pn
     const c = cogs.get(key);
     const e = opex.get(key);
     const inc = income.get(key);
+    const w = wb.get(key);
+    const hasReport = Boolean(w && Number(w.rows_count) > 0);
+    const closed = hasReport && Boolean(reportUntilRaw && reportUntilRaw >= monthEndOf(key));
 
-    const revenueRub = Math.round(Number(s?.revenue_rub ?? 0));
-    const forPayRub = Math.round(Number(s?.for_pay_rub ?? 0));
-    const wbFeesRub = Math.max(0, revenueRub - forPayRub);
+    // Источник выручки. Закрытый месяц — из отчёта о реализации: это первичный
+    // документ WB, он бьётся с удержаниями до копейки. Незакрытый — из продаж
+    // statistics-api: там свежие дни, которых в отчёте ещё нет, иначе текущий
+    // месяц выглядел бы провалившимся (WB просто не досчитал).
+    const revenueRub = Math.round(
+      closed ? Number(w!.revenue_rub ?? 0) : Number(s?.revenue_rub ?? 0),
+    );
+
+    let commissionRub = 0;
+    let acquiringRub = 0;
+    let logisticsRub = 0;
+    let storageRub = 0;
+    let penaltyRub = 0;
+    let acceptanceRub = 0;
+    let deductionRub = 0;
+    if (hasReport) {
+      commissionRub = Math.round(Number(w!.commission_rub ?? 0));
+      acquiringRub = Math.round(Number(w!.acquiring_rub ?? 0));
+      logisticsRub = Math.round(Number(w!.logistics_rub ?? 0));
+      storageRub = Math.round(Number(w!.storage_rub ?? 0));
+      penaltyRub = Math.round(Number(w!.penalty_rub ?? 0));
+      acceptanceRub = Math.round(Number(w!.acceptance_rub ?? 0));
+      deductionRub = Math.round(Number(w!.deduction_rub ?? 0));
+    } else {
+      // Отчёта нет — оценка комиссии по продажам (к перечислению уже за вычетом)
+      commissionRub = Math.max(
+        0,
+        Math.round(Number(s?.revenue_rub ?? 0) - Number(s?.for_pay_rub ?? 0)),
+      );
+    }
+    const wbFeesRub =
+      commissionRub + acquiringRub + logisticsRub + storageRub + penaltyRub + acceptanceRub + deductionRub;
+
+    const advertRub = Math.round(Number(advert.get(key)?.spend_rub ?? 0));
     const cogsRub = Math.round(Number(c?.cogs_rub ?? 0));
     const opexRub = Math.round(Number(e?.opex_rub ?? 0));
     const otherIncomeRub = Math.round(Number(inc?.income_rub ?? 0));
     const grossRub = revenueRub - wbFeesRub - cogsRub;
-    const netRub = grossRub - opexRub + otherIncomeRub;
+    const netRub = grossRub - advertRub - opexRub + otherIncomeRub;
     const coveredQty = Number(c?.covered_qty ?? 0);
     const totalQty = Number(c?.total_qty ?? 0);
 
@@ -333,14 +428,23 @@ export async function getPnlView(db: SupabaseClient, monthsBack = 6): Promise<Pn
       label: monthLabel(key, true),
       revenueRub,
       wbFeesRub,
+      commissionRub,
+      acquiringRub,
+      logisticsRub,
+      storageRub,
+      penaltyRub,
+      acceptanceRub,
+      deductionRub,
+      advertRub,
       cogsRub,
       grossRub,
       opexRub,
       otherIncomeRub,
       netRub,
       marginPct: revenueRub > 0 ? Math.round((netRub / revenueRub) * 100) : 0,
-      qty: Number(s?.qty ?? 0),
+      qty: closed ? Number(w!.qty ?? 0) : Number(s?.qty ?? 0),
       costCoveragePct: totalQty > 0 ? Math.round((coveredQty / totalQty) * 100) : 0,
+      source: closed ? "wb_report" : "estimate",
     });
   }
 
@@ -359,6 +463,14 @@ export async function getPnlView(db: SupabaseClient, monthsBack = 6): Promise<Pn
     label: `Итого за ${monthsBack} мес.`,
     revenueRub: totalRevenue,
     wbFeesRub: sum((m) => m.wbFeesRub),
+    commissionRub: sum((m) => m.commissionRub),
+    acquiringRub: sum((m) => m.acquiringRub),
+    logisticsRub: sum((m) => m.logisticsRub),
+    storageRub: sum((m) => m.storageRub),
+    penaltyRub: sum((m) => m.penaltyRub),
+    acceptanceRub: sum((m) => m.acceptanceRub),
+    deductionRub: sum((m) => m.deductionRub),
+    advertRub: sum((m) => m.advertRub),
     cogsRub: sum((m) => m.cogsRub),
     grossRub: sum((m) => m.grossRub),
     opexRub: sum((m) => m.opexRub),
@@ -367,6 +479,7 @@ export async function getPnlView(db: SupabaseClient, monthsBack = 6): Promise<Pn
     marginPct: totalRevenue > 0 ? Math.round((totalNet / totalRevenue) * 100) : 0,
     qty: sum((m) => m.qty),
     costCoveragePct,
+    source: months.some((m) => m.source === "wb_report") ? "wb_report" : "estimate",
   };
 
   type SliceRow = {
@@ -379,6 +492,16 @@ export async function getPnlView(db: SupabaseClient, monthsBack = 6): Promise<Pn
   };
   const rawSlices = ((slicesRes.data ?? []) as SliceRow[]).filter((c) => Number(c.amount_rub) > 0);
   const slicesTotal = rawSlices.reduce((t, c) => t + Number(c.amount_rub), 0);
+
+  // Валюта кабинета: WB считает отчёт в валюте юрлица (у киргизского — сомы),
+  // и подписывать эти суммы рублём было бы враньём.
+  const currency = ((wbRes.data ?? []) as WbRow[]).length
+    ? await storeCurrency(db)
+    : "RUB";
+
+  const bal = balRes.data as
+    | { currency: string; current_amount: number; for_withdraw: number; checked_at: string }
+    | null;
 
   return {
     months,
@@ -394,13 +517,36 @@ export async function getPnlView(db: SupabaseClient, monthsBack = 6): Promise<Pn
     })),
     costCoveragePct,
     hasExpenses: rawSlices.length > 0,
-    advertSpendRub: Math.round(
-      ((advRes.data ?? []) as { spend_rub: number }[]).reduce(
-        (t, r) => t + Number(r.spend_rub ?? 0),
-        0,
-      ),
-    ),
+    hasWbReport: months.some((m) => m.source === "wb_report"),
+    reportUntil: reportUntilRaw,
+    advertSpendRub: sum((m) => m.advertRub),
+    currency,
+    wbBalance: bal
+      ? {
+          currency: String(bal.currency ?? "RUB"),
+          current: Math.round(Number(bal.current_amount ?? 0)),
+          forWithdraw: Math.round(Number(bal.for_withdraw ?? 0)),
+          checkedAt: String(bal.checked_at),
+        }
+      : null,
   };
+}
+
+// Валюта кабинета — из последней строки отчёта о реализации (WB отдаёт её в
+// currency_name). Кэшируется на процесс: значение меняется раз в жизни.
+let _storeCurrency: string | null = null;
+export async function storeCurrency(db: SupabaseClient): Promise<string> {
+  if (_storeCurrency) return _storeCurrency;
+  const { data } = await db
+    .from("raw_finance_report")
+    .select("currency_name")
+    .eq("store_id", DEMO_STORE_ID)
+    .not("currency_name", "is", null)
+    .order("rr_dt", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  _storeCurrency = (data?.currency_name as string) || "RUB";
+  return _storeCurrency;
 }
 
 // ─── Поиск счёта/статьи по человеческому названию (бот и ИИ) ─────────────────
@@ -472,6 +618,7 @@ export type CashTxInput = {
   note?: string | null;
   rateToRub?: number | null; // курс валюты счёта; по умолчанию — общий курс
   source?: CashTx["source"];
+  sourceRef?: string | null; // внешний ключ (номер отчёта WB) — защита от дублей
 };
 
 export type CashResult =
@@ -605,6 +752,7 @@ export async function createCashTx(
       occurred_on: occurredOn,
       note: input.note ? String(input.note).slice(0, NOTE_MAX) : null,
       source: input.source ?? "manual",
+      source_ref: input.sourceRef ?? null,
       created_by: authorId(actor),
     })
     .select("id, amount_rub, category:expense_categories(name)")
@@ -687,6 +835,104 @@ export async function mirrorSupplyPaymentToCash(
     console.error("[cash] зеркалирование оплаты поставки:", e);
     return false;
   }
+}
+
+// Поступления от Wildberries — по отчётам о реализации.
+// WB перечисляет деньги за отчётный период; сумму периода мы уже умеем считать
+// (agg_wb_payouts). Заводим её приходом в кассу, чтобы «сколько денег» не
+// требовало ручного ввода после каждой выплаты маркетплейса.
+// Защита от дублей — уникальный (source, source_ref) по номеру отчёта.
+// Счёт: первый в валюте кабинета; если такого нет — создаём «Счёт WB».
+export async function syncWbPayoutsToCash(
+  db: SupabaseClient,
+  actor: CashActor,
+  sinceDays = 90,
+): Promise<{ created: number; skipped: number }> {
+  const since = new Date();
+  since.setDate(since.getDate() - sinceDays);
+
+  const { data, error } = await db.rpc("agg_wb_payouts", {
+    p_store: DEMO_STORE_ID,
+    p_since: isoDay(since),
+  });
+  if (error) throw new Error(error.message);
+  const reports = (data ?? []) as {
+    report_id: number;
+    period_start: string;
+    period_end: string;
+    currency: string | null;
+    payout: number;
+  }[];
+  if (!reports.length) return { created: 0, skipped: 0 };
+
+  const currency = ((reports[0].currency ?? "RUB").toLowerCase() as Currency) ?? "rub";
+  const { accounts, categories } = await getFinanceRefs(db);
+
+  let account = accounts.find((a) => a.kind === "wb" && a.currency === currency)
+    ?? accounts.find((a) => a.currency === currency);
+  if (!account) {
+    const created = await createCashAccount(db, actor, {
+      name: "Счёт WB",
+      kind: "wb",
+      currency,
+    });
+    if (!created.ok) throw new Error(created.message);
+    account = { id: created.id, name: "Счёт WB", kind: "wb", currency };
+  }
+
+  const category = categories.find((c) => c.direction === "in" && c.name === "Поступление от WB");
+
+  // Уже заведённые отчёты — чтобы не гонять заведомо дублирующие вставки
+  const { data: existing } = await db
+    .from("cash_tx")
+    .select("source_ref")
+    .eq("org_id", DEMO_ORG_ID)
+    .eq("source", "wb_payout")
+    .not("source_ref", "is", null)
+    .limit(1000);
+  const known = new Set(
+    ((existing ?? []) as { source_ref: string }[]).map((r) => String(r.source_ref)),
+  );
+
+  let created = 0;
+  let skipped = 0;
+  for (const r of reports) {
+    const ref = String(r.report_id);
+    const amount = Math.round(Number(r.payout));
+    if (known.has(ref)) {
+      skipped += 1;
+      continue;
+    }
+    if (amount <= 0) {
+      // Отрицательный итог периода (возвраты перевесили) — это не приход;
+      // такие периоды показываем в ОПиУ, но деньгами не двигаем.
+      skipped += 1;
+      continue;
+    }
+    const { error: insErr } = await db.from("cash_tx").insert({
+      org_id: DEMO_ORG_ID,
+      kind: "in",
+      account_id: account.id,
+      category_id: category?.id ?? null,
+      amount,
+      currency,
+      rate_to_rub: currency === "rub" ? 1 : (EXCHANGE_RATES[currency] ?? 1),
+      occurred_on: r.period_end ?? isoDay(new Date()),
+      note: `Выплата WB за период ${r.period_start} — ${r.period_end} (отчёт ${ref})`,
+      source: "wb_payout",
+      source_ref: ref,
+      created_by: authorId(actor),
+    });
+    // 23505 — отчёт уже заводили параллельным прогоном, это не ошибка
+    if (insErr && insErr.code !== "23505") {
+      console.error("[cash] поступление WB:", insErr.message);
+      skipped += 1;
+      continue;
+    }
+    if (insErr) skipped += 1;
+    else created += 1;
+  }
+  return { created, skipped };
 }
 
 // Удалить ошибочную операцию (только руководители — право finance:expense)

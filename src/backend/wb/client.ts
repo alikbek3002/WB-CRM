@@ -254,6 +254,143 @@ export function fetchSales(
   );
 }
 
+// ─── Финансы: отчёт о реализации (детализация к оплате) ──────────────────────
+// v5/reportDetailByPeriod — единственный источник фактических удержаний WB:
+// комиссия, эквайринг, логистика, хранение, штрафы, приёмка. Пагинация курсором
+// rrdid: следующий запрос начинается с rrd_id последней полученной строки.
+// Лимит statistics — 1 запрос/мин, поэтому тянем партиями с паузой.
+
+export type WbFinanceRow = {
+  realizationreport_id: number;
+  date_from: string;
+  date_to: string;
+  currency_name?: string;
+  rrd_id: number;
+  nm_id: number;
+  doc_type_name: string; // «Продажа» | «Возврат»
+  supplier_oper_name?: string; // «Продажа», «Логистика», «Хранение», «Штраф»…
+  quantity: number;
+  retail_price?: number;
+  retail_amount?: number; // сумма продажи
+  retail_price_withdisc_rub?: number;
+  ppvz_sales_commission?: number; // комиссия WB
+  ppvz_for_pay?: number; // к перечислению продавцу
+  acquiring_fee?: number; // эквайринг
+  delivery_rub?: number; // логистика
+  rebill_logistic_cost?: number; // возмещение логистики
+  storage_fee?: number;
+  penalty?: number;
+  acceptance?: number; // платная приёмка
+  deduction?: number; // прочие удержания
+  sale_dt?: string;
+  rr_dt?: string; // дата расчёта — по ней отчёт разбит на периоды
+};
+
+export function fetchFinanceReport(
+  token: string,
+  dateFrom: string,
+  dateTo: string,
+  rrdid = 0,
+  limit = 100_000,
+  timeoutMs = 180_000,
+): Promise<WbFinanceRow[]> {
+  const url =
+    "https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod" +
+    `?dateFrom=${dateFrom}&dateTo=${dateTo}&limit=${limit}&rrdid=${rrdid}`;
+  return wbFetch<WbFinanceRow[]>(url, token, undefined, timeoutMs).then((r) => r ?? []);
+}
+
+// Баланс кабинета: сколько WB ещё должен продавцу (и сколько можно вывести).
+// Валюта кабинета может быть не рублёвой (у киргизского юрлица — KGS).
+export type WbBalance = { currency: string; current: number; for_withdraw: number };
+
+export function fetchAccountBalance(token: string): Promise<WbBalance> {
+  return wbFetch<WbBalance>(
+    "https://finance-api.wildberries.ru/api/v1/account/balance",
+    token,
+    undefined,
+    30_000,
+  );
+}
+
+// ─── Реклама: кампании и расход ──────────────────────────────────────────────
+
+type WbPromotionCount = {
+  adverts: { type: number; status: number; count: number; advert_list: { advertId: number; changeTime: string }[] }[];
+  all: number;
+};
+
+// Список кампаний кабинета. changeTime нужен, чтобы не тянуть статистику по
+// кампаниям, которых давно не касались.
+export async function fetchAdvertCampaigns(
+  token: string,
+): Promise<{ advertId: number; status: number; changeTime: string }[]> {
+  const res = await wbFetch<WbPromotionCount>(
+    "https://advert-api.wildberries.ru/adv/v1/promotion/count",
+    token,
+    undefined,
+    30_000,
+  );
+  return (res.adverts ?? []).flatMap((group) =>
+    (group.advert_list ?? []).map((a) => ({
+      advertId: a.advertId,
+      status: group.status,
+      changeTime: a.changeTime,
+    })),
+  );
+}
+
+// Разбивка дня по товарам: WB отдаёт её внутри площадок (apps[].nms[]).
+// Благодаря ей расход раскладывается по артикулам — иначе ДРР по товару не
+// посчитать, будет только общая сумма по кампании.
+export type WbAdvertNm = {
+  nmId: number;
+  name?: string;
+  views: number;
+  clicks: number;
+  sum: number;
+  atbs: number;
+  orders: number;
+};
+
+export type WbAdvertDay = {
+  date: string;
+  views: number;
+  clicks: number;
+  ctr: number;
+  cpc: number;
+  sum: number; // расход
+  atbs: number;
+  orders: number;
+  cr: number;
+  apps?: { appType: number; nms?: WbAdvertNm[] }[];
+};
+
+export type WbAdvertStat = {
+  advertId: number;
+  currency?: string;
+  views: number;
+  clicks: number;
+  sum: number;
+  orders: number;
+  days: WbAdvertDay[];
+};
+
+// Статистика кампаний за период. v2 (POST) отключён — работает GET v3 с ids.
+// Лимит — 1 запрос/мин, поэтому вызывающая сторона сама делает паузы.
+export function fetchAdvertStats(
+  token: string,
+  advertIds: number[],
+  beginDate: string,
+  endDate: string,
+  timeoutMs = 120_000,
+): Promise<WbAdvertStat[]> {
+  const url =
+    "https://advert-api.wildberries.ru/adv/v3/fullstats" +
+    `?ids=${advertIds.join(",")}&beginDate=${beginDate}&endDate=${endDate}`;
+  return wbFetch<WbAdvertStat[]>(url, token, undefined, timeoutMs).then((r) => r ?? []);
+}
+
 // ─── Скоупы токена (для карточки интеграции) ─────────────────────────────────
 
 const SCOPE_BITS: Record<number, string> = {

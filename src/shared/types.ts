@@ -194,7 +194,7 @@ export type CashTx = {
   occurredOn: string; // yyyy-mm-dd
   note: string | null;
   authorName: string | null;
-  source: "manual" | "bot" | "ai" | "supply_payment" | "wb_payout";
+  source: "manual" | "bot" | "ai" | "supply_payment" | "wb_payout" | "payout";
 };
 
 export type CashFlowMonth = {
@@ -206,6 +206,9 @@ export type CashFlowMonth = {
 
 export type CashOverview = {
   accounts: CashAccount[];
+  // Деньги, которые WB ещё не перечислил: они есть у компании, но не в кассе.
+  // Показываем отдельно, чтобы «всего денег» не смешивало наличные и дебиторку.
+  wbBalance: { currency: string; current: number; forWithdraw: number; checkedAt: string } | null;
   totalRub: number; // всего денег в кассе, ₽
   monthInRub: number; // приход за текущий месяц
   monthOutRub: number; // расход за текущий месяц
@@ -233,21 +236,74 @@ export type ExpensesView = {
   monthly: { month: string; label: string; totalRub: number }[];
 };
 
+// ─── Заявки на выплату (миграция 0029) ──────────────────────────────────────
+
+export type PayoutKind = "salary" | "contractor" | "factory" | "reimbursement" | "other";
+export type PayoutStatus = "pending" | "approved" | "rejected" | "paid" | "cancelled";
+
+export type PayoutRequest = {
+  id: string;
+  kind: PayoutKind;
+  status: PayoutStatus;
+  title: string;
+  description: string | null;
+  amount: number;
+  currency: Currency;
+  amountRub: number; // для сводок
+  dueDate: string | null;
+  payee: string | null; // кому платим, если не сам заявитель
+  requesterId: string;
+  requesterName: string;
+  requesterRole: string | null;
+  categoryId: string | null;
+  categoryName: string | null;
+  factoryId: string | null;
+  factoryName: string | null;
+  supplyId: string | null;
+  supplyTitle: string | null;
+  decidedByName: string | null;
+  decidedAt: string | null;
+  decisionNote: string | null;
+  paidAt: string | null;
+  paidAccountName: string | null;
+  createdAt: string;
+};
+
+export type PayoutsView = {
+  items: PayoutRequest[];
+  pendingCount: number;
+  pendingRub: number; // сколько ждёт согласования
+  approvedRub: number; // согласовано, но ещё не оплачено
+  paidMonthRub: number; // выплачено в этом месяце
+};
+
 // ─── ОПиУ (отчёт о прибылях и убытках) ───────────────────────────────────────
 
 export type PnlMonth = {
   month: string; // yyyy-mm-01
   label: string; // «Июль 2026»
-  revenueRub: number; // выручка (продажи по цене со скидкой, минус возвраты)
-  wbFeesRub: number; // удержания WB (выручка − к перечислению)
+  revenueRub: number; // выручка (реализация за вычетом возвратов)
+  wbFeesRub: number; // ИТОГО удержания WB (сумма строк ниже)
+  // Детализация удержаний — из отчёта о реализации WB (v5/reportDetailByPeriod).
+  // Если отчёт за месяц ещё не синхронизирован, в commissionRub попадает
+  // оценка «выручка − к перечислению», остальные строки нулевые (source).
+  commissionRub: number; // комиссия WB
+  acquiringRub: number; // эквайринг
+  logisticsRub: number; // логистика
+  storageRub: number; // хранение
+  penaltyRub: number; // штрафы
+  acceptanceRub: number; // платная приёмка
+  deductionRub: number; // прочие удержания
+  advertRub: number; // расход на внутреннюю рекламу WB
   cogsRub: number; // себестоимость проданного товара
-  grossRub: number; // валовая прибыль
-  opexRub: number; // операционные расходы (касса, статьи с in_pnl)
+  grossRub: number; // валовая прибыль (выручка − удержания WB − себестоимость)
+  opexRub: number; // расходы компании из кассы (статьи с in_pnl)
   otherIncomeRub: number; // прочие доходы
   netRub: number; // чистая прибыль
   marginPct: number; // рентабельность к выручке
   qty: number; // продано штук
   costCoveragePct: number; // % продаж с заполненной себестоимостью
+  source: "wb_report" | "estimate"; // откуда удержания: отчёт WB или оценка
 };
 
 export type PnlView = {
@@ -256,7 +312,11 @@ export type PnlView = {
   expenseSlices: ExpenseCategorySlice[]; // расходы периода по статьям
   costCoveragePct: number; // покрытие себестоимостью за период
   hasExpenses: boolean; // заведены ли расходы вообще
-  advertSpendRub: number; // расход на рекламу из кабинета WB (если синхронизирован)
+  hasWbReport: boolean; // синхронизирован ли отчёт о реализации WB
+  reportUntil: string | null; // по какую дату WB посчитал (позже — без удержаний)
+  advertSpendRub: number; // расход на рекламу из кабинета WB
+  currency: string; // валюта кабинета из отчёта WB: RUB, KGS…
+  wbBalance: { currency: string; current: number; forWithdraw: number; checkedAt: string } | null;
 };
 
 export type TaskItem = {
@@ -306,7 +366,8 @@ export type Tariff = {
 // ─── Цепочка поставок (КП) ───────────────────────────────────────────────────
 
 export type SupplyCountry = "china" | "uzbekistan";
-export type Currency = "cny" | "uzs" | "rub";
+// kgs — валюта киргизского кабинета WB (в ней приходят деньги от маркетплейса)
+export type Currency = "cny" | "uzs" | "rub" | "kgs";
 export type SupplyStatus =
   | "in_transit" // В пути
   | "arrived" // Приехал (авто через 15 дней, ожидает приёмки)

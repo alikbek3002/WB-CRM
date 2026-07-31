@@ -190,6 +190,33 @@ function intFromEnv(name: string, def: number, min: number): number {
 
 let lastLiveKey = "";
 let lastFullKey = "";
+let lastFinanceKey = "";
+
+// Финансы WB (отчёт о реализации + реклама + баланс) — раз в сутки ночью.
+// Отдельным треком: лимит «1 запрос/мин» растягивает прогон на минуты, а живым
+// данным ждать нельзя. Час запуска настраивается WB_FINANCE_SYNC_HOUR.
+function autoSyncFinance(now: Date): void {
+  const appUrl = process.env.APP_URL;
+  const secret = process.env.CRON_SECRET;
+  if (!appUrl || !secret) return;
+
+  const hour = intFromEnv("WB_FINANCE_SYNC_HOUR", 5, 0);
+  if (now.getHours() !== hour) return;
+  const key = localIsoDate(now);
+  if (key === lastFinanceKey) return;
+  const first = !lastFinanceKey;
+  lastFinanceKey = key;
+  if (first) return; // первый тик после старта — пропуск (как в autoSyncWb)
+
+  console.log("[scheduler] запускаю синк финансов WB…");
+  fetch(`${appUrl.replace(/\/$/, "")}/api/cron/wb-sync?mode=finance`, {
+    headers: { authorization: `Bearer ${secret}` },
+    signal: AbortSignal.timeout(890_000),
+  })
+    .then((r) => console.log("[scheduler] синк финансов:", r.status))
+    .catch((e) => console.error("[scheduler] синк финансов:", e?.message ?? e));
+}
+
 function autoSyncWb(now: Date): void {
   const appUrl = process.env.APP_URL;
   const secret = process.env.CRON_SECRET;
@@ -273,5 +300,6 @@ export async function schedulerTick(): Promise<void> {
   await deadlineReminders(now).catch((e) => console.error("[scheduler] remind:", e));
   await eveningSummary(now).catch((e) => console.error("[scheduler] evening:", e));
   autoSyncWb(now);
+  autoSyncFinance(now);
   autoSupplyArrive(now);
 }
