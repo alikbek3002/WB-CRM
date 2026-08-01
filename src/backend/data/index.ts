@@ -128,6 +128,30 @@ export const getExpensesView = (from?: string, to?: string) =>
     { revalidate: READ_TTL_SECONDS, tags: [WB_DATA_TAG, `${WB_DATA_TAG}:expenses`] },
   )();
 
+// Выплаты команде — параметризованы периодом
+export const getPayrollView = (from?: string, to?: string) =>
+  unstable_cache(
+    () =>
+      fromDb(
+        (client) => db.getPayrollView(client, from, to),
+        () => ({
+          from: from ?? "",
+          to: to ?? "",
+          totalRub: 0,
+          people: [],
+          unassignedRub: 0,
+          unassignedCount: 0,
+          items: [],
+          pendingRub: 0,
+        }),
+      ),
+    ["wb-data", "payroll", from ?? "", to ?? ""],
+    { revalidate: READ_TTL_SECONDS, tags: [WB_DATA_TAG, `${WB_DATA_TAG}:payroll`] },
+  )();
+
+// Сотрудники как справочник адресатов выплат (для форм)
+export const getMembers = cachedRead("members", db.listMembers, () => []);
+
 const EMPTY_PNL_MONTH: PnlMonth = {
   month: "",
   label: "Итого",
@@ -270,6 +294,8 @@ export async function warmReadCache(): Promise<{ ms: number; failed: number }> {
     getFinanceRefs,
     () => getPnlView(6), // ОПиУ — самая тяжёлая вкладка финансов
     () => getExpensesView(), // расходы текущего месяца
+    () => getPayrollView(), // выплаты команде за текущий месяц
+    getMembers,
     getTasks,
     getIntegrations,
     getTariffs,

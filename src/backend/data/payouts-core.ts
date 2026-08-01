@@ -19,7 +19,7 @@ import type {
   PayoutsView,
 } from "../../shared/types";
 import { notifyProfile, notifyRoles, tgEsc } from "../telegram/notify";
-import { createCashTx, isoDay, type CashActor } from "./cash-core";
+import { createCashTx, isoDay, listMembers, type CashActor } from "./cash-core";
 
 export type PayoutActor = CashActor;
 
@@ -69,10 +69,11 @@ const isLead = (role: MemberRole) => can(role, "payout:approve");
 // ─── Чтение ──────────────────────────────────────────────────────────────────
 
 const PAYOUT_SELECT =
-  "id, kind, status, title, description, amount, currency, due_date, payee, requester_id, " +
+  "id, kind, status, title, description, amount, currency, due_date, payee, payee_user_id, requester_id, " +
   "category_id, factory_id, supply_id, decided_at, decision_note, paid_at, created_at, " +
   "requester:profiles!payout_requests_requester_id_fkey(full_name), " +
   "decider:profiles!payout_requests_decided_by_fkey(full_name), " +
+  "payee_user:profiles!payout_requests_payee_user_id_fkey(full_name), " +
   "category:expense_categories(name), factory:factories(name), supply:supplies(title), " +
   "account:cash_accounts(name)";
 
@@ -86,6 +87,7 @@ type PayoutRow = {
   currency: Currency;
   due_date: string | null;
   payee: string | null;
+  payee_user_id: string | null;
   requester_id: string;
   category_id: string | null;
   factory_id: string | null;
@@ -96,6 +98,7 @@ type PayoutRow = {
   created_at: string;
   requester: { full_name: string | null } | { full_name: string | null }[] | null;
   decider: { full_name: string | null } | { full_name: string | null }[] | null;
+  payee_user: { full_name: string | null } | { full_name: string | null }[] | null;
   category: { name: string } | { name: string }[] | null;
   factory: { name: string } | { name: string }[] | null;
   supply: { title: string } | { title: string }[] | null;
@@ -114,7 +117,9 @@ function mapPayout(r: PayoutRow, roleByUser: Map<string, string>): PayoutRequest
     currency: r.currency,
     amountRub: toRub(amount, r.currency),
     dueDate: r.due_date,
-    payee: r.payee,
+    payee: r.payee ?? first(r.payee_user)?.full_name ?? null,
+    payeeUserId: r.payee_user_id ? String(r.payee_user_id) : null,
+    payeeUserName: first(r.payee_user)?.full_name ?? null,
     requesterId: String(r.requester_id),
     requesterName: first(r.requester)?.full_name ?? "—",
     requesterRole: roleByUser.get(String(r.requester_id)) ?? null,
@@ -188,6 +193,7 @@ export type PayoutInput = {
   currency?: Currency;
   description?: string | null;
   payee?: string | null;
+  payeeUserId?: string | null; // сотрудник-адресат: тогда выплата попадёт в его карточку
   dueDate?: string | null;
   categoryId?: string | null;
   factoryId?: string | null;
@@ -221,6 +227,19 @@ export async function createPayoutRequest(
     ? String(input.dueDate)
     : null;
 
+  // Адресат-сотрудник: проверяем, что он из этой команды, и подписываем имя —
+  // иначе в списке заявок «кому» осталось бы пустым.
+  let payeeUserId: string | null = null;
+  let payeeUserName: string | null = null;
+  if (input.payeeUserId) {
+    const member = (await listMembers(db)).find((m) => m.id === String(input.payeeUserId));
+    if (!member) {
+      return { ok: false, code: "not_found", message: "Сотрудник не найден в команде." };
+    }
+    payeeUserId = member.id;
+    payeeUserName = member.name;
+  }
+
   const { data, error } = await db
     .from("payout_requests")
     .insert({
@@ -228,7 +247,8 @@ export async function createPayoutRequest(
       kind: input.kind,
       status: "pending",
       requester_id: actor.id,
-      payee: input.payee ? String(input.payee).slice(0, 120) : null,
+      payee: (input.payee ? String(input.payee) : payeeUserName)?.slice(0, 120) ?? null,
+      payee_user_id: payeeUserId,
       title: title.slice(0, TITLE_MAX),
       description: input.description ? String(input.description).slice(0, TEXT_MAX) : null,
       amount,
@@ -370,6 +390,16 @@ export async function payPayout(
     categoryId = cat ? String(cat.id) : null;
   }
 
+  // Кому эти деньги: явный адресат из заявки, иначе — сам заявитель, если
+  // заявка про людей (зарплата, возмещение). Так выплата попадает в карточку
+  // сотрудника без второго ввода данных.
+  const personId =
+    row.payee_user_id
+      ? String(row.payee_user_id)
+      : row.kind === "salary" || row.kind === "reimbursement"
+        ? String(row.requester_id)
+        : null;
+
   const tx = await createCashTx(db, actor, {
     kind: "out",
     accountId,
@@ -378,6 +408,7 @@ export async function payPayout(
     occurredOn: paidOn,
     rateToRub: opts?.rateToRub ?? null,
     note: `Выплата по заявке: ${row.title}${row.payee ? ` · ${row.payee}` : ""}`,
+    personId,
     source: "payout",
   });
   if (!tx.ok) return { ok: false, code: "db_error", message: tx.message };
@@ -411,11 +442,14 @@ export async function payPayout(
     .eq("id", id);
   if (error) return { ok: false, code: "db_error", message: error.message };
 
-  void notifyProfile(
-    String(row.requester_id),
-    `💸 <b>Выплата произведена</b>\n«${tgEsc(row.title)}» — ${tgEsc(money(Number(row.amount), row.currency))}\n` +
-      `Выплатил: ${tgEsc(actor.name)} · ${tgEsc(paidOn)}`,
-  );
+  // Адресату о деньгах уже написала касса (createCashTx) — второй раз не дублируем
+  if (personId !== String(row.requester_id)) {
+    void notifyProfile(
+      String(row.requester_id),
+      `💸 <b>Выплата произведена</b>\n«${tgEsc(row.title)}» — ${tgEsc(money(Number(row.amount), row.currency))}\n` +
+        `Выплатил: ${tgEsc(actor.name)} · ${tgEsc(paidOn)}`,
+    );
+  }
 
   return {
     ok: true,

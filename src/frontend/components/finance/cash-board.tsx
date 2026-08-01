@@ -48,7 +48,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/frontend/components/ui/table";
-import { AddTxButton } from "@/frontend/components/finance/tx-dialog";
+import { AddTxButton, type MemberOpt } from "@/frontend/components/finance/tx-dialog";
 import { StatRow } from "@/frontend/components/finance/stat-row";
 import {
   AXIS_TICK,
@@ -174,7 +174,7 @@ function AccountDialog({
             кошелёк в юанях для карго.
           </DialogDescription>
         </DialogHeader>
-        <div className="grid gap-3 sm:grid-cols-2">
+        <div className="grid gap-3 sm:grid-cols-2 [&>div]:min-w-0">
           <div className="grid gap-1.5 sm:col-span-2">
             <Label htmlFor="acc-name">Название</Label>
             <Input
@@ -239,10 +239,12 @@ function AccountDialog({
 export function CashBoard({
   overview,
   categories,
+  members = [],
   canEdit,
 }: {
   overview: CashOverview;
   categories: ExpenseCategory[];
+  members?: MemberOpt[];
   canEdit: boolean;
 }) {
   const [accountDialog, setAccountDialog] = useState(false);
@@ -267,6 +269,7 @@ export function CashBoard({
               label="Расход"
               accounts={accountOpts}
               categories={categories}
+              members={members}
             />
             <AddTxButton
               kind="in"
@@ -274,6 +277,7 @@ export function CashBoard({
               variant="outline"
               accounts={accountOpts}
               categories={categories}
+              members={members}
               lockKind
             />
             <AddTxButton

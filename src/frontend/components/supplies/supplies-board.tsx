@@ -337,9 +337,9 @@ function CreateSupplyDialog({
             )}
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-2 gap-3 [&>div]:min-w-0">
             <div className="grid gap-1.5">
-              <Label>Товар WB (опц.)</Label>
+              <Label>Товар WB (необязательно)</Label>
               <Select value={productId} onValueChange={(v) => v && pickProduct(v)}>
                 <SelectTrigger className="w-full">
                   <SelectValue />

@@ -14,7 +14,11 @@ import {
   TableHeader,
   TableRow,
 } from "@/frontend/components/ui/table";
-import { AddTxButton, type AccountOpt } from "@/frontend/components/finance/tx-dialog";
+import {
+  AddTxButton,
+  type AccountOpt,
+  type MemberOpt,
+} from "@/frontend/components/finance/tx-dialog";
 import { StatRow } from "@/frontend/components/finance/stat-row";
 import { StructureBar } from "@/frontend/components/finance/structure-bar";
 import { SERIES } from "@/frontend/components/charts/palette";
@@ -45,11 +49,13 @@ export function ExpensesBoard({
   view,
   accounts,
   categories,
+  members = [],
   canEdit,
 }: {
   view: ExpensesView;
   accounts: AccountOpt[];
   categories: ExpenseCategory[];
+  members?: MemberOpt[];
   canEdit: boolean;
 }) {
   const router = useRouter();
@@ -94,6 +100,7 @@ export function ExpensesBoard({
               label="Добавить расход"
               accounts={accounts}
               categories={categories}
+              members={members}
               lockKind
             />
             <AddTxButton
@@ -102,6 +109,7 @@ export function ExpensesBoard({
               variant="outline"
               accounts={accounts}
               categories={categories}
+              members={members}
               lockKind
             />
           </div>
@@ -171,6 +179,7 @@ export function ExpensesBoard({
               <TableRow>
                 <TableHead>Дата</TableHead>
                 <TableHead>Статья</TableHead>
+                <TableHead>Кому</TableHead>
                 <TableHead>Комментарий</TableHead>
                 <TableHead>Счёт</TableHead>
                 <TableHead>Кто внёс</TableHead>
@@ -182,7 +191,7 @@ export function ExpensesBoard({
               {view.items.length === 0 && (
                 <TableRow>
                   <TableCell
-                    colSpan={canEdit ? 7 : 6}
+                    colSpan={canEdit ? 8 : 7}
                     className="py-12 text-center text-sm text-muted-foreground"
                   >
                     За этот период расходов нет.
@@ -196,6 +205,9 @@ export function ExpensesBoard({
                   <TableCell>
                     {t.categoryEmoji ? `${t.categoryEmoji} ` : ""}
                     {t.categoryName ?? "Без статьи"}
+                  </TableCell>
+                  <TableCell className="whitespace-nowrap">
+                    {t.personName ?? <span className="text-muted-foreground">—</span>}
                   </TableCell>
                   <TableCell className="max-w-64 truncate text-muted-foreground">
                     {t.note ?? "—"}

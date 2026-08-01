@@ -150,7 +150,7 @@ export function ProductForm({ product }: { product?: ProductListItem }) {
             </DialogDescription>
           </DialogHeader>
 
-          <div className="grid gap-3 sm:grid-cols-2">
+          <div className="grid gap-3 sm:grid-cols-2 [&>div]:min-w-0">
             <div className="grid gap-1.5">
               <Label htmlFor="prod-nm">Артикул WB (nm_id)</Label>
               <Input

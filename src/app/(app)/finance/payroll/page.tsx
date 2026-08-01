@@ -1,12 +1,12 @@
 import { NoAccess } from "@/frontend/components/layout/no-access";
-import { ExpensesBoard } from "@/frontend/components/finance/expenses-board";
+import { PayrollBoard } from "@/frontend/components/finance/payroll-board";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
-import { getExpensesView, getFinanceRefs, getMembers } from "@/backend/data";
+import { getFinanceRefs, getMembers, getPayrollView } from "@/backend/data";
 
-// Расходы компании за период. Период задаётся в адресе (?from=&to=), чтобы
-// ссылкой на конкретный месяц можно было поделиться.
-export default async function ExpensesPage({
+// Выплаты команде: кому сколько ушло за период. Считается из кассы (расходы с
+// указанным сотрудником) — отдельного «фонда зарплат» нет, деньги одни и те же.
+export default async function PayrollPage({
   searchParams,
 }: {
   searchParams: Promise<{ from?: string; to?: string }>;
@@ -20,13 +20,13 @@ export default async function ExpensesPage({
   const isDate = (v?: string) => (v && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : undefined);
 
   const [view, refs, members] = await Promise.all([
-    getExpensesView(isDate(from), isDate(to)),
+    getPayrollView(isDate(from), isDate(to)),
     getFinanceRefs(),
     getMembers(),
   ]);
 
   return (
-    <ExpensesBoard
+    <PayrollBoard
       view={view}
       accounts={refs.accounts.map((a) => ({ id: a.id, name: a.name, currency: a.currency }))}
       categories={refs.categories}

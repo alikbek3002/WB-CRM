@@ -39,6 +39,11 @@ import type {
 type AccountOpt = { id: string; name: string; currency: Currency };
 type FactoryOpt = { id: string; name: string };
 type SupplyOpt = { id: string; title: string; factoryName: string };
+type MemberOpt = { id: string; name: string; roleLabel: string };
+
+// «Кому платим»: сотрудник из команды (тогда выплата попадёт в его карточку)
+// или произвольное имя — подрядчик, фотограф, курьер.
+const PAYEE_MANUAL = "__manual__";
 
 const KIND_LABEL: Record<PayoutKind, string> = {
   salary: "Зарплата",
@@ -71,18 +76,21 @@ function RequestDialog({
   categories,
   factories,
   supplies,
+  members,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   categories: ExpenseCategory[];
   factories: FactoryOpt[];
   supplies: SupplyOpt[];
+  members: MemberOpt[];
 }) {
   const router = useRouter();
   const [kind, setKind] = useState<PayoutKind>("contractor");
   const [title, setTitle] = useState("");
   const [amount, setAmount] = useState("");
   const [currency, setCurrency] = useState<Currency>("rub");
+  const [payeeUserId, setPayeeUserId] = useState("");
   const [payee, setPayee] = useState("");
   const [dueDate, setDueDate] = useState("");
   const [categoryId, setCategoryId] = useState("");
@@ -111,7 +119,8 @@ function RequestDialog({
           title: title.trim(),
           amount: sum,
           currency,
-          payee: payee.trim() || null,
+          payee: payeeUserId && payeeUserId !== PAYEE_MANUAL ? null : payee.trim() || null,
+          payeeUserId: payeeUserId && payeeUserId !== PAYEE_MANUAL ? payeeUserId : null,
           dueDate: dueDate || null,
           categoryId: categoryId || null,
           factoryId: kind === "factory" ? factoryId || null : null,
@@ -146,7 +155,7 @@ function RequestDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="grid gap-3 sm:grid-cols-2">
+        <div className="grid gap-3 sm:grid-cols-2 [&>div]:min-w-0">
           <div className="grid gap-1.5">
             <Label>Тип выплаты</Label>
             <Select value={kind} onValueChange={(v) => v && setKind(v as PayoutKind)}>
@@ -198,13 +207,28 @@ function RequestDialog({
           </div>
 
           <div className="grid gap-1.5">
-            <Label htmlFor="p-payee">Кому платим</Label>
-            <Input
-              id="p-payee"
-              value={payee}
-              onChange={(e) => setPayee(e.target.value)}
-              placeholder="Если не себе — имя или компания"
-            />
+            <Label>Кому платим</Label>
+            <Select value={payeeUserId} onValueChange={(v) => setPayeeUserId(v ?? "")}>
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="Себе (заявителю)" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="">Себе (заявителю)</SelectItem>
+                {members.map((m) => (
+                  <SelectItem key={m.id} value={m.id}>
+                    {m.name} · {m.roleLabel}
+                  </SelectItem>
+                ))}
+                <SelectItem value={PAYEE_MANUAL}>Другой человек или компания…</SelectItem>
+              </SelectContent>
+            </Select>
+            {payeeUserId === PAYEE_MANUAL && (
+              <Input
+                value={payee}
+                onChange={(e) => setPayee(e.target.value)}
+                placeholder="Имя подрядчика или компания"
+              />
+            )}
           </div>
 
           <div className="grid gap-1.5">
@@ -350,7 +374,7 @@ function PayDialog({
               : ""}
           </DialogDescription>
         </DialogHeader>
-        <div className="grid gap-3 sm:grid-cols-2">
+        <div className="grid gap-3 sm:grid-cols-2 [&>div]:min-w-0">
           <div className="grid gap-1.5">
             <Label>Счёт списания</Label>
             <Select value={accountId} onValueChange={(v) => v && setAccountId(v)}>
@@ -404,6 +428,7 @@ export function PayoutsBoard({
   categories,
   factories,
   supplies,
+  members = [],
 }: {
   view: PayoutsView;
   canApprove: boolean;
@@ -412,6 +437,7 @@ export function PayoutsBoard({
   categories: ExpenseCategory[];
   factories: FactoryOpt[];
   supplies: SupplyOpt[];
+  members?: MemberOpt[];
 }) {
   const router = useRouter();
   const [requestOpen, setRequestOpen] = useState(false);
@@ -606,6 +632,7 @@ export function PayoutsBoard({
         categories={categories}
         factories={factories}
         supplies={supplies}
+        members={members}
       />
       <PayDialog payout={paying} accounts={accounts} onOpenChange={() => setPaying(null)} />
     </div>

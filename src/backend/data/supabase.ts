@@ -527,7 +527,9 @@ export {
   getCashOverview,
   getExpensesView,
   getFinanceRefs,
+  getPayrollView,
   getPnlView,
+  listMembers,
 } from "./cash-core";
 
 // ─── Задачи ──────────────────────────────────────────────────────────────────

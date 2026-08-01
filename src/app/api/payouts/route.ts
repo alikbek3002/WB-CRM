@@ -18,6 +18,7 @@ const payoutSchema = z.object({
   currency: z.enum(["rub", "cny", "uzs", "kgs"]).optional(),
   description: z.string().trim().max(1000).nullable().optional(),
   payee: z.string().trim().max(120).nullable().optional(),
+  payeeUserId: z.string().regex(UUID).nullable().optional(), // адресат из команды
   dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
   categoryId: z.string().regex(UUID).nullable().optional(),
   factoryId: z.string().regex(UUID).nullable().optional(),

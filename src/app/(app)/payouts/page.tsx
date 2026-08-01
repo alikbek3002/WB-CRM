@@ -2,7 +2,13 @@ import { NoAccess } from "@/frontend/components/layout/no-access";
 import { PayoutsBoard } from "@/frontend/components/finance/payouts-board";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
-import { getFinanceRefs, getFactories, getPayouts, getSupplies } from "@/backend/data";
+import {
+  getFactories,
+  getFinanceRefs,
+  getMembers,
+  getPayouts,
+  getSupplies,
+} from "@/backend/data";
 
 // Выплаты: сотрудник просит деньги (зарплата, подрядчик, счёт фабрики),
 // руководитель согласовывает и оплачивает — оплата уходит прямо в кассу.
@@ -13,11 +19,12 @@ export default async function PayoutsPage() {
   }
 
   const canApprove = can(session.role, "payout:approve");
-  const [view, refs, factories, supplies] = await Promise.all([
+  const [view, refs, factories, supplies, members] = await Promise.all([
     getPayouts({ id: session.user.id, role: session.role }),
     getFinanceRefs(),
     can(session.role, "factory:view") ? getFactories() : Promise.resolve([]),
     can(session.role, "supply:view") ? getSupplies() : Promise.resolve([]),
+    getMembers(),
   ]);
 
   return (
@@ -42,6 +49,7 @@ export default async function PayoutsPage() {
           .filter((s) => s.status !== "cancelled")
           .slice(0, 100)
           .map((s) => ({ id: s.id, title: s.title, factoryName: s.factoryName }))}
+        members={members.map((m) => ({ id: m.id, name: m.name, roleLabel: m.roleLabel }))}
       />
     </div>
   );

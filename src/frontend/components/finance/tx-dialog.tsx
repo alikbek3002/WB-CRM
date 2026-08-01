@@ -27,6 +27,7 @@ import { formatMoney } from "@/shared/format";
 import type { CashTxKind, Currency, ExpenseCategory } from "@/shared/types";
 
 export type AccountOpt = { id: string; name: string; currency: Currency };
+export type MemberOpt = { id: string; name: string; roleLabel: string };
 
 const KIND_TITLE: Record<CashTxKind, string> = {
   out: "Новый расход",
@@ -48,6 +49,9 @@ export function TxDialog({
   kind: initialKind,
   accounts,
   categories,
+  members = [],
+  defaultCategoryId = "",
+  defaultPersonId = "",
   lockKind = false,
 }: {
   open: boolean;
@@ -55,13 +59,17 @@ export function TxDialog({
   kind: CashTxKind;
   accounts: AccountOpt[];
   categories: ExpenseCategory[];
+  members?: MemberOpt[];
+  defaultCategoryId?: string; // предзаполнение с экрана «Выплаты команде»
+  defaultPersonId?: string;
   lockKind?: boolean;
 }) {
   const router = useRouter();
   const [kind, setKind] = useState<CashTxKind>(initialKind);
   const [accountId, setAccountId] = useState(accounts[0]?.id ?? "");
   const [toAccountId, setToAccountId] = useState(accounts[1]?.id ?? "");
-  const [categoryId, setCategoryId] = useState("");
+  const [categoryId, setCategoryId] = useState(defaultCategoryId);
+  const [personId, setPersonId] = useState(defaultPersonId);
   const [amount, setAmount] = useState("");
   const [amountTo, setAmountTo] = useState("");
   const [rate, setRate] = useState("");
@@ -80,12 +88,19 @@ export function TxDialog({
     [categories, kind],
   );
 
+  // Зарплата, премия, гонорар подрядчику, возмещение — деньги конкретному
+  // человеку. Для таких статей спрашиваем, кому именно: тогда сумма попадёт в
+  // отчёт «Выплаты команде», а не растворится в общей строке расходов.
+  const category = categories.find((c) => c.id === categoryId);
+  const needsPerson = kind === "out" && Boolean(category?.isPayroll) && members.length > 0;
+
   function reset() {
     setAmount("");
     setAmountTo("");
     setNote("");
     setRate("");
-    setCategoryId("");
+    setCategoryId(defaultCategoryId);
+    setPersonId(defaultPersonId);
     setOccurredOn(todayIso());
   }
 
@@ -128,6 +143,7 @@ export function TxDialog({
           amountTo: crossCurrency ? toSum : null,
           occurredOn,
           note: note.trim() || null,
+          personId: needsPerson && personId ? personId : null,
           rateToRub: needsRate && Number.isFinite(rateNum) && rateNum > 0 ? rateNum : null,
         }),
       });
@@ -158,7 +174,7 @@ export function TxDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="grid gap-3 sm:grid-cols-2">
+        <div className="grid gap-3 sm:grid-cols-2 [&>div]:min-w-0">
           {!lockKind && (
             <div className="grid gap-1.5 sm:col-span-2">
               <Label>Тип операции</Label>
@@ -235,7 +251,7 @@ export function TxDialog({
             </div>
           ) : (
             <div className="grid gap-1.5">
-              <Label>Статья</Label>
+              <Label>Статья {kind === "in" ? "прихода" : "расхода"}</Label>
               <Select value={categoryId} onValueChange={(v) => v && setCategoryId(v)}>
                 <SelectTrigger className="w-full">
                   <SelectValue placeholder="Выберите статью" />
@@ -249,6 +265,29 @@ export function TxDialog({
                   ))}
                 </SelectContent>
               </Select>
+            </div>
+          )}
+
+          {needsPerson && (
+            <div className="grid gap-1.5 sm:col-span-2">
+              <Label>Кому выплата</Label>
+              <Select value={personId} onValueChange={(v) => setPersonId(v ?? "")}>
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="Выберите сотрудника" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="">Не указывать</SelectItem>
+                  {members.map((m) => (
+                    <SelectItem key={m.id} value={m.id}>
+                      {m.name} · {m.roleLabel}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[11px] text-muted-foreground">
+                Сумма попадёт в отчёт «Выплаты команде» — сколько получил каждый сотрудник.
+                Для человека не из команды оставьте пустым и напишите имя в комментарии.
+              </p>
             </div>
           )}
 
@@ -313,6 +352,9 @@ export function AddTxButton({
   kind,
   accounts,
   categories,
+  members = [],
+  defaultCategoryId = "",
+  defaultPersonId = "",
   label,
   lockKind = false,
   variant = "default",
@@ -320,9 +362,12 @@ export function AddTxButton({
   kind: CashTxKind;
   accounts: AccountOpt[];
   categories: ExpenseCategory[];
+  members?: MemberOpt[];
+  defaultCategoryId?: string;
+  defaultPersonId?: string;
   label: string;
   lockKind?: boolean;
-  variant?: "default" | "outline";
+  variant?: "default" | "outline" | "ghost";
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -337,6 +382,9 @@ export function AddTxButton({
         kind={kind}
         accounts={accounts}
         categories={categories}
+        members={members}
+        defaultCategoryId={defaultCategoryId}
+        defaultPersonId={defaultPersonId}
         lockKind={lockKind}
       />
     </>

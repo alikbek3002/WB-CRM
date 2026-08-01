@@ -128,7 +128,7 @@ export function TaskForm({ team }: { team: TeamOption[] }) {
                 </SelectContent>
               </Select>
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-2 gap-3 [&>div]:min-w-0">
               <div className="grid gap-1.5">
                 <Label>Приоритет</Label>
                 <Select value={priority} items={PRIORITIES} onValueChange={(v) => v && setPriority(v)}>

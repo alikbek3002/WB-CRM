@@ -21,6 +21,7 @@ import {
   getCashOverview,
   getExpensesView,
   getFinanceRefs,
+  getPayrollView,
   getPnlView,
 } from "../data/cash-core";
 import {
@@ -492,11 +493,14 @@ function helpText(user?: AuthedUser): string {
     if (can(user.role, "finance:cash")) {
       ask.push("«сколько денег в кассе?»");
       ask.push("«какая прибыль за месяц?»");
+      if (can(user.role, "payout:approve")) ask.push("«кому сколько выплатили за месяц?»");
     }
     if (can(user.role, "finance:expense")) {
       act.push("«потратил 15 тысяч на рекламу»");
       act.push("«пришло 800 тысяч от WB на расчётный счёт»");
+      if (can(user.role, "payout:approve")) act.push("«начисли Азизу зарплату 60 тысяч»");
     }
+    ask.push("«сколько мне выплатили за месяц?»");
     if (can(user.role, "payout:request")) {
       act.push("«нужно оплатить фотографу 15 тысяч»");
     }
@@ -979,6 +983,7 @@ function financeMenu(user: AuthedUser): InlineKeyboard {
     kb.text("📊 Прибыль (ОПиУ)", "fin:pnl").row();
     kb.text("👛 Касса — сколько денег", "fin:cash").row();
     kb.text("🧾 Расходы за месяц", "fin:expenses").row();
+    kb.text("👥 Выплаты команде", "fin:payroll").row();
   }
   if (can(user.role, "finance:expense")) {
     kb.text("➕ Записать расход", "fin:add").row();
@@ -1219,6 +1224,55 @@ async function renderExpenses(): Promise<string> {
       `     ${esc(humanDate(t.occurredOn))}${t.note ? ` · ${esc(short(t.note, 40))}` : ""}${t.authorName ? ` · ${esc(t.authorName)}` : ""}`,
     );
   }
+  return lines.join("\n");
+}
+
+// Выплаты команде: кому сколько ушло с начала месяца. Тот же расчёт, что в
+// вебе (cash-core) — цифры в боте и на сайте не могут разойтись.
+async function renderPayroll(): Promise<string> {
+  const view = await getPayrollView(admin());
+  if (!view.people.length) {
+    return (
+      "👥 <b>Выплаты команде</b>\n\nВ этом месяце адресных выплат нет.\n" +
+      (view.unassignedRub > 0
+        ? `При этом по «людским» статьям ушло <b>${rub(view.unassignedRub)}</b> без указания сотрудника.\n\n`
+        : "") +
+      "Начислить можно словами: <i>«начисли Азизу зарплату 60 тысяч»</i>."
+    );
+  }
+
+  const lines = [
+    "👥 <b>Выплаты команде</b>",
+    "",
+    `💰 Всего за месяц — <b>${rub(view.totalRub)}</b>`,
+    `     ${view.people.length} чел. · ${view.items.length} выплат`,
+    "",
+    RULE,
+    "",
+    "<b>КОМУ СКОЛЬКО</b>",
+  ];
+  for (const p of view.people.slice(0, 10)) {
+    lines.push(
+      "",
+      `👤 <b>${esc(p.name)}</b> — ${rub(p.amountRub)}`,
+      `     ${esc(p.roleLabel)} · ${p.sharePct}% фонда · ${p.txCount} выплат` +
+        (p.lastPaidOn ? ` · последняя ${esc(humanDate(p.lastPaidOn))}` : ""),
+    );
+    if (p.slices.length > 1) {
+      lines.push(
+        `     <i>${esc(p.slices.map((s) => `${s.name} ${num(s.amountRub)}`).join(" · "))}</i>`,
+      );
+    }
+  }
+
+  const notes: string[] = [];
+  if (view.unassignedRub > 0) {
+    notes.push(
+      `⚠️ Без указания сотрудника — ${rub(view.unassignedRub)} (${view.unassignedCount} оп.)`,
+    );
+  }
+  if (view.pendingRub > 0) notes.push(`🟡 Ждут выплаты по заявкам — ${rub(view.pendingRub)}`);
+  if (notes.length) lines.push("", RULE, "", ...notes);
   return lines.join("\n");
 }
 
@@ -1810,14 +1864,20 @@ async function handleFinanceCallback(
       await editText(ctx, await renderFinance(user), financeMenu(user));
       return;
     }
-    if (action === "pnl" || action === "cash" || action === "expenses") {
+    if (action === "pnl" || action === "cash" || action === "expenses" || action === "payroll") {
       if (!needCash()) {
         await ctx.answerCallbackQuery({ text: "Нет доступа к этому разделу", show_alert: true });
         return;
       }
       await ctx.answerCallbackQuery();
       const body =
-        action === "pnl" ? await renderPnl() : action === "cash" ? await renderCash() : await renderExpenses();
+        action === "pnl"
+          ? await renderPnl()
+          : action === "cash"
+            ? await renderCash()
+            : action === "payroll"
+              ? await renderPayroll()
+              : await renderExpenses();
       await editText(ctx, body, financeMenu(user));
       return;
     }

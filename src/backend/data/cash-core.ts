@@ -11,7 +11,7 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { DEMO_ORG_ID, DEMO_STORE_ID, EXCHANGE_RATES, toRub } from "../../shared/constants";
-import { can, type MemberRole } from "../../shared/rbac";
+import { can, ROLE_LABELS, type MemberRole } from "../../shared/rbac";
 import type {
   CashAccount,
   CashAccountKind,
@@ -23,10 +23,13 @@ import type {
   ExpenseCategory,
   ExpenseCategorySlice,
   ExpensesView,
+  PayrollPerson,
+  PayrollSlice,
+  PayrollView,
   PnlMonth,
   PnlView,
 } from "../../shared/types";
-import { notifyRoles, tgEsc } from "../telegram/notify";
+import { notifyProfile, notifyRoles, tgEsc } from "../telegram/notify";
 
 const MONTHS_RU = [
   "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -78,19 +81,24 @@ type CashTxRow = {
   source: CashTx["source"];
   account_id: string;
   category_id: string | null;
+  person_id: string | null;
   account: { name: string } | { name: string }[] | null;
   to_account: { name: string } | { name: string }[] | null;
   category: { name: string; emoji: string | null } | { name: string; emoji: string | null }[] | null;
   author: { full_name: string | null } | { full_name: string | null }[] | null;
+  person: { full_name: string | null } | { full_name: string | null }[] | null;
 };
 
-// Один и тот же select для ленты кассы и списка расходов
+// Один и тот же select для ленты кассы и списка расходов.
+// У cash_tx ДВА FK на profiles (автор и адресат) — имена связей обязательны,
+// иначе PostgREST не поймёт, какую именно подтянуть (грабли embed).
 const CASH_TX_SELECT =
-  "id, kind, amount, amount_rub, currency, occurred_on, note, source, account_id, category_id, " +
+  "id, kind, amount, amount_rub, currency, occurred_on, note, source, account_id, category_id, person_id, " +
   "account:cash_accounts!cash_tx_account_id_fkey(name), " +
   "to_account:cash_accounts!cash_tx_to_account_id_fkey(name), " +
   "category:expense_categories(name, emoji), " +
-  "author:profiles!cash_tx_created_by_fkey(full_name)";
+  "author:profiles!cash_tx_created_by_fkey(full_name), " +
+  "person:profiles!cash_tx_person_id_fkey(full_name)";
 
 function mapTx(r: CashTxRow): CashTx {
   const cat = first(r.category);
@@ -109,6 +117,8 @@ function mapTx(r: CashTxRow): CashTx {
     occurredOn: String(r.occurred_on),
     note: r.note,
     authorName: first(r.author)?.full_name ?? null,
+    personId: r.person_id ? String(r.person_id) : null,
+    personName: first(r.person)?.full_name ?? null,
     source: r.source,
   };
 }
@@ -128,7 +138,7 @@ export async function getFinanceRefs(db: SupabaseClient): Promise<{
       .limit(100),
     db
       .from("expense_categories")
-      .select("id, name, direction, in_pnl, emoji")
+      .select("id, name, direction, in_pnl, emoji, is_payroll")
       .eq("org_id", DEMO_ORG_ID)
       .eq("archived", false)
       .order("direction")
@@ -150,6 +160,7 @@ export async function getFinanceRefs(db: SupabaseClient): Promise<{
       direction: c.direction as "in" | "out",
       inPnl: Boolean(c.in_pnl),
       emoji: (c.emoji as string) ?? null,
+      isPayroll: Boolean(c.is_payroll),
     })),
   };
 }
@@ -298,6 +309,158 @@ export async function getExpensesView(
       label: monthLabel(String(m.month)),
       totalRub: Math.round(Number(m.total_rub ?? 0)),
     })),
+  };
+}
+
+// Выплаты команде: кому сколько ушло за период.
+//
+// Считается из той же книги cash_tx (расходы с указанным сотрудником), поэтому
+// «зарплата Азизу» одновременно и расход компании в ОПиУ, и строка в его
+// карточке — двойного учёта нет. Выплаты по «людским» статьям без адресата
+// показываем отдельно (unassigned): это подсказка «укажите, кому платили».
+export async function getPayrollView(
+  db: SupabaseClient,
+  from?: string,
+  to?: string,
+): Promise<PayrollView> {
+  const periodFrom = from ?? isoDay(monthStart(0));
+  const periodTo = to ?? isoDay(new Date());
+
+  const { categories } = await getFinanceRefs(db);
+  const payrollCatIds = new Set(categories.filter((c) => c.isPayroll).map((c) => c.id));
+
+  const [peopleRes, sliceRes, monthlyRes, itemsRes, catRes, pendingRes] = await Promise.all([
+    db.rpc("agg_payroll_by_person", { p_org: DEMO_ORG_ID, p_from: periodFrom, p_to: periodTo }),
+    db.rpc("agg_payroll_by_person_category", {
+      p_org: DEMO_ORG_ID,
+      p_from: periodFrom,
+      p_to: periodTo,
+    }),
+    db.rpc("agg_payroll_monthly", { p_org: DEMO_ORG_ID, p_since: isoDay(monthStart(5)) }),
+    db
+      .from("cash_tx")
+      .select(CASH_TX_SELECT)
+      .eq("org_id", DEMO_ORG_ID)
+      .eq("kind", "out")
+      .not("person_id", "is", null)
+      .gte("occurred_on", periodFrom)
+      .lte("occurred_on", periodTo)
+      .order("occurred_on", { ascending: false })
+      .order("created_at", { ascending: false })
+      .limit(300),
+    db.rpc("agg_expenses_by_category", {
+      p_org: DEMO_ORG_ID,
+      p_from: periodFrom,
+      p_to: periodTo,
+    }),
+    db
+      .from("payout_requests")
+      .select("amount, currency, status")
+      .eq("org_id", DEMO_ORG_ID)
+      .in("status", ["pending", "approved"])
+      .in("kind", ["salary", "contractor", "reimbursement", "other"])
+      .limit(500),
+  ]);
+  if (peopleRes.error) throw peopleRes.error;
+  if (sliceRes.error) throw sliceRes.error;
+  if (monthlyRes.error) throw monthlyRes.error;
+  if (itemsRes.error) throw itemsRes.error;
+  if (catRes.error) throw catRes.error;
+
+  type PersonRow = {
+    person_id: string;
+    full_name: string;
+    role: string | null;
+    amount_rub: number;
+    tx_count: number;
+    last_paid: string | null;
+  };
+  type SliceRow = {
+    person_id: string;
+    category_id: string | null;
+    name: string;
+    emoji: string | null;
+    amount_rub: number;
+    tx_count: number;
+  };
+  type MonthRow = { month: string; person_id: string; amount_rub: number };
+  type CatRow = { category_id: string | null; amount_rub: number; tx_count: number };
+
+  const personRows = (peopleRes.data ?? []) as PersonRow[];
+  const sliceRows = (sliceRes.data ?? []) as SliceRow[];
+  const monthRows = (monthlyRes.data ?? []) as MonthRow[];
+  const totalRub = personRows.reduce((t, r) => t + Number(r.amount_rub ?? 0), 0);
+
+  const slicesByPerson = new Map<string, PayrollSlice[]>();
+  for (const s of sliceRows) {
+    const key = String(s.person_id);
+    const list = slicesByPerson.get(key) ?? [];
+    list.push({
+      categoryId: s.category_id ? String(s.category_id) : null,
+      name: String(s.name),
+      emoji: s.emoji,
+      amountRub: Math.round(Number(s.amount_rub ?? 0)),
+      txCount: Number(s.tx_count ?? 0),
+    });
+    slicesByPerson.set(key, list);
+  }
+
+  const monthsByPerson = new Map<string, { month: string; label: string; amountRub: number }[]>();
+  for (const m of monthRows) {
+    const key = String(m.person_id);
+    const list = monthsByPerson.get(key) ?? [];
+    list.push({
+      month: String(m.month),
+      label: monthLabel(String(m.month)),
+      amountRub: Math.round(Number(m.amount_rub ?? 0)),
+    });
+    monthsByPerson.set(key, list);
+  }
+
+  const people: PayrollPerson[] = personRows.map((r) => {
+    const id = String(r.person_id);
+    const amountRub = Math.round(Number(r.amount_rub ?? 0));
+    const role = (r.role ?? "") as MemberRole;
+    return {
+      personId: id,
+      name: String(r.full_name ?? "—"),
+      role: String(r.role ?? ""),
+      roleLabel: ROLE_LABELS[role] ?? "—",
+      amountRub,
+      txCount: Number(r.tx_count ?? 0),
+      lastPaidOn: r.last_paid ? String(r.last_paid) : null,
+      sharePct: totalRub > 0 ? Math.round((amountRub / totalRub) * 100) : 0,
+      slices: (slicesByPerson.get(id) ?? []).sort((a, b) => b.amountRub - a.amountRub),
+      monthly: monthsByPerson.get(id) ?? [],
+    };
+  });
+
+  // «Людские» статьи без адресата: столько денег ушло людям, но кому — не указано
+  const payrollCatRows = ((catRes.data ?? []) as CatRow[]).filter(
+    (c) => c.category_id && payrollCatIds.has(String(c.category_id)),
+  );
+  const payrollFundRub = payrollCatRows.reduce((t, c) => t + Number(c.amount_rub ?? 0), 0);
+  const payrollFundCount = payrollCatRows.reduce((t, c) => t + Number(c.tx_count ?? 0), 0);
+  const assignedInPayroll = sliceRows.filter(
+    (s) => s.category_id && payrollCatIds.has(String(s.category_id)),
+  );
+  const assignedRub = assignedInPayroll.reduce((t, s) => t + Number(s.amount_rub ?? 0), 0);
+  const assignedCount = assignedInPayroll.reduce((t, s) => t + Number(s.tx_count ?? 0), 0);
+
+  const pending = ((pendingRes.data ?? []) as { amount: number; currency: Currency }[]).reduce(
+    (t, p) => t + toRub(Number(p.amount ?? 0), p.currency),
+    0,
+  );
+
+  return {
+    from: periodFrom,
+    to: periodTo,
+    totalRub: Math.round(totalRub),
+    people,
+    unassignedRub: Math.max(0, Math.round(payrollFundRub - assignedRub)),
+    unassignedCount: Math.max(0, payrollFundCount - assignedCount),
+    items: ((itemsRes.data ?? []) as unknown as CashTxRow[]).map(mapTx),
+    pendingRub: Math.round(pending),
   };
 }
 
@@ -597,6 +760,59 @@ export async function findCategories(
   );
 }
 
+// ─── Команда: кому платим ────────────────────────────────────────────────────
+
+export type MemberRef = { id: string; name: string; role: MemberRole; roleLabel: string };
+
+// Сотрудники организации — справочник адресатов выплат для веба, бота и ИИ.
+export async function listMembers(db: SupabaseClient): Promise<MemberRef[]> {
+  const { data, error } = await db
+    .from("org_members")
+    .select("role, profile:profiles(id, full_name)")
+    .eq("org_id", DEMO_ORG_ID)
+    .limit(200);
+  if (error) throw error;
+  return ((data ?? []) as unknown as {
+    role: MemberRole;
+    profile: { id: string; full_name: string | null } | { id: string; full_name: string | null }[] | null;
+  }[])
+    .map((m) => {
+      const p = first(m.profile);
+      return p?.id
+        ? {
+            id: String(p.id),
+            name: p.full_name ?? "—",
+            role: m.role,
+            roleLabel: ROLE_LABELS[m.role] ?? String(m.role),
+          }
+        : null;
+    })
+    .filter((m): m is MemberRef => m !== null)
+    .sort((a, b) => a.name.localeCompare(b.name, "ru"));
+}
+
+// Поиск сотрудника по id или по части имени — бот и ИИ получают «Азиз», а не uuid.
+export async function findMembers(db: SupabaseClient, query: string): Promise<MemberRef[]> {
+  const members = await listMembers(db);
+  const q = query.trim().toLowerCase();
+  if (!q) return members;
+  const byId = members.filter((m) => m.id === q);
+  if (byId.length) return byId;
+  const exact = members.filter((m) => m.name.toLowerCase() === q);
+  if (exact.length) return exact;
+  const starts = members.filter((m) =>
+    m.name.toLowerCase().split(/\s+/).some((part) => part.startsWith(q)),
+  );
+  if (starts.length) return starts;
+  return members.filter((m) => m.name.toLowerCase().includes(q));
+}
+
+async function findMember(db: SupabaseClient, id: string): Promise<MemberRef | null> {
+  if (!UUID_RE.test(id)) return null;
+  const members = await listMembers(db);
+  return members.find((m) => m.id === id) ?? null;
+}
+
 // ─── Запись операций ─────────────────────────────────────────────────────────
 
 export type CashActor = { id: string; name: string; role: MemberRole; roleLabel: string };
@@ -617,6 +833,7 @@ export type CashTxInput = {
   occurredOn?: string | null; // yyyy-mm-dd, по умолчанию сегодня
   note?: string | null;
   rateToRub?: number | null; // курс валюты счёта; по умолчанию — общий курс
+  personId?: string | null; // кому эти деньги (сотрудник) — для зарплат и гонораров
   source?: CashTx["source"];
   sourceRef?: string | null; // внешний ключ (номер отчёта WB) — защита от дублей
 };
@@ -729,6 +946,17 @@ export async function createCashTx(
     }
   }
 
+  // Адресат выплаты: только свой сотрудник. Чужой uuid отклоняем — иначе отчёт
+  // «кому сколько выплатили» соберёт людей не из этой команды.
+  let personId: string | null = null;
+  if (input.personId && input.kind !== "transfer") {
+    const member = await findMember(db, input.personId);
+    if (!member) {
+      return { ok: false, code: "not_found", message: "Сотрудник не найден в команде." };
+    }
+    personId = member.id;
+  }
+
   // Курс к рублю: свой можно передать (реальный курс сделки), иначе общий
   const rate =
     currency === "rub"
@@ -751,6 +979,7 @@ export async function createCashTx(
       rate_to_rub: rate,
       occurred_on: occurredOn,
       note: input.note ? String(input.note).slice(0, NOTE_MAX) : null,
+      person_id: personId,
       source: input.source ?? "manual",
       source_ref: input.sourceRef ?? null,
       created_by: authorId(actor),
@@ -767,6 +996,19 @@ export async function createCashTx(
     input.kind === "transfer"
       ? `перевод ${rubFmt(amountRub)}`
       : `${input.kind === "out" ? "расход" : "приход"} ${rubFmt(amountRub)}${catName ? ` · ${catName}` : ""}`;
+
+  // Адресная выплата — сразу сотруднику: человек узнаёт о деньгах от системы,
+  // а не «на словах», и может сверить сумму в тот же день.
+  if (personId && input.kind === "out") {
+    void notifyProfile(
+      personId,
+      `💰 <b>Вам начислена выплата</b> — ${tgEsc(rubFmt(amountRub))}\n` +
+        `Статья: <b>${tgEsc(catName ?? "без статьи")}</b>\n` +
+        `Дата: ${tgEsc(occurredOn)}\n` +
+        `Провёл: ${tgEsc(actor.name)} (${tgEsc(actor.roleLabel)})` +
+        (input.note ? `\nКомментарий: ${tgEsc(String(input.note).slice(0, 200))}` : ""),
+    );
+  }
 
   // Крупные расходы — пушем директору (best effort, не роняет запись)
   if (input.kind === "out" && amountRub >= CASH_NOTIFY_THRESHOLD_RUB) {

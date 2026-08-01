@@ -177,6 +177,7 @@ export type ExpenseCategory = {
   direction: "in" | "out";
   inPnl: boolean; // влияет ли на прибыль периода
   emoji: string | null;
+  isPayroll: boolean; // деньги человеку (зарплата, премия, подрядчик, возмещение)
 };
 
 export type CashTx = {
@@ -194,6 +195,8 @@ export type CashTx = {
   occurredOn: string; // yyyy-mm-dd
   note: string | null;
   authorName: string | null;
+  personId: string | null; // кому эти деньги (сотрудник)
+  personName: string | null;
   source: "manual" | "bot" | "ai" | "supply_payment" | "wb_payout" | "payout";
 };
 
@@ -252,6 +255,8 @@ export type PayoutRequest = {
   amountRub: number; // для сводок
   dueDate: string | null;
   payee: string | null; // кому платим, если не сам заявитель
+  payeeUserId: string | null; // тот же адресат, но сотрудником из команды
+  payeeUserName: string | null;
   requesterId: string;
   requesterName: string;
   requesterRole: string | null;
@@ -275,6 +280,40 @@ export type PayoutsView = {
   pendingRub: number; // сколько ждёт согласования
   approvedRub: number; // согласовано, но ещё не оплачено
   paidMonthRub: number; // выплачено в этом месяце
+};
+
+// ─── Выплаты команде: кому сколько ушло (миграция 0030) ─────────────────────
+
+export type PayrollSlice = {
+  categoryId: string | null;
+  name: string; // «Зарплата», «Премии и бонусы», «Возмещение сотруднику»
+  emoji: string | null;
+  amountRub: number;
+  txCount: number;
+};
+
+export type PayrollPerson = {
+  personId: string;
+  name: string;
+  role: string; // код роли (member_role)
+  roleLabel: string;
+  amountRub: number; // выплачено за период
+  txCount: number;
+  lastPaidOn: string | null; // yyyy-mm-dd
+  sharePct: number; // доля от фонда выплат за период
+  slices: PayrollSlice[]; // из чего сложилось
+  monthly: { month: string; label: string; amountRub: number }[];
+};
+
+export type PayrollView = {
+  from: string; // yyyy-mm-dd
+  to: string;
+  totalRub: number; // фонд выплат людям за период
+  people: PayrollPerson[];
+  unassignedRub: number; // выплаты «людям» без указанного сотрудника
+  unassignedCount: number;
+  items: CashTx[]; // операции периода (только адресные выплаты)
+  pendingRub: number; // согласовано к выплате, но ещё не оплачено
 };
 
 // ─── ОПиУ (отчёт о прибылях и убытках) ───────────────────────────────────────

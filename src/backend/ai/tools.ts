@@ -18,12 +18,15 @@ import {
   createCashTx,
   findAccounts,
   findCategories,
+  findMembers,
   getCashOverview,
   getExpensesView,
+  getPayrollView,
   getPnlView,
   mirrorSupplyPaymentToCash,
   pickDefaultAccount,
   type CashActor,
+  type MemberRef,
 } from "../data/cash-core";
 import {
   createPayoutRequest,
@@ -308,6 +311,56 @@ const CATALOG: ToolSpec[] = [
   },
 
   {
+    name: "pay_salary",
+    permission: "finance:expense",
+    leadOnly: true,
+    description:
+      "НАЧИСЛИТЬ ВЫПЛАТУ СОТРУДНИКУ: зарплата, аванс, премия, гонорар, возмещение расходов. " +
+      "Деньги сразу списываются со счёта кассы и попадают в отчёт «Выплаты команде» — видно, кому сколько выплатили. " +
+      "Используй на «начисли Азизу зарплату 60 тысяч», «выплати Назире премию 10к», «отдал аванс Алие 20000». " +
+      "Сотрудника ищем по имени. Сотруднику придёт уведомление в Telegram. " +
+      "Если нужно СОГЛАСОВАНИЕ руководителя, а не сразу деньги — используй request_payout.",
+    input_schema: obj(
+      {
+        employee: str("Имя сотрудника (например «Азиз» или «Назира»)"),
+        amount: int("Сумма выплаты (в валюте счёта; для рублёвого счёта — рубли)"),
+        kind: {
+          type: "string",
+          enum: ["salary", "bonus", "contractor", "reimbursement"],
+          description:
+            "salary — зарплата или аванс (по умолчанию), bonus — премия, contractor — гонорар за услуги, reimbursement — возместить потраченное",
+        },
+        account: str("Название счёта, с которого платим (необязательно — возьмём основной рублёвый)"),
+        date: str("Дата выплаты yyyy-mm-dd (по умолчанию сегодня)"),
+        note: str("За что: «зарплата за июль», «аванс», «премия за план» (необязательно)"),
+      },
+      ["employee", "amount"],
+    ),
+  },
+  {
+    name: "payroll_report",
+    permission: "finance:cash",
+    leadOnly: true,
+    description:
+      "КОМУ СКОЛЬКО ВЫПЛАТИЛИ: разрез выплат по сотрудникам за период — суммы, число выплат, из чего сложилось (оклад, премия, возмещение). " +
+      "Используй на «сколько выплатили Азизу за месяц», «кому сколько заплатили», «сколько ушло на зарплаты», «фонд оплаты труда».",
+    input_schema: obj({
+      employee: str("Имя сотрудника, если нужен разрез по одному человеку (необязательно)"),
+      days: int("За сколько последних дней (по умолчанию — с начала месяца)"),
+    }),
+  },
+  {
+    name: "my_salary",
+    permission: "tasks:view",
+    description:
+      "Сколько сотрудник получил ОТ КОМПАНИИ: его собственные выплаты за период (зарплата, премии, возмещения) и заявки, которые ещё ждут оплаты. " +
+      "Показывает ТОЛЬКО деньги самого спрашивающего. Используй на «сколько мне заплатили», «когда была последняя зарплата», «сколько я получил за месяц».",
+    input_schema: obj({
+      days: int("За сколько последних дней (по умолчанию 90)"),
+    }),
+  },
+
+  {
     name: "request_payout",
     permission: "payout:request",
     description:
@@ -324,7 +377,8 @@ const CATALOG: ToolSpec[] = [
           description: "Тип: salary — зарплата/аванс, contractor — подрядчик/услуги, factory — счёт фабрики, reimbursement — возместить сотруднику, other — прочее",
         },
         currency: { type: "string", enum: ["rub", "kgs", "cny", "uzs"], description: "Валюта (по умолчанию рубли)" },
-        payee: str("Кому платим, если не самому заявителю"),
+        payee: str("Кому платим, если это не сотрудник компании: имя подрядчика, фотографа, компании"),
+        employee: str("Имя сотрудника-адресата, если платим кому-то из команды — тогда выплата попадёт в его карточку"),
         due_date: str("Оплатить до, yyyy-mm-dd (необязательно)"),
         supply: str("Часть названия поставки, если это счёт фабрики (необязательно)"),
       },
@@ -1486,9 +1540,260 @@ async function execCompanyExpenses(ctx: ToolCtx, input: { days?: number }): Prom
 
 // ── Заявки на выплату (правила — в data/payouts-core) ───────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Выплаты людям
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Какую статью расхода берём под тип выплаты. Названия те же, что в кассе, —
+// сотрудник видит в CRM ровно то, что продиктовал боту.
+const SALARY_CATEGORY: Record<string, string> = {
+  salary: "Зарплата",
+  bonus: "Премии и бонусы",
+  contractor: "Подрядчики и услуги",
+  reimbursement: "Возмещение сотруднику",
+};
+
+// Сотрудник по имени: «Азиз» → профиль. Переспрашиваем, если совпало несколько.
+async function resolveEmployee(
+  ctx: ToolCtx,
+  query: string,
+): Promise<{ ask: string } | { member: MemberRef }> {
+  const q = String(query ?? "").trim();
+  if (!q) return { ask: "Уточни, кому именно выплата — назови имя сотрудника." };
+  const matches = await findMembers(ctx.db, q);
+  if (!matches.length) {
+    const all = await findMembers(ctx.db, "");
+    return {
+      ask:
+        `Сотрудник «${q}» не найден. В команде: ${all.map((m) => m.name).join(", ")}. ` +
+        "Уточни имя.",
+    };
+  }
+  if (matches.length > 1) {
+    return {
+      ask: `Подходит несколько человек: ${matches.map((m) => `${m.name} (${m.roleLabel})`).join(", ")}. Уточни, кто именно.`,
+    };
+  }
+  return { member: matches[0] };
+}
+
+async function execPaySalary(
+  ctx: ToolCtx,
+  input: { employee?: string; amount?: number; kind?: string; account?: string; date?: string; note?: string },
+): Promise<string> {
+  const amount = Number(input.amount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return "Ошибка: нужна сумма больше нуля. Спроси, сколько начислить.";
+  }
+
+  const found = await resolveEmployee(ctx, String(input.employee ?? ""));
+  if ("ask" in found) return found.ask;
+  const member = found.member;
+
+  const wantedCategory = SALARY_CATEGORY[String(input.kind ?? "salary")] ?? SALARY_CATEGORY.salary;
+  const categories = await findCategories(ctx.db, wantedCategory, "out");
+  if (!categories.length) {
+    const all = await findCategories(ctx.db, "", "out");
+    return (
+      `Статья «${wantedCategory}» не заведена. Есть: ${all.map((c) => c.name).join(", ")}. ` +
+      "Заведите её в CRM → Финансы → Расходы или скажи, какую использовать."
+    );
+  }
+  const category = categories[0];
+
+  let account: { id: string; name: string } | null = null;
+  const accountQuery = String(input.account ?? "").trim();
+  if (accountQuery) {
+    const found = await findAccounts(ctx.db, accountQuery);
+    if (!found.length) {
+      const all = await findAccounts(ctx.db, "");
+      return `Счёт «${accountQuery}» не найден. Есть: ${all.map((a) => a.name).join(", ")}.`;
+    }
+    if (found.length > 1) {
+      return `Подходит несколько счетов: ${found.map((a) => a.name).join(", ")}. Уточни, с какого платим.`;
+    }
+    account = { id: found[0].id, name: found[0].name };
+  } else {
+    const fallback = await pickDefaultAccount(ctx.db);
+    if (!fallback) return "Счетов кассы ещё нет — заведите счёт в CRM → Финансы → Касса.";
+    account = { id: fallback.id, name: fallback.name };
+  }
+
+  const date = isoOr(input.date, localIsoDate()) ?? localIsoDate();
+  const result = await createCashTx(ctx.db, cashActorOf(ctx.user), {
+    kind: "out",
+    accountId: account.id,
+    categoryId: category.id,
+    amount,
+    occurredOn: date,
+    note: input.note ? String(input.note) : `${category.name} · ${member.name}`,
+    personId: member.id,
+    source: "ai",
+  });
+  if (!result.ok) return `Не удалось начислить выплату: ${result.message}`;
+  ctx.touch();
+
+  return (
+    `Выплата проведена: ${num(result.amountRub)} ₽ · ${member.name} (${member.roleLabel}) · ` +
+    `статья «${category.name}» · счёт «${account.name}» · дата ${date}. ` +
+    "Сумма попала в отчёт «Выплаты команде»; сотруднику ушло уведомление в Telegram, если его аккаунт привязан." +
+    (accountQuery ? "" : " Счёт выбран автоматически — скажи об этом, чтобы поправили, если платили с другого.")
+  );
+}
+
+async function execPayrollReport(
+  ctx: ToolCtx,
+  input: { employee?: string; days?: number },
+): Promise<string> {
+  const days = posInt(input.days);
+  const from = days
+    ? localIsoDate(new Date(Date.now() - (days - 1) * 86_400_000))
+    : localIsoDate(new Date(new Date().getFullYear(), new Date().getMonth(), 1));
+  const to = localIsoDate();
+
+  const view = await getPayrollView(ctx.db, from, to);
+
+  // Разрез по одному человеку
+  if (input.employee) {
+    const found = await resolveEmployee(ctx, String(input.employee));
+    if ("ask" in found) return found.ask;
+    const person = view.people.find((p) => p.personId === found.member.id);
+    if (!person) {
+      return `${found.member.name}: выплат за период ${from}…${to} нет.`;
+    }
+    const lines = [
+      `ВЫПЛАТЫ · ${person.name} (${person.roleLabel}) за ${from}…${to}: ` +
+        `${num(person.amountRub)} ₽ за ${person.txCount} выплат` +
+        (person.lastPaidOn ? `, последняя ${person.lastPaidOn}` : "") +
+        `. Это ${person.sharePct}% всех выплат команде.`,
+    ];
+    if (person.slices.length) {
+      lines.push(
+        "Из чего сложилось: " +
+          person.slices.map((s) => `${s.name} — ${num(s.amountRub)} ₽`).join("; "),
+      );
+    }
+    if (person.monthly.length > 1) {
+      lines.push(
+        "По месяцам: " + person.monthly.map((m) => `${m.label} — ${num(m.amountRub)} ₽`).join("; "),
+      );
+    }
+    const own = view.items.filter((t) => t.personId === person.personId).slice(0, 8);
+    if (own.length) {
+      lines.push("Операции:");
+      for (const t of own) {
+        lines.push(
+          `- ${t.occurredOn}: ${num(t.amountRub)} ₽ · ${t.categoryName ?? "без статьи"}` +
+            (t.note ? ` · ${t.note}` : ""),
+        );
+      }
+    }
+    return lines.join("\n");
+  }
+
+  if (!view.people.length) {
+    return (
+      `ВЫПЛАТЫ КОМАНДЕ за ${from}…${to}: адресных выплат нет.` +
+      (view.unassignedRub > 0
+        ? ` При этом по «людским» статьям ушло ${num(view.unassignedRub)} ₽ без указания сотрудника — стоит указывать, кому платили.`
+        : "")
+    );
+  }
+
+  const lines = [
+    `ВЫПЛАТЫ КОМАНДЕ за ${from}…${to}: всего ${num(view.totalRub)} ₽ на ${view.people.length} человек ` +
+      `(${view.items.length} выплат).`,
+  ];
+  for (const p of view.people) {
+    lines.push(
+      `- ${p.name} (${p.roleLabel}): ${num(p.amountRub)} ₽ · ${p.sharePct}% · ${p.txCount} выплат` +
+        (p.lastPaidOn ? ` · последняя ${p.lastPaidOn}` : "") +
+        (p.slices.length
+          ? ` · ${p.slices.map((s) => `${s.name} ${num(s.amountRub)}`).join(", ")}`
+          : ""),
+    );
+  }
+  if (view.unassignedRub > 0) {
+    lines.push(
+      `Без указания сотрудника: ${num(view.unassignedRub)} ₽ (${view.unassignedCount} операций) — ` +
+        "в разрезе по людям их не видно.",
+    );
+  }
+  if (view.pendingRub > 0) {
+    lines.push(`Ждут выплаты по заявкам: ${num(view.pendingRub)} ₽.`);
+  }
+  return lines.join("\n");
+}
+
+// Свои деньги видит любой сотрудник — но только свои
+async function execMySalary(ctx: ToolCtx, input: { days?: number }): Promise<string> {
+  const days = posInt(input.days) ?? 90;
+  const from = localIsoDate(new Date(Date.now() - (days - 1) * 86_400_000));
+  const to = localIsoDate();
+
+  const [txRes, payouts] = await Promise.all([
+    ctx.db
+      .from("cash_tx")
+      .select("occurred_on, amount_rub, note, category:expense_categories(name)")
+      .eq("org_id", DEMO_ORG_ID)
+      .eq("kind", "out")
+      .eq("person_id", ctx.user.id)
+      .gte("occurred_on", from)
+      .lte("occurred_on", to)
+      .order("occurred_on", { ascending: false })
+      .limit(50),
+    getPayouts(ctx.db, { id: ctx.user.id, role: ctx.user.role }),
+  ]);
+  if (txRes.error) return `Не удалось прочитать выплаты: ${txRes.error.message}`;
+
+  const rows = (txRes.data ?? []) as unknown as {
+    occurred_on: string;
+    amount_rub: number;
+    note: string | null;
+    category: { name: string } | { name: string }[] | null;
+  }[];
+  const total = rows.reduce((t, r) => t + Number(r.amount_rub ?? 0), 0);
+
+  const waiting = payouts.items.filter(
+    (p) => p.requesterId === ctx.user.id && (p.status === "pending" || p.status === "approved"),
+  );
+
+  const lines = [
+    `МОИ ВЫПЛАТЫ за ${from}…${to}: ${num(total)} ₽ за ${rows.length} ` +
+      (rows.length === 1 ? "выплату" : "выплат") + ".",
+  ];
+  for (const r of rows.slice(0, 10)) {
+    lines.push(
+      `- ${r.occurred_on}: ${num(Number(r.amount_rub ?? 0))} ₽ · ${one(r.category)?.name ?? "без статьи"}` +
+        (r.note ? ` · ${r.note}` : ""),
+    );
+  }
+  if (waiting.length) {
+    lines.push("Заявки в работе:");
+    for (const p of waiting) {
+      lines.push(
+        `- «${p.title}» ${num(p.amountRub)} ₽ · ${PAYOUT_STATUS_LABELS[p.status]}`,
+      );
+    }
+  }
+  if (!rows.length && !waiting.length) {
+    lines.push("Пока ничего не начислено — если ждёшь выплату, попроси её через заявку.");
+  }
+  return lines.join("\n");
+}
+
 async function execRequestPayout(
   ctx: ToolCtx,
-  input: { amount?: number; title?: string; kind?: string; currency?: string; payee?: string; due_date?: string; supply?: string },
+  input: {
+    amount?: number;
+    title?: string;
+    kind?: string;
+    currency?: string;
+    payee?: string;
+    employee?: string;
+    due_date?: string;
+    supply?: string;
+  },
 ): Promise<string> {
   const kind = ["salary", "contractor", "factory", "reimbursement", "other"].includes(String(input.kind))
     ? (String(input.kind) as PayoutKind)
@@ -1503,6 +1808,14 @@ async function execRequestPayout(
     supplyId = picked.row.id;
   }
 
+  // Адресат из команды — тогда после оплаты выплата попадёт в его карточку
+  let payeeUserId: string | null = null;
+  if (input.employee) {
+    const found = await resolveEmployee(ctx, String(input.employee));
+    if ("ask" in found) return found.ask;
+    payeeUserId = found.member.id;
+  }
+
   const result = await createPayoutRequest(ctx.db, cashActorOf(ctx.user), {
     kind,
     title: String(input.title ?? "").trim(),
@@ -1511,6 +1824,7 @@ async function execRequestPayout(
       ? String(input.currency)
       : "rub") as Currency,
     payee: input.payee ? String(input.payee) : null,
+    payeeUserId,
     dueDate: input.due_date ? String(input.due_date) : null,
     supplyId,
   });
@@ -2295,6 +2609,9 @@ const HANDLERS: Record<string, Handler> = {
   set_sales_plan: execSetSalesPlan as Handler,
   add_expense: execAddExpense as Handler,
   add_income: execAddIncome as Handler,
+  pay_salary: execPaySalary as Handler,
+  payroll_report: execPayrollReport as Handler,
+  my_salary: execMySalary as Handler,
   cash_balance: (ctx) => execCashBalance(ctx),
   pnl_report: execPnlReport as Handler,
   company_expenses: execCompanyExpenses as Handler,

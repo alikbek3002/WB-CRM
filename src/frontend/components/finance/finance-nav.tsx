@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BarChart3, Receipt, Target, Wallet } from "lucide-react";
+import { BarChart3, Receipt, Target, Users, Wallet } from "lucide-react";
 import { cn } from "@/shared/utils";
 
 // Вкладки раздела «Финансы». Ссылки, а не клиентские табы: каждая вкладка —
@@ -11,6 +11,7 @@ const TABS = [
   { href: "/finance", label: "План WB", icon: Target, cashOnly: false },
   { href: "/finance/pnl", label: "Прибыль (ОПиУ)", icon: BarChart3, cashOnly: true },
   { href: "/finance/expenses", label: "Расходы", icon: Receipt, cashOnly: true },
+  { href: "/finance/payroll", label: "Выплаты команде", icon: Users, cashOnly: true },
   { href: "/finance/cash", label: "Касса", icon: Wallet, cashOnly: true },
 ];
 

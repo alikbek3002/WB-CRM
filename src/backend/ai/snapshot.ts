@@ -6,7 +6,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { DEMO_ORG_ID, DEMO_STORE_ID } from "../../shared/constants";
 import { can, type MemberRole } from "../../shared/rbac";
-import { getCashOverview, getExpensesView, getPnlView } from "../data/cash-core";
+import { getCashOverview, getExpensesView, getPayrollView, getPnlView } from "../data/cash-core";
 import { getPayouts } from "../data/payouts-core";
 
 export type SnapshotUser = {
@@ -211,6 +211,31 @@ export async function buildSnapshot(
       }
       if (!pnl.hasExpenses) {
         lines.push("- ОГОВОРКА: расходы компании не внесены, прибыль без них.");
+      }
+      return lines.join("\n");
+    }, "");
+    if (block) sections.push(block);
+  }
+
+  // ── Выплаты команде: кому сколько ушло в этом месяце (finance:cash) ──
+  // «Сколько мы платим Азизу» — вопрос уровня директора, держим в снимке.
+  if (can(user.role, "finance:cash")) {
+    const block = await safe(async () => {
+      const view = await getPayrollView(db);
+      if (!view.people.length && view.unassignedRub === 0) return "";
+      const lines = [
+        `ВЫПЛАТЫ КОМАНДЕ с начала месяца: ${rub(view.totalRub)} на ${view.people.length} человек.`,
+      ];
+      for (const p of view.people.slice(0, 10)) {
+        lines.push(
+          `- ${p.name} (${p.roleLabel}): ${rub(p.amountRub)} · ${p.txCount} выплат` +
+            (p.lastPaidOn ? ` · последняя ${p.lastPaidOn}` : ""),
+        );
+      }
+      if (view.unassignedRub > 0) {
+        lines.push(
+          `- Без указания сотрудника: ${rub(view.unassignedRub)} (${view.unassignedCount} операций).`,
+        );
       }
       return lines.join("\n");
     }, "");
