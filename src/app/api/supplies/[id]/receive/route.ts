@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { toRub } from "@/shared/constants";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
@@ -49,10 +50,13 @@ export async function POST(
     return NextResponse.json({ ok: true, persisted: false, receipt: parsed.data });
   }
 
-  // Читаем дату отгрузки (для времени в пути) и статус (guard повторной приёмки)
+  // Дата отгрузки (время в пути), статус (guard повторной приёмки) и стоимость
+  // партии (автосебестоимость товара при связанной карточке WB)
   const { data: supply, error: readErr } = await admin
     .from("supplies")
-    .select("ship_date, status")
+    .select(
+      "ship_date, status, product_id, quantity, sewing_cost, sewing_currency, cargo_cost, cargo_currency",
+    )
     .eq("id", id)
     .single();
   if (readErr || !supply) {
@@ -82,6 +86,39 @@ export async function POST(
     return NextResponse.json({ error: "db_error" }, { status: 500 });
   }
 
+  // Автосебестоимость (политика «последняя партия»): (отшивка + карго) в ₽,
+  // делённые на фактически принятое (недостача удорожает партию — это честно).
+  // Перезаписывает и ручной ввод: происхождение видно по cost_price_source.
+  let costPriceUpdated = false;
+  const divisor = parsed.data.receivedQty > 0 ? parsed.data.receivedQty : Number(supply.quantity ?? 0);
+  const batchCostRub =
+    toRub(Number(supply.sewing_cost ?? 0), String(supply.sewing_currency ?? "rub")) +
+    toRub(Number(supply.cargo_cost ?? 0), String(supply.cargo_currency ?? "rub"));
+  if (supply.product_id && divisor > 0 && batchCostRub > 0) {
+    const unitCost = Math.round((batchCostRub / divisor) * 100) / 100;
+    const { error: costErr } = await admin
+      .from("products")
+      .update({
+        cost_price: unitCost,
+        cost_price_source: "supply",
+        cost_price_updated_at: now.toISOString(),
+      })
+      .eq("id", supply.product_id);
+    if (costErr) {
+      console.error("[supplies/receive] cost update failed:", costErr);
+    } else {
+      costPriceUpdated = true;
+      const { error: histErr } = await admin.from("product_cost_history").insert({
+        product_id: supply.product_id,
+        cost_price: unitCost,
+        source: "supply",
+        supply_id: id,
+        created_by: UUID.test(session.user.id) ? session.user.id : null,
+      });
+      if (histErr) console.error("[supplies/receive] cost history failed:", histErr);
+    }
+  }
+
   invalidateWbData();
-  return NextResponse.json({ ok: true, persisted: true });
+  return NextResponse.json({ ok: true, persisted: true, costPriceUpdated });
 }

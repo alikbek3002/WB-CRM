@@ -35,6 +35,10 @@ const KIND_TITLE: Record<CashTxKind, string> = {
   transfer: "Перевод между счетами",
 };
 
+// Пустая строка в Select значит «значение не выбрано» — для пункта
+// «Не указывать» нужен отдельный маркер, иначе подпись не отображается.
+const PERSON_NONE = "none";
+
 const todayIso = () => {
   const d = new Date();
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -69,7 +73,7 @@ export function TxDialog({
   const [accountId, setAccountId] = useState(accounts[0]?.id ?? "");
   const [toAccountId, setToAccountId] = useState(accounts[1]?.id ?? "");
   const [categoryId, setCategoryId] = useState(defaultCategoryId);
-  const [personId, setPersonId] = useState(defaultPersonId);
+  const [personId, setPersonId] = useState(defaultPersonId || PERSON_NONE);
   const [amount, setAmount] = useState("");
   const [amountTo, setAmountTo] = useState("");
   const [rate, setRate] = useState("");
@@ -100,7 +104,7 @@ export function TxDialog({
     setNote("");
     setRate("");
     setCategoryId(defaultCategoryId);
-    setPersonId(defaultPersonId);
+    setPersonId(defaultPersonId || PERSON_NONE);
     setOccurredOn(todayIso());
   }
 
@@ -143,7 +147,7 @@ export function TxDialog({
           amountTo: crossCurrency ? toSum : null,
           occurredOn,
           note: note.trim() || null,
-          personId: needsPerson && personId ? personId : null,
+          personId: needsPerson && personId !== PERSON_NONE ? personId : null,
           rateToRub: needsRate && Number.isFinite(rateNum) && rateNum > 0 ? rateNum : null,
         }),
       });
@@ -178,7 +182,22 @@ export function TxDialog({
           {!lockKind && (
             <div className="grid gap-1.5 sm:col-span-2">
               <Label>Тип операции</Label>
-              <Select value={kind} onValueChange={(v) => v && setKind(v as CashTxKind)}>
+              <Select
+                value={kind}
+                onValueChange={(v) => {
+                  if (!v) return;
+                  const k = v as CashTxKind;
+                  setKind(k);
+                  // Статья другого направления не отображается в списке —
+                  // сбрасываем, чтобы в кнопке не остался «сырой» uuid
+                  const dir = k === "in" ? "in" : "out";
+                  setCategoryId((prev) =>
+                    prev && categories.some((c) => c.id === prev && c.direction === dir)
+                      ? prev
+                      : "",
+                  );
+                }}
+              >
                 <SelectTrigger className="w-full">
                   <SelectValue />
                 </SelectTrigger>
@@ -215,7 +234,17 @@ export function TxDialog({
 
           <div className="grid gap-1.5">
             <Label>{kind === "transfer" ? "Списать со счёта" : "Счёт"}</Label>
-            <Select value={accountId} onValueChange={(v) => v && setAccountId(v)}>
+            <Select
+              value={accountId}
+              onValueChange={(v) => {
+                if (!v) return;
+                setAccountId(v);
+                // Счёт-получатель не может совпадать с источником
+                if (v === toAccountId) {
+                  setToAccountId(accounts.find((a) => a.id !== v)?.id ?? "");
+                }
+              }}
+            >
               <SelectTrigger className="w-full">
                 <SelectValue placeholder="Выберите счёт" />
               </SelectTrigger>
@@ -271,12 +300,12 @@ export function TxDialog({
           {needsPerson && (
             <div className="grid gap-1.5 sm:col-span-2">
               <Label>Кому выплата</Label>
-              <Select value={personId} onValueChange={(v) => setPersonId(v ?? "")}>
+              <Select value={personId} onValueChange={(v) => v && setPersonId(v)}>
                 <SelectTrigger className="w-full">
                   <SelectValue placeholder="Выберите сотрудника" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="">Не указывать</SelectItem>
+                  <SelectItem value={PERSON_NONE}>Не указывать</SelectItem>
                   {members.map((m) => (
                     <SelectItem key={m.id} value={m.id}>
                       {m.name} · {m.roleLabel}

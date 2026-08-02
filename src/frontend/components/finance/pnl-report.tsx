@@ -154,6 +154,23 @@ export function PnlReport({ view }: { view: PnlView }) {
 
   const drrPct = total.revenueRub > 0 ? (total.advertRub / total.revenueRub) * 100 : 0;
 
+  // Расшифровка «прочих удержаний» по видам операций (agg_deduction_details):
+  // помесячные значения под строкой удержаний, топ-6 по модулю суммы
+  const dedByOper = new Map<string, Map<string, number>>();
+  for (const d of view.deductionDetails) {
+    const m = dedByOper.get(d.operName) ?? new Map<string, number>();
+    m.set(d.month, (m.get(d.month) ?? 0) + d.amountRub);
+    dedByOper.set(d.operName, m);
+  }
+  const dedOpers = [...dedByOper.entries()]
+    .map(([name, byMonth]) => ({
+      name,
+      byMonth,
+      total: [...byMonth.values()].reduce((t, v) => t + v, 0),
+    }))
+    .sort((a, b) => Math.abs(b.total) - Math.abs(a.total))
+    .slice(0, 6);
+
   const stats: Stat[] = [
     { label: "Выручка", value: money(total.revenueRub), hint: `${formatNumber(total.qty)} шт продано` },
     {
@@ -464,6 +481,18 @@ export function PnlReport({ view }: { view: PnlView }) {
                   indent
                 />
               )}
+              {total.deductionRub !== 0 &&
+                dedOpers.map((op) => (
+                  <PnlRow
+                    key={op.name}
+                    label={`· ${op.name.toLowerCase()}`}
+                    currency={currency}
+                    values={months.map((m) => op.byMonth.get(m.month) ?? 0)}
+                    total={op.total}
+                    negative
+                    indent
+                  />
+                ))}
               <PnlRow
                 label="Себестоимость товара"
                 currency={currency}

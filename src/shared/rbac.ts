@@ -135,8 +135,9 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
     "duty:view",
   ],
   viewer: [
+    // Наблюдатель (гость/инвестор) — только чтение: заявки на выплату ему не
+    // положены, деньги компании он не просит
     "dashboard:view",
-    "payout:request",
     "rnp:view",
     "tasks:view",
     "factory:view",

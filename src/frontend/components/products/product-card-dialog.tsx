@@ -11,7 +11,23 @@ import {
   DialogTitle,
 } from "@/frontend/components/ui/dialog";
 import { formatNumber, formatRub } from "@/shared/format";
-import type { ProductListItem } from "@/shared/types";
+import type { CostPriceSource, ProductListItem } from "@/shared/types";
+
+const COST_SOURCE_LABEL: Record<CostPriceSource, string> = {
+  manual: "вручную",
+  import: "импорт из файла",
+  supply: "из поставки",
+};
+
+function costSourceLabel(product: ProductListItem): string | null {
+  if (product.costPrice <= 0) return null;
+  const label = COST_SOURCE_LABEL[product.costPriceSource] ?? null;
+  if (!label) return null;
+  const date = product.costPriceUpdatedAt
+    ? new Date(product.costPriceUpdatedAt).toLocaleDateString("ru-RU")
+    : null;
+  return date ? `${label} · ${date}` : label;
+}
 
 // Карточка-диалог товара: большое фото, галерея, описание, цены WB.
 // Открывается из таблицы (ProductCell) и из сетки карточек (products-view).
@@ -144,10 +160,80 @@ export function ProductDialog({
                 <span className="text-muted-foreground">Себестоимость</span>
                 <span className="text-right tabular-nums">
                   {formatRub(product.costPrice)}
+                  {costSourceLabel(product) && (
+                    <span className="ml-1.5 text-[10px] text-muted-foreground">
+                      {costSourceLabel(product)}
+                    </span>
+                  )}
                 </span>
                 <span className="text-muted-foreground">Ответственный</span>
                 <span className="truncate text-right">{product.responsible}</span>
               </div>
+
+              {product.econ && (
+                <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
+                  <div className="mb-2 flex items-baseline justify-between">
+                    <span className="text-xs font-medium text-muted-foreground">
+                      Юнит-экономика · {product.econ.periodDays} дней · на единицу
+                    </span>
+                    <span className="text-[11px] text-muted-foreground">
+                      продано {formatNumber(product.econ.saleQty)} шт
+                    </span>
+                  </div>
+                  <div className="space-y-1 text-sm">
+                    {[
+                      { label: "Цена реализации", value: product.econ.priceRub, plus: true },
+                      { label: "Комиссия и эквайринг", value: -product.econ.commissionRub },
+                      { label: "Логистика", value: -product.econ.logisticsRub },
+                      { label: "Хранение", value: -product.econ.storageRub },
+                      { label: "Приёмка", value: -product.econ.acceptanceRub },
+                      {
+                        label: `Реклама (ДРР ${product.econ.drrPct}%)`,
+                        value: -product.econ.advertRub,
+                      },
+                      { label: "Себестоимость", value: -product.econ.costPrice },
+                    ]
+                      .filter((r) => r.value !== 0 || r.plus)
+                      .map((r) => (
+                        <div key={r.label} className="flex justify-between">
+                          <span className="text-muted-foreground">{r.label}</span>
+                          <span className="tabular-nums">
+                            {r.value > 0 ? "" : "−"}
+                            {formatRub(Math.abs(r.value))}
+                          </span>
+                        </div>
+                      ))}
+                    <div className="flex justify-between border-t border-border/60 pt-1 font-medium">
+                      <span>Прибыль с единицы</span>
+                      <span
+                        className={`tabular-nums ${
+                          product.econ.profitPerUnitRub > 0
+                            ? "text-emerald-400"
+                            : product.econ.profitPerUnitRub < 0
+                              ? "text-red-400"
+                              : ""
+                        }`}
+                      >
+                        {formatRub(product.econ.profitPerUnitRub)}
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-xs text-muted-foreground">
+                      <span>
+                        маржа {product.econ.marginPct}%
+                        {product.econ.costPrice > 0 && ` · ROI ${product.econ.roiPct}%`}
+                      </span>
+                      <span className="tabular-nums">
+                        за период: {formatRub(product.econ.profitRub)}
+                      </span>
+                    </div>
+                    {product.econ.costPrice <= 0 && (
+                      <div className="text-[11px] text-amber-400">
+                        Себестоимость не заполнена — прибыль завышена
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
 
               {product.description && (
                 <div>

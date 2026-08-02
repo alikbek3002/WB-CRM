@@ -44,6 +44,9 @@ type MemberOpt = { id: string; name: string; roleLabel: string };
 // «Кому платим»: сотрудник из команды (тогда выплата попадёт в его карточку)
 // или произвольное имя — подрядчик, фотограф, курьер.
 const PAYEE_MANUAL = "__manual__";
+// Пустая строка в Select значит «не выбрано» и подпись не отображается —
+// для пункта «Себе» нужен явный маркер.
+const PAYEE_SELF = "__self__";
 
 const KIND_LABEL: Record<PayoutKind, string> = {
   salary: "Зарплата",
@@ -90,7 +93,7 @@ function RequestDialog({
   const [title, setTitle] = useState("");
   const [amount, setAmount] = useState("");
   const [currency, setCurrency] = useState<Currency>("rub");
-  const [payeeUserId, setPayeeUserId] = useState("");
+  const [payeeUserId, setPayeeUserId] = useState(PAYEE_SELF);
   const [payee, setPayee] = useState("");
   const [dueDate, setDueDate] = useState("");
   const [categoryId, setCategoryId] = useState("");
@@ -119,8 +122,9 @@ function RequestDialog({
           title: title.trim(),
           amount: sum,
           currency,
-          payee: payeeUserId && payeeUserId !== PAYEE_MANUAL ? null : payee.trim() || null,
-          payeeUserId: payeeUserId && payeeUserId !== PAYEE_MANUAL ? payeeUserId : null,
+          payee: payeeUserId === PAYEE_MANUAL ? payee.trim() || null : null,
+          payeeUserId:
+            payeeUserId !== PAYEE_SELF && payeeUserId !== PAYEE_MANUAL ? payeeUserId : null,
           dueDate: dueDate || null,
           categoryId: categoryId || null,
           factoryId: kind === "factory" ? factoryId || null : null,
@@ -208,12 +212,12 @@ function RequestDialog({
 
           <div className="grid gap-1.5">
             <Label>Кому платим</Label>
-            <Select value={payeeUserId} onValueChange={(v) => setPayeeUserId(v ?? "")}>
+            <Select value={payeeUserId} onValueChange={(v) => v && setPayeeUserId(v)}>
               <SelectTrigger className="w-full">
                 <SelectValue placeholder="Себе (заявителю)" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="">Себе (заявителю)</SelectItem>
+                <SelectItem value={PAYEE_SELF}>Себе (заявителю)</SelectItem>
                 {members.map((m) => (
                   <SelectItem key={m.id} value={m.id}>
                     {m.name} · {m.roleLabel}
@@ -530,6 +534,7 @@ export function PayoutsBoard({
                 {p.requesterName}
                 {p.requesterRole ? ` · ${p.requesterRole}` : ""} · {dmy(p.createdAt)}
                 {p.payee ? ` · кому: ${p.payee}` : ""}
+                {p.categoryName ? ` · статья: ${p.categoryName}` : ""}
                 {p.dueDate ? ` · до ${dmy(p.dueDate)}` : ""}
                 {p.supplyTitle ? ` · поставка «${p.supplyTitle}»` : ""}
                 {p.factoryName && !p.supplyTitle ? ` · фабрика ${p.factoryName}` : ""}
@@ -634,7 +639,13 @@ export function PayoutsBoard({
         supplies={supplies}
         members={members}
       />
-      <PayDialog payout={paying} accounts={accounts} onOpenChange={() => setPaying(null)} />
+      {/* key пересоздаёт диалог под заявку: счёт списания предвыбирается в её валюте */}
+      <PayDialog
+        key={paying?.id ?? "none"}
+        payout={paying}
+        accounts={accounts}
+        onOpenChange={() => setPaying(null)}
+      />
     </div>
   );
 }

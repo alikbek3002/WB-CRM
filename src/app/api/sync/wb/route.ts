@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
-import { runWbSync } from "@/backend/wb/sync";
+import { runWbSync, WB_SYNC_SOURCES, type WbSyncSource } from "@/backend/wb/sync";
 import { invalidateWbData } from "@/backend/data/revalidate";
 
 export const runtime = "nodejs";
@@ -24,10 +24,23 @@ export async function POST(request: Request) {
   }
 
   const body = await request.json().catch(() => ({}));
-  const days = Math.min(30, Math.max(1, Number(body?.days) || 30));
-  const maxBatches = Math.min(5, Math.max(1, Number(body?.maxBatches) || 2));
+  const days = Math.min(90, Math.max(1, Number(body?.days) || 30));
+  // до 10 партий — хватает на разовый бэкфилл storage (8 окон по 8 дней)
+  const maxBatches = Math.min(10, Math.max(1, Number(body?.maxBatches) || 2));
+  // Явный выбор источников (бэкфилл: {"sources":["storage"],"maxBatches":8});
+  // без него — дефолтный набор без тяжёлых task-based отчётов
+  const sources = Array.isArray(body?.sources)
+    ? (body.sources as string[]).filter((s): s is WbSyncSource =>
+        (WB_SYNC_SOURCES as readonly string[]).includes(s),
+      )
+    : undefined;
 
-  const result = await runWbSync(admin, days, maxBatches);
+  const result = await runWbSync(
+    admin,
+    days,
+    maxBatches,
+    sources && sources.length ? sources : undefined,
+  );
   if (result.ok) invalidateWbData(); // свежие заказы/остатки видно сразу
   return NextResponse.json(result, { status: result.ok ? 200 : 502 });
 }

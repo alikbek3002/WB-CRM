@@ -18,6 +18,7 @@ import {
   getProductStocks,
   getProductWarehouseOrders,
   getStocksOverview,
+  getWbIncomes,
 } from "@/backend/data";
 
 // Цвет запаса: <14 дн — критично, <30 — предупреждение, дальше — норма
@@ -48,9 +49,10 @@ export default async function StocksPage({
   const params = await searchParams;
   const productId = params.product && UUID.test(params.product) ? params.product : null;
 
-  const [overview, products] = await Promise.all([
+  const [overview, products, wbIncomes] = await Promise.all([
     getStocksOverview(),
     getProductList(),
+    getWbIncomes(),
   ]);
 
   const category =
@@ -409,6 +411,60 @@ export default async function StocksPage({
                 </span>
               </div>
             ))}
+          </CardContent>
+        </Card>
+      )}
+
+      {!selected && !filtersActive && wbIncomes.length > 0 && (
+        // ── Поставки FBW: что и когда приняли склады WB (raw_incomes) ──
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">
+              Поставки на склады WB
+              <span className="ml-2 text-xs font-normal text-muted-foreground">
+                последние приёмки за 90 дней
+              </span>
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="overflow-x-auto px-0 pb-0">
+            <table className="w-full min-w-[640px] text-sm">
+              <thead>
+                <tr className="border-b border-border/60 text-xs text-muted-foreground">
+                  <th className="px-4 py-2 text-left font-normal">Поставка</th>
+                  <th className="px-2 py-2 text-left font-normal">Склад</th>
+                  <th className="px-2 py-2 text-left font-normal">Товары</th>
+                  <th className="px-2 py-2 text-right font-normal">Принято, шт</th>
+                  <th className="px-4 py-2 text-right font-normal">Статус</th>
+                </tr>
+              </thead>
+              <tbody>
+                {wbIncomes.map((g) => (
+                  <tr key={g.incomeId} className="border-b border-border/40 last:border-0">
+                    <td className="px-4 py-2">
+                      <span className="block font-medium">№ {g.incomeId}</span>
+                      <span className="block text-xs text-muted-foreground">
+                        {g.date}
+                        {g.dateClose && g.dateClose !== g.date && ` → ${g.dateClose}`}
+                      </span>
+                    </td>
+                    <td className="px-2 py-2">{g.warehouse}</td>
+                    <td className="max-w-72 px-2 py-2 text-xs text-muted-foreground">
+                      {g.items.map((i) => i.title).join(", ")}
+                      {g.positions > g.items.length &&
+                        ` и ещё ${g.positions - g.items.length}`}
+                    </td>
+                    <td className="px-2 py-2 text-right tabular-nums">
+                      {formatNumber(g.totalQty)}
+                    </td>
+                    <td className="px-4 py-2 text-right">
+                      <Badge variant="secondary" className="text-[10px]">
+                        {g.status}
+                      </Badge>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </CardContent>
         </Card>
       )}

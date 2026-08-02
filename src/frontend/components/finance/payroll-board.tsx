@@ -74,12 +74,23 @@ export function PayrollBoard({
   const presets = periodPresets();
   const active = presets.find((p) => p.from === view.from && p.to === view.to);
 
-  const selected = view.people.find((p) => p.personId === personId) ?? null;
-  const salaryCategory = categories.find((c) => c.isPayroll && c.name === "Зарплата");
+  // После смены периода выбранного человека может не быть в новом списке —
+  // тогда фильтр откатывается на «Все», иначе в селекте останется сырой uuid
+  const effectivePersonId = view.people.some((p) => p.personId === personId)
+    ? personId
+    : ALL;
+  const selected = view.people.find((p) => p.personId === effectivePersonId) ?? null;
+  // Если статью «Зарплата» переименовали — берём любую зарплатную, не пустоту
+  const salaryCategory =
+    categories.find((c) => c.isPayroll && c.name === "Зарплата") ??
+    categories.find((c) => c.isPayroll);
 
   const items = useMemo(
-    () => (personId === ALL ? view.items : view.items.filter((t) => t.personId === personId)),
-    [view.items, personId],
+    () =>
+      effectivePersonId === ALL
+        ? view.items
+        : view.items.filter((t) => t.personId === effectivePersonId),
+    [view.items, effectivePersonId],
   );
 
   const avgPerPerson = view.people.length ? Math.round(view.totalRub / view.people.length) : 0;
@@ -102,6 +113,9 @@ export function PayrollBoard({
         </div>
         {canEdit && (
           <AddTxButton
+            // key пересоздаёт кнопку с диалогом при смене выбранного сотрудника:
+            // useState в TxDialog берёт default* только при монтировании
+            key={selected?.personId ?? "none"}
             kind="out"
             label="Начислить выплату"
             accounts={accounts}
@@ -242,7 +256,7 @@ export function PayrollBoard({
           <div className="flex flex-wrap items-end justify-between gap-2 px-4">
             <div className="grid min-w-56 gap-1.5">
               <Label>Смотреть выплаты по сотруднику</Label>
-              <Select value={personId} onValueChange={(v) => setPersonId(v ?? ALL)}>
+              <Select value={effectivePersonId} onValueChange={(v) => setPersonId(v ?? ALL)}>
                 <SelectTrigger className="w-full">
                   <SelectValue placeholder="Все сотрудники" />
                 </SelectTrigger>

@@ -352,6 +352,9 @@ export function getProductList(): ProductListItem[] {
             : "Костюмы",
       status: s.status,
       costPrice: s.cost,
+      costPriceSource: "manual" as const,
+      costPriceUpdatedAt: null,
+      econ: null,
       logisticsCost: Math.round(70 + rnd() * 60),
       stockQty,
       responsible: s.responsible,
@@ -544,6 +547,7 @@ export function getTasks(): TaskItem[] {
   const base = {
     description: null,
     assigneeId: null,
+    createdById: null,
     report: null,
     completedAt: null,
     completedOnTime: null,

@@ -80,6 +80,15 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "db_error" }, { status: 500 });
   }
 
+  if ((p.costPrice ?? 0) > 0) {
+    await admin.from("product_cost_history").insert({
+      product_id: data.id,
+      cost_price: p.costPrice,
+      source: "manual",
+      created_by: UUID.test(session.user.id) ? session.user.id : null,
+    });
+  }
+
   invalidateWbData();
   return NextResponse.json({ ok: true, persisted: true, id: data.id });
 }
@@ -124,7 +133,11 @@ export async function PATCH(request: Request) {
   if (p.brand !== undefined) patch.brand = p.brand || null;
   if (p.category !== undefined) patch.category = p.category || null;
   if (p.status !== undefined) patch.status = p.status || null;
-  if (p.costPrice !== undefined) patch.cost_price = p.costPrice;
+  if (p.costPrice !== undefined) {
+    patch.cost_price = p.costPrice;
+    patch.cost_price_source = "manual";
+    patch.cost_price_updated_at = new Date().toISOString();
+  }
   if (p.logisticsCost !== undefined) patch.logistics_cost = p.logisticsCost;
   if (Object.keys(patch).length === 0) {
     return NextResponse.json({ error: "empty_patch" }, { status: 400 });
@@ -143,6 +156,15 @@ export async function PATCH(request: Request) {
   }
   if (!updated || updated.length === 0) {
     return NextResponse.json({ error: "not_found" }, { status: 404 });
+  }
+
+  if (p.costPrice !== undefined) {
+    await admin.from("product_cost_history").insert({
+      product_id: p.id,
+      cost_price: p.costPrice,
+      source: "manual",
+      created_by: UUID.test(session.user.id) ? session.user.id : null,
+    });
   }
 
   invalidateWbData();

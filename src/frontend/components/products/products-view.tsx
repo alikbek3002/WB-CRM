@@ -17,6 +17,7 @@ import {
   ProductCell,
   ProductDialog,
 } from "@/frontend/components/products/product-card-dialog";
+import { CostImportDialog } from "@/frontend/components/products/cost-import-dialog";
 import { ProductForm } from "@/frontend/components/products/product-form";
 import { RecoButton } from "@/frontend/components/products/reco-button";
 import { formatNumber, formatRub } from "@/shared/format";
@@ -151,6 +152,7 @@ function ProductsTable({
               <TableHead>Статус</TableHead>
               <TableHead className="text-right">Цена WB</TableHead>
               <TableHead className="text-right">Себест.</TableHead>
+              <TableHead className="text-right">Маржа</TableHead>
               <TableHead className="text-right">Остаток, шт</TableHead>
               <TableHead className="text-right">В пути в МСК</TableHead>
               <TableHead className="text-right">Продаж/30д</TableHead>
@@ -185,6 +187,27 @@ function ProductsTable({
                 </TableCell>
                 <TableCell className="text-right tabular-nums">
                   {formatRub(p.costPrice)}
+                  {p.costPrice > 0 && p.costPriceSource !== "manual" && (
+                    <span className="block text-[10px] text-muted-foreground">
+                      {p.costPriceSource === "supply" ? "из поставки" : "импорт"}
+                    </span>
+                  )}
+                </TableCell>
+                <TableCell
+                  className={`text-right tabular-nums ${
+                    p.econ
+                      ? p.econ.marginPct > 0
+                        ? "text-emerald-400"
+                        : "text-red-400"
+                      : "text-muted-foreground"
+                  }`}
+                  title={
+                    p.econ
+                      ? `Прибыль ${formatRub(p.econ.profitPerUnitRub)}/шт за 30 дней`
+                      : "Продаж за 30 дней не было"
+                  }
+                >
+                  {p.econ ? `${p.econ.marginPct}%` : "—"}
                 </TableCell>
                 <TableCell className="text-right tabular-nums">
                   {formatNumber(p.stockQty)}
@@ -258,6 +281,8 @@ export function ProductsView({
         <div className="text-sm text-muted-foreground">
           {formatNumber(products.length)} товаров
         </div>
+        <div className="flex items-center gap-2">
+          {canEdit && <CostImportDialog />}
         <div className="flex gap-1 rounded-lg border border-border/60 p-0.5">
           <Button
             size="xs"
@@ -277,6 +302,7 @@ export function ProductsView({
             <List className="size-3.5" />
             Список
           </Button>
+        </div>
         </div>
       </div>
 

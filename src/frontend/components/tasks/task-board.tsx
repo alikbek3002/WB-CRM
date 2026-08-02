@@ -137,7 +137,10 @@ export function TaskBoard({
   const [busy, setBusy] = useState<string | null>(null);
 
   const mine = (t: TaskItem) => t.assigneeId === userId;
-  const canAct = (t: TaskItem) => mine(t) || canLead;
+  // Исполнять (взять в работу / закрыть) может только назначенный исполнитель.
+  // Бесхозную задачу может взять руководитель или её автор.
+  const canExecute = (t: TaskItem) =>
+    t.assigneeId ? mine(t) : canLead || t.createdById === userId;
 
   async function changeStatus(task: TaskItem, action: "start" | "cancel") {
     setBusy(task.id);
@@ -236,10 +239,10 @@ export function TaskBoard({
                       </p>
                     )}
 
-                    {/* Действия */}
-                    {t.status !== "done" && canAct(t) && (
+                    {/* Действия: исполнение — только исполнителю, отмена — руководителю */}
+                    {t.status !== "done" && (canExecute(t) || canLead) && (
                       <div className="mt-2 flex gap-1.5">
-                        {t.status === "open" && (
+                        {t.status === "open" && canExecute(t) && (
                           <Button
                             size="sm"
                             variant="outline"
@@ -250,14 +253,16 @@ export function TaskBoard({
                             <Play className="size-3" /> В работу
                           </Button>
                         )}
-                        <Button
-                          size="sm"
-                          className="h-7 text-xs"
-                          disabled={busy === t.id}
-                          onClick={() => setCompleting(t)}
-                        >
-                          <CheckCircle2 className="size-3" /> Выполнено
-                        </Button>
+                        {canExecute(t) && (
+                          <Button
+                            size="sm"
+                            className="h-7 text-xs"
+                            disabled={busy === t.id}
+                            onClick={() => setCompleting(t)}
+                          >
+                            <CheckCircle2 className="size-3" /> Выполнено
+                          </Button>
+                        )}
                         {canLead && (
                           <Button
                             size="sm"

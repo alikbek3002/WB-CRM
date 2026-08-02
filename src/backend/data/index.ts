@@ -16,7 +16,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { unstable_cache } from "next/cache";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
 import type { MemberRole } from "@/shared/rbac";
-import type { PnlMonth, PnlView } from "@/shared/types";
+import type { DutyStatsPeriod, PnlMonth, PnlView } from "@/shared/types";
 import * as mock from "./mock";
 import * as payouts from "./payouts-core";
 import * as db from "./supabase";
@@ -192,11 +192,44 @@ export const getPnlView = (monthsBack = 6) =>
           advertSpendRub: 0,
           currency: "RUB",
           wbBalance: null,
+          deductionDetails: [],
         }),
       ),
     ["wb-data", "pnl", String(monthsBack)],
     { revalidate: READ_TTL_SECONDS, tags: [WB_DATA_TAG, `${WB_DATA_TAG}:pnl`] },
   )();
+
+// Юнит-экономика по товарам — параметризована периодом (30/90 дней)
+export const getUnitEconomics = (days = 30) =>
+  unstable_cache(
+    () =>
+      fromDb(
+        (client) => db.getUnitEconomics(client, days),
+        () => ({
+          from: "",
+          to: "",
+          days,
+          rows: [],
+          unallocated: null,
+          totals: {
+            saleQty: 0,
+            revenueRub: 0,
+            wbFeesRub: 0,
+            advertRub: 0,
+            cogsRub: 0,
+            profitRub: 0,
+            marginPct: 0,
+          },
+          storageSource: "finance" as const,
+          costCoveragePct: 0,
+        }),
+      ),
+    ["wb-data", "unit-econ", String(days)],
+    { revalidate: READ_TTL_SECONDS, tags: [WB_DATA_TAG, `${WB_DATA_TAG}:unit-econ`] },
+  )();
+
+// Поставки FBW (приёмки складов WB)
+export const getWbIncomes = cachedRead("wb-incomes", db.getWbIncomes, () => []);
 
 // Заявки на выплату: список зависит от того, кто смотрит (свои vs все),
 // и меняется каждым решением — кэшировать нечего.
@@ -275,6 +308,26 @@ export const getDesignRequests = () =>
 export const getMyDuties = (userId: string) =>
   fromDb((client) => db.getMyDuties(client, userId), () => []);
 
+// Статистика дисциплины регламента (7/30 дней) — чистое чтение, кэшируем
+// коротко: данные меняются в течение дня по мере закрытия задач.
+const EMPTY_DUTY_PERIOD = (days: 7 | 30): DutyStatsPeriod => ({
+  days,
+  from: "",
+  employees: [],
+  teamCompletionPct: 0,
+  teamOnTimePct: 0,
+});
+
+export const getDutyStats = unstable_cache(
+  () =>
+    fromDb(db.getDutyStats, () => ({
+      d7: EMPTY_DUTY_PERIOD(7),
+      d30: EMPTY_DUTY_PERIOD(30),
+    })),
+  ["wb-data", "duty-stats"],
+  { revalidate: 300, tags: [WB_DATA_TAG, `${WB_DATA_TAG}:duty-stats`] },
+);
+
 // Прогрев кэша чтения: пересчитать все кэшируемые геттеры, чтобы юзер открывал
 // вкладки уже с тёплым кэшем. ВАЖНО: звать из ОТДЕЛЬНОГО запроса ПОСЛЕ синка
 // (/api/cron/warm), а не из запроса, где был revalidateTag — Next сбрасывает
@@ -295,6 +348,8 @@ export async function warmReadCache(): Promise<{ ms: number; failed: number }> {
     () => getPnlView(6), // ОПиУ — самая тяжёлая вкладка финансов
     () => getExpensesView(), // расходы текущего месяца
     () => getPayrollView(), // выплаты команде за текущий месяц
+    () => getUnitEconomics(30), // юнит-экономика (страница «Экономика»)
+    getWbIncomes,
     getMembers,
     getTasks,
     getIntegrations,

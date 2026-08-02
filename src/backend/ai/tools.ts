@@ -15,7 +15,10 @@ import { DEMO_ORG_ID, DEMO_STORE_ID, toRub } from "../../shared/constants";
 import { can, type MemberRole, type Permission } from "../../shared/rbac";
 import type { Currency, PayoutKind } from "../../shared/types";
 import {
+  CASH_NOTIFY_THRESHOLD_RUB,
   createCashTx,
+  createExpenseCategory,
+  deleteCashTx,
   findAccounts,
   findCategories,
   findMembers,
@@ -24,7 +27,6 @@ import {
   getPayrollView,
   getPnlView,
   mirrorSupplyPaymentToCash,
-  pickDefaultAccount,
   type CashActor,
   type MemberRef,
 } from "../data/cash-core";
@@ -36,7 +38,7 @@ import {
   PAYOUT_KIND_LABELS,
   PAYOUT_STATUS_LABELS,
 } from "../data/payouts-core";
-import { localIsoDate } from "../data/duties-core";
+import { ensureDutyAssignments, getDutyStats, localIsoDate } from "../data/duties-core";
 import { cancelTask, completeTask, startTask, type TaskActor } from "../data/tasks-core";
 import { notifyProfile, notifyRoles, tgEsc } from "../telegram/notify";
 import type { SnapshotUser } from "./snapshot";
@@ -60,7 +62,8 @@ const LEAD_ROLES = ["owner", "admin", "manager"];
 const isLead = (role: string) => LEAD_ROLES.includes(role);
 
 const CURRENCIES = ["cny", "uzs", "rub"] as const;
-const CURRENCY_LABEL: Record<string, string> = { cny: "¥", uzs: "сум", rub: "₽" };
+// kgs в CURRENCIES нет (счета кассы — rub/cny/uzs), но заявки бывают в сомах
+const CURRENCY_LABEL: Record<string, string> = { cny: "¥", uzs: "сум", rub: "₽", kgs: "сом" };
 
 // Схемы-заготовки, чтобы описания инструментов не расползались
 const str = (description: string) => ({ type: "string", description });
@@ -71,7 +74,13 @@ const obj = (properties: Record<string, unknown>, required: string[] = []) => ({
   required,
 });
 
-type ToolSpec = ToolDef & { permission?: Permission; leadOnly?: boolean };
+type ToolSpec = ToolDef & {
+  permission?: Permission;
+  // Достаточно ЛЮБОГО из прав — для инструментов, полезных нескольким ролям
+  // с разными правами (например, design_action: сдаёт дизайнер, утверждает лид)
+  permissionsAny?: Permission[];
+  leadOnly?: boolean;
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Каталог инструментов. Один список — один источник правды по правам:
@@ -170,6 +179,34 @@ const CATALOG: ToolSpec[] = [
       ["duty", "report"],
     ),
   },
+  {
+    name: "duty_stats",
+    permission: "duty:view",
+    description:
+      "СТАТИСТИКА ДИСЦИПЛИНЫ по регламенту за период: кто выполняет свои задачи хорошо, кто срывает, " +
+      "процент выполнения и своевременности. Руководитель видит всю команду, сотрудник — только себя. " +
+      "Используй на «как команда работает по регламенту», «кто хуже всех за неделю», «моя дисциплина за месяц».",
+    input_schema: obj({
+      days: int("Период: 7 (неделя, по умолчанию) или 30 (месяц)"),
+      person: str("Имя сотрудника, если интересует один человек (только для руководителя)"),
+    }),
+  },
+  {
+    name: "complete_duty_for",
+    leadOnly: true,
+    description:
+      "Закрыть задачу регламента ЗА СОТРУДНИКА (руководитель принял работу устно/лично). " +
+      "Используй на «закрой за Азиза задачу по отзывам, он всё сделал». " +
+      "Если по шаблону обязателен отчёт — спроси, что именно сделано, и передай текст.",
+    input_schema: obj(
+      {
+        employee: str("Имя сотрудника, чью задачу закрываем"),
+        duty: str("Часть названия задачи регламента"),
+        report: str("Что сделано (обязательно, если задача требует отчёт)"),
+      },
+      ["employee", "duty"],
+    ),
+  },
 
   // ───────────────────────────── Товары ─────────────────────────────
   {
@@ -251,14 +288,20 @@ const CATALOG: ToolSpec[] = [
     description:
       "Записать РАСХОД компании в кассу (реклама, зарплата, налоги, аренда, логистика WB, карго и т.д.). " +
       "Используй на «потратил 15 тысяч на рекламу», «отдал зарплату 200 000», «заплатили 30к за хранение». " +
-      "Статью пиши словами — система найдёт подходящую. Если счёт не указан, спишется с основного рублёвого счёта.",
+      "Статью пиши словами — система найдёт подходящую. Если счёт не назван и счетов несколько — " +
+      "инструмент вернёт список: уточни у сотрудника, с какого платили. «Вчера» и другие относительные даты переведи в yyyy-mm-dd сам.",
     input_schema: obj(
       {
         amount: int("Сумма расхода (в валюте счёта; для рублёвого счёта — рубли)"),
         category: str("Статья расхода словами: «реклама», «зарплата», «налоги», «карго», «закуп товара»…"),
         account: str("Название счёта, если известно: «наличные», «карта», «юани» (необязательно)"),
         note: str("За что именно (необязательно, но полезно)"),
-        date: str("Дата расхода yyyy-mm-dd (по умолчанию сегодня)"),
+        date: str("Дата расхода yyyy-mm-dd (по умолчанию сегодня; «вчера» — вычисли и передай явно)"),
+        confirm: {
+          type: "boolean",
+          description:
+            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 ₽) отдельным сообщением",
+        },
       },
       ["amount", "category"],
     ),
@@ -268,7 +311,7 @@ const CATALOG: ToolSpec[] = [
     permission: "finance:expense",
     description:
       "Записать ПОСТУПЛЕНИЕ денег на счёт (выплата от WB, возврат, пополнение владельцем). " +
-      "Используй на «пришло 800 тысяч от WB», «положил в кассу 50 000».",
+      "Используй на «пришло 800 тысяч от WB», «положил в кассу 50 000». Если счёт не назван и счетов несколько — уточни.",
     input_schema: obj(
       {
         amount: int("Сумма поступления"),
@@ -276,8 +319,84 @@ const CATALOG: ToolSpec[] = [
         account: str("На какой счёт (необязательно)"),
         note: str("Комментарий (необязательно)"),
         date: str("Дата yyyy-mm-dd (по умолчанию сегодня)"),
+        confirm: {
+          type: "boolean",
+          description:
+            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 ₽) отдельным сообщением",
+        },
       },
       ["amount", "category"],
+    ),
+  },
+  {
+    name: "transfer_money",
+    permission: "finance:expense",
+    description:
+      "Перевод денег МЕЖДУ СЧЕТАМИ кассы (наличные → карта, карта → юани…). Общая сумма денег не меняется. " +
+      "Используй на «переведи 50 тысяч с карты на наличные», «снял с карты 100к». " +
+      "Если счета в РАЗНЫХ валютах — обязательно спроси, сколько зачислено на второй счёт (это курс сделки).",
+    input_schema: obj(
+      {
+        from_account: str("Счёт списания (название)"),
+        to_account: str("Счёт зачисления (название)"),
+        amount: int("Сумма списания (в валюте счёта-источника)"),
+        amount_to: int(
+          "Сколько зачислено на второй счёт — ОБЯЗАТЕЛЬНО при разных валютах счетов (необязательно при одинаковых)",
+        ),
+        date: str("Дата yyyy-mm-dd (по умолчанию сегодня)"),
+        note: str("Комментарий (необязательно)"),
+        confirm: {
+          type: "boolean",
+          description:
+            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 ₽) отдельным сообщением",
+        },
+      },
+      ["from_account", "to_account", "amount"],
+    ),
+  },
+  {
+    name: "delete_cash_tx",
+    permission: "finance:expense",
+    description:
+      "Удалить ОШИБОЧНУЮ операцию кассы (расход/приход/перевод, внесённые по ошибке или дублем). НЕОБРАТИМО. " +
+      "Используй на «удали расход 3000 от вчера», «я ошибся, убери последнюю операцию». " +
+      "Ищет по сумме, дате, статье/комментарию; удаляет ТОЛЬКО при однозначном совпадении, иначе покажет кандидатов.",
+    input_schema: obj(
+      {
+        amount: int("Сумма операции (главный признак поиска)"),
+        date: str("Дата операции yyyy-mm-dd, если известна (необязательно)"),
+        query: str("Слова из статьи или комментария: «реклама», «такси»… (необязательно)"),
+        account: str("Название счёта (необязательно)"),
+      },
+      ["amount"],
+    ),
+  },
+  {
+    name: "create_expense_category",
+    permission: "finance:expense",
+    description:
+      "Создать новую СТАТЬЮ расходов или приходов кассы. Используй, когда подходящей статьи нет " +
+      "и сотрудник подтвердил, что нужна новая (например «Сертификация», «Обучение»).",
+    input_schema: obj(
+      {
+        name: str("Название статьи (коротко, по-русски)"),
+        direction: {
+          type: "string",
+          enum: ["out", "in"],
+          description: "out — статья расходов, in — статья приходов",
+        },
+        in_pnl: {
+          type: "boolean",
+          description:
+            "false — движение активов (закуп товара, вывод владельцу), НЕ уменьшает прибыль в ОПиУ. По умолчанию true",
+        },
+        emoji: str("Эмодзи для статьи (необязательно)"),
+        confirm_new: {
+          type: "boolean",
+          description: "true — создать, даже если есть похожая статья (после подтверждения сотрудника)",
+        },
+      },
+      ["name", "direction"],
     ),
   },
   {
@@ -309,6 +428,18 @@ const CATALOG: ToolSpec[] = [
       days: int("За сколько последних дней (по умолчанию — с начала месяца)"),
     }),
   },
+  {
+    name: "unit_economics",
+    permission: "finance:view",
+    description:
+      "ЮНИТ-ЭКОНОМИКА по товарам за период: выручка, удержания WB, реклама, себестоимость, прибыль, маржа и ДРР по каждому SKU. " +
+      "Используй на «какая юнит-экономика», «какой товар самый прибыльный», «что в минусе», «маржа по пижаме». " +
+      "С параметром product — детальный разбор одного товара.",
+    input_schema: obj({
+      days: int("За сколько последних дней (по умолчанию 30, максимум 90)"),
+      product: str("Часть названия товара или артикул WB — для разбора одного SKU (необязательно)"),
+    }),
+  },
 
   {
     name: "pay_salary",
@@ -328,13 +459,21 @@ const CATALOG: ToolSpec[] = [
           type: "string",
           enum: ["salary", "bonus", "contractor", "reimbursement"],
           description:
-            "salary — зарплата или аванс (по умолчанию), bonus — премия, contractor — гонорар за услуги, reimbursement — возместить потраченное",
+            "ОБЯЗАТЕЛЬНО выбери по смыслу: salary — зарплата или аванс, bonus — премия (премия НИКОГДА не salary), " +
+            "contractor — гонорар за услуги, reimbursement — возместить потраченное. Не уверен — спроси.",
         },
-        account: str("Название счёта, с которого платим (необязательно — возьмём основной рублёвый)"),
+        account: str(
+          "Название счёта, с которого платим. Если не назван и счетов несколько — инструмент вернёт список, уточни",
+        ),
         date: str("Дата выплаты yyyy-mm-dd (по умолчанию сегодня)"),
         note: str("За что: «зарплата за июль», «аванс», «премия за план» (необязательно)"),
+        confirm: {
+          type: "boolean",
+          description:
+            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 ₽) отдельным сообщением",
+        },
       },
-      ["employee", "amount"],
+      ["employee", "amount", "kind"],
     ),
   },
   {
@@ -351,7 +490,8 @@ const CATALOG: ToolSpec[] = [
   },
   {
     name: "my_salary",
-    permission: "tasks:view",
+    // Без permission: свои деньги видит каждый сотрудник; изоляция — внутри,
+    // запрос жёстко фильтруется .eq("person_id", ctx.user.id)
     description:
       "Сколько сотрудник получил ОТ КОМПАНИИ: его собственные выплаты за период (зарплата, премии, возмещения) и заявки, которые ещё ждут оплаты. " +
       "Показывает ТОЛЬКО деньги самого спрашивающего. Используй на «сколько мне заплатили», «когда была последняя зарплата», «сколько я получил за месяц».",
@@ -374,15 +514,23 @@ const CATALOG: ToolSpec[] = [
         kind: {
           type: "string",
           enum: ["salary", "contractor", "factory", "reimbursement", "other"],
-          description: "Тип: salary — зарплата/аванс, contractor — подрядчик/услуги, factory — счёт фабрики, reimbursement — возместить сотруднику, other — прочее",
+          description:
+            "ОБЯЗАТЕЛЬНО выбери по смыслу: salary — зарплата/аванс, contractor — подрядчик/услуги, " +
+            "factory — счёт фабрики, reimbursement — возместить сотруднику, other — прочее. Не уверен — спроси.",
         },
-        currency: { type: "string", enum: ["rub", "kgs", "cny", "uzs"], description: "Валюта (по умолчанию рубли)" },
+        currency: {
+          type: "string",
+          enum: ["rub", "kgs", "cny", "uzs"],
+          description:
+            "Валюта суммы — ОБЯЗАТЕЛЬНО. НЕ подставляй rub сам: если речь про фабрику/Китай, " +
+            "скорее всего юани (cny); если валюта не звучала — переспроси у сотрудника.",
+        },
         payee: str("Кому платим, если это не сотрудник компании: имя подрядчика, фотографа, компании"),
         employee: str("Имя сотрудника-адресата, если платим кому-то из команды — тогда выплата попадёт в его карточку"),
         due_date: str("Оплатить до, yyyy-mm-dd (необязательно)"),
         supply: str("Часть названия поставки, если это счёт фабрики (необязательно)"),
       },
-      ["amount", "title"],
+      ["amount", "title", "kind", "currency"],
     ),
   },
   {
@@ -412,13 +560,21 @@ const CATALOG: ToolSpec[] = [
     name: "pay_payout",
     permission: "payout:approve",
     description:
-      "Оплатить согласованную заявку: деньги списываются со счёта кассы и попадают в расходы. " +
+      "Оплатить СОГЛАСОВАННУЮ заявку: деньги списываются со счёта кассы и попадают в расходы. " +
+      "Несогласованную (pending) оплатить нельзя — сначала decide_payout. " +
       "Используй на «оплати заявку фотографу с карты», «выплати аванс наличными».",
     input_schema: obj(
       {
         payout: str("Часть названия заявки"),
-        account: str("Название счёта, с которого платим (необязательно — возьмём основной)"),
+        account: str(
+          "Название счёта, с которого платим. Если не назван и счетов несколько — инструмент вернёт список, уточни",
+        ),
         paid_on: str("Дата оплаты yyyy-mm-dd (по умолчанию сегодня)"),
+        confirm: {
+          type: "boolean",
+          description:
+            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 ₽) отдельным сообщением",
+        },
       },
       ["payout"],
     ),
@@ -464,13 +620,28 @@ const CATALOG: ToolSpec[] = [
         title: str("Наименование поставки / товара"),
         quantity: int("Количество, шт"),
         ship_date: str("Дата отгрузки yyyy-mm-dd (по умолчанию сегодня)"),
-        sewing_cost: int("Стоимость отшивки (долг фабрике)"),
-        sewing_currency: { type: "string", enum: CURRENCIES, description: "Валюта отшивки (по умолчанию cny)" },
-        cargo_cost: int("Стоимость карго (перевозка)"),
-        cargo_currency: { type: "string", enum: CURRENCIES, description: "Валюта карго (по умолчанию cny)" },
+        sewing_cost: int(
+          "Стоимость отшивки (долг фабрике) — ОБЯЗАТЕЛЬНА: без неё долги и себестоимость врут. Не назвали — спроси",
+        ),
+        sewing_currency: {
+          type: "string",
+          enum: CURRENCIES,
+          description: "Валюта отшивки (не указана — возьмём по стране фабрики: Китай ¥, Узбекистан сум)",
+        },
+        cargo_cost: int("Стоимость карго (перевозка), если уже известна"),
+        cargo_currency: {
+          type: "string",
+          enum: CURRENCIES,
+          description: "Валюта карго (не указана — по стране фабрики)",
+        },
+        cost_unknown: {
+          type: "boolean",
+          description:
+            "true ТОЛЬКО если сотрудник ЯВНО сказал, что стоимость отшивки пока неизвестна / внесёт позже",
+        },
         product: str("Часть названия товара WB, если поставку надо связать с карточкой (необязательно)"),
       },
-      ["factory", "title", "quantity"],
+      ["factory", "title", "quantity", "sewing_cost"],
     ),
   },
   {
@@ -559,7 +730,10 @@ const CATALOG: ToolSpec[] = [
   },
   {
     name: "design_action",
-    permission: "design:view",
+    // Виден только тем, кто реально может хоть что-то сделать с заявкой:
+    // дизайнер/SEO сдают, руководители утверждают. Точные права на каждый
+    // переход проверяются внутри (DESIGN_TRANSITIONS).
+    permissionsAny: ["design:submit", "design:approve"],
     description:
       "Действие по заявке на дизайн: take (взять в работу), submit (сдать макет — нужна ссылка), approve (утвердить), return (вернуть на доработку — нужен комментарий), cancel (отменить). Права проверяются: сдают дизайнеры, утверждают руководители.",
     input_schema: obj(
@@ -610,6 +784,7 @@ export function toolsForRole(role: MemberRole): ToolDef[] {
   return CATALOG.filter((t) => {
     if (t.leadOnly && !isLead(role)) return false;
     if (t.permission && !can(role, t.permission)) return false;
+    if (t.permissionsAny && !t.permissionsAny.some((p) => can(role, p))) return false;
     return true;
   }).map(({ name, description, input_schema }) => ({ name, description, input_schema }));
 }
@@ -673,6 +848,67 @@ function posInt(input: unknown): number | null {
 function currencyOr(input: unknown, fallback: string): string {
   const s = String(input ?? "").trim().toLowerCase();
   return (CURRENCIES as readonly string[]).includes(s) ? s : fallback;
+}
+
+// ── Деньги: строгий выбор счёта и подтверждение крупных сумм ────────────────
+
+type AccountRef = { id: string; name: string; currency: Currency };
+
+// Счёт для денежной операции. Не указан: один счёт → берём его (и называем в
+// ответе), несколько → НЕ выполняем, возвращаем список — модель уточнит у
+// человека. Молчаливого «дефолтного» счёта больше нет: деньги не списываются
+// с угаданного счёта.
+async function resolveAccountStrict(
+  ctx: ToolCtx,
+  accountQuery: unknown,
+): Promise<{ ok: true; account: AccountRef; autoPicked: boolean } | { ok: false; message: string }> {
+  const q = String(accountQuery ?? "").trim();
+  if (q) {
+    const found = await findAccounts(ctx.db, q);
+    if (!found.length) {
+      const all = await findAccounts(ctx.db, "");
+      return {
+        ok: false,
+        message: `Счёт «${q}» не найден. Есть: ${all.map((a) => a.name).join(", ")}. Уточни у сотрудника.`,
+      };
+    }
+    if (found.length > 1) {
+      return {
+        ok: false,
+        message: `Подходит несколько счетов: ${found.map((a) => a.name).join(", ")}. Уточни, какой именно.`,
+      };
+    }
+    return { ok: true, account: found[0], autoPicked: false };
+  }
+
+  const all = await findAccounts(ctx.db, "");
+  if (!all.length) {
+    return {
+      ok: false,
+      message: "Счетов кассы ещё нет. Заведите счёт: CRM → Финансы → Касса → «Новый счёт».",
+    };
+  }
+  if (all.length > 1) {
+    return {
+      ok: false,
+      message:
+        `С какого счёта проводим? Есть: ${all
+          .map((a) => `${a.name} (${CURRENCY_LABEL[a.currency] ?? a.currency})`)
+          .join(", ")}. ` + "Спроси у сотрудника и повтори вызов с параметром account.",
+    };
+  }
+  return { ok: true, account: all[0], autoPicked: true };
+}
+
+// Стоп-кран на крупные суммы: без явного подтверждения человека операция не
+// проводится. Порог тот же, что у Telegram-пуша директору о крупных расходах.
+function confirmGate(amountRub: number, confirm: unknown, summary: string): string | null {
+  if (amountRub < CASH_NOTIFY_THRESHOLD_RUB || confirm === true) return null;
+  return (
+    `Крупная сумма — ${num(amountRub)} ₽. Ничего не записано. ` +
+    `Покажи сотруднику сводку (${summary}) и дождись явного «да», ` +
+    "затем повтори вызов с confirm=true."
+  );
 }
 
 // Результат нечёткого поиска: либо одна строка, либо текст-уточнение для модели.
@@ -800,15 +1036,15 @@ async function execCreateTask(
   const title = String(input.title ?? "").trim();
   if (!q || !title) return "Ошибка: нужны имя сотрудника и текст задачи.";
 
-  const safe = likeSafe(q.toLowerCase());
-  const { data: candidates } = await db
-    .from("profiles")
-    .select("id, full_name, login")
-    .or(`full_name.ilike.%${safe}%,login.ilike.${safe}`)
-    .limit(5);
-  if (!candidates?.length) return `Сотрудник «${q}» не найден. Уточните имя или логин.`;
+  // Поиск строго среди членов НАШЕЙ организации (findMembers идёт через
+  // org_members) — прямой запрос к profiles без org-фильтра мог найти чужого
+  const candidates = await findMembers(db, q);
+  if (!candidates.length) {
+    const all = await findMembers(db, "");
+    return `Сотрудник «${q}» не найден. В команде: ${all.map((m) => m.name).join(", ")}. Уточни имя или логин.`;
+  }
   if (candidates.length > 1) {
-    return `Нашлось несколько: ${candidates.map((c) => c.full_name).join(", ")}. Уточните, кому именно.`;
+    return `Нашлось несколько: ${candidates.map((c) => `${c.name} (${c.roleLabel})`).join(", ")}. Уточни, кому именно.`;
   }
   const assignee = candidates[0];
 
@@ -846,7 +1082,7 @@ async function execCreateTask(
     String(assignee.id),
     `📬 <b>Вам новая задача</b> от ${tgEsc(user.name)} (${tgEsc(user.roleLabel)}):\n«${tgEsc(title)}»\nПриоритет: <b>${priority}</b>${due ? `\nСрок: <b>${due}</b>` : ""}\n\nОткрыть: /menu → 🗒 Мои задачи`,
   );
-  return `Задача создана и назначена: ${assignee.full_name}. Уведомление в Telegram отправлено (если привязан).`;
+  return `Задача создана и назначена: ${assignee.name}. Уведомление в Telegram отправлено (если привязан).`;
 }
 
 async function execMyTasks(ctx: ToolCtx): Promise<string> {
@@ -1057,6 +1293,127 @@ async function execCompleteMyDuty(
   return `Задача «${one(match.template)?.title}» закрыта ${onTime ? "вовремя" : "после дедлайна"}, отчёт записан.`;
 }
 
+// ── Дисциплина за период и закрытие регламента за сотрудника (руководителю) ──
+
+const GRADE_RU: Record<string, string> = {
+  good: "🟢 отлично",
+  ok: "🟡 средне",
+  bad: "🔴 плохо",
+};
+
+async function execDutyStats(
+  ctx: ToolCtx,
+  input: { days?: number; person?: string },
+): Promise<string> {
+  // Сначала пометить просроченные pending → missed, иначе цифры сразу после
+  // дедлайна будут завышены (веб делает это в readDuties, у бота крон реже)
+  await ensureDutyAssignments(ctx.db);
+  const stats = await getDutyStats(ctx.db);
+  const days = (posInt(input.days) ?? 7) <= 7 ? 7 : 30;
+  const period = days === 7 ? stats.d7 : stats.d30;
+
+  let list = period.employees;
+  if (!isLead(ctx.user.role)) {
+    // Специалист видит только свою дисциплину — как на сайте
+    list = list.filter((e) => e.assigneeId === ctx.user.id);
+    if (!list.length) return `За последние ${days} дн. назначений по регламенту у вас не было.`;
+  } else if (String(input.person ?? "").trim()) {
+    const found = await resolveEmployee(ctx, String(input.person));
+    if ("ask" in found) return found.ask;
+    list = list.filter((e) => e.assigneeId === found.member.id);
+    if (!list.length) {
+      return `${found.member.name}: назначений по регламенту за последние ${days} дн. не было.`;
+    }
+  }
+  if (!list.length) return `За последние ${days} дн. данных по регламенту нет.`;
+
+  const lines = [
+    `ДИСЦИПЛИНА РЕГЛАМЕНТА за ${days} дн. (с ${period.from}): ` +
+      `команда — выполнение ${period.teamCompletionPct}%, вовремя ${period.teamOnTimePct}%.`,
+  ];
+  for (const e of list) {
+    lines.push(
+      `- ${e.assigneeName}: ${GRADE_RU[e.grade]} · балл ${e.score}/100 · ` +
+        `${e.done} из ${e.total} выполнено (${e.completionPct}%), вовремя ${e.onTimePct}%` +
+        (e.missed ? ` · просрочено ${e.missed}` : ""),
+    );
+    if (e.problems.length) {
+      lines.push(
+        `  чаще срывается: ${e.problems
+          .map((p) => `«${p.title}» (просрочено ${p.missed}, с опозданием ${p.late})`)
+          .join("; ")}`,
+      );
+    }
+  }
+  return lines.join("\n");
+}
+
+async function execCompleteDutyFor(
+  ctx: ToolCtx,
+  input: { employee?: string; duty?: string; report?: string },
+): Promise<string> {
+  const q = String(input.duty ?? "").trim();
+  if (!q) return "Ошибка: укажи, какую задачу регламента закрыть.";
+
+  const found = await resolveEmployee(ctx, String(input.employee ?? ""));
+  if ("ask" in found) return found.ask;
+  const member = found.member;
+
+  const rows = await myDutiesToday(ctx.db, member.id);
+  const norm = (s: string) => s.toLowerCase();
+  const matches = rows.filter((r) => norm(one(r.template)?.title ?? "").includes(norm(q)));
+  if (!matches.length) {
+    const titles = rows.map((r) => one(r.template)?.title).filter(Boolean);
+    return `У ${member.name} на сегодня нет задачи «${q}». Его задачи: ${titles.join("; ") || "нет"}.`;
+  }
+  if (matches.length > 1) {
+    return `Подходит несколько задач ${member.name}: ${matches
+      .map((r) => `«${one(r.template)?.title}»`)
+      .join(", ")}. Уточни, какая.`;
+  }
+  const match = matches[0];
+  if (match.status === "done") return `Эта задача у ${member.name} уже закрыта.`;
+
+  // Требование отчёта — по шаблону задачи
+  const { data: tpl } = await ctx.db
+    .from("duty_assignments")
+    .select("template:duty_templates(requires_report)")
+    .eq("id", match.id)
+    .maybeSingle();
+  const requiresReport = Boolean(
+    one((tpl?.template ?? null) as { requires_report: boolean } | { requires_report: boolean }[] | null)
+      ?.requires_report,
+  );
+  const report = String(input.report ?? "").trim();
+  if (requiresReport && !report) {
+    return `По задаче «${one(match.template)?.title}» обязателен отчёт. Спроси у руководителя, что именно сделано, и повтори вызов с текстом.`;
+  }
+
+  const onTime = Date.now() <= new Date(match.due_at).getTime();
+  if (report) {
+    await ctx.db.from("duty_reports").upsert(
+      {
+        org_id: match.org_id,
+        assignment_id: match.id,
+        user_id: member.id,
+        content: `Закрыто руководителем ${ctx.user.name}: ${report}`,
+        on_time: onTime,
+      },
+      { onConflict: "assignment_id" },
+    );
+  }
+  await ctx.db
+    .from("duty_assignments")
+    .update({ status: "done", completed_at: new Date().toISOString() })
+    .eq("id", match.id);
+  ctx.touch();
+  return (
+    `Задача «${one(match.template)?.title}» закрыта за ${member.name} ` +
+    `${onTime ? "вовремя" : "после дедлайна"}.` +
+    (report ? " В отчёте помечено, что закрыл руководитель." : " Отчёт не требовался — закрыто без него.")
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Товары и остатки
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1196,6 +1553,8 @@ async function execUpdateProduct(
   const cost = posInt(input.cost_price);
   if (input.cost_price !== undefined && cost !== null) {
     patch.cost_price = cost;
+    patch.cost_price_source = "manual";
+    patch.cost_price_updated_at = new Date().toISOString();
     changed.push(`себестоимость ${num(cost)} ₽`);
   }
   const logistics = posInt(input.logistics_cost);
@@ -1223,6 +1582,14 @@ async function execUpdateProduct(
     .eq("id", picked.row.id)
     .eq("store_id", DEMO_STORE_ID);
   if (error) return `Не удалось обновить товар: ${error.message}`;
+  if (patch.cost_price !== undefined) {
+    await ctx.db.from("product_cost_history").insert({
+      product_id: picked.row.id,
+      cost_price: patch.cost_price,
+      source: "manual",
+      created_by: authorId(ctx.user),
+    });
+  }
   ctx.touch();
   return `Товар «${picked.row.title}» обновлён: ${changed.join(", ")}.`;
 }
@@ -1242,21 +1609,34 @@ async function execCreateProduct(
   const title = String(input.title ?? "").trim();
   if (!nmId || !title) return "Ошибка: нужны артикул WB (nm_id) и название товара.";
 
-  const { error } = await ctx.db.from("products").insert({
-    store_id: DEMO_STORE_ID,
-    nm_id: nmId,
-    title: title.slice(0, 200),
-    vendor_code: String(input.vendor_code ?? "").trim() || null,
-    brand: String(input.brand ?? "").trim() || null,
-    category: String(input.category ?? "").trim() || null,
-    status: "Новинка",
-    cost_price: posInt(input.cost_price) ?? 0,
-    responsible_user_id: authorId(ctx.user),
-  });
+  const costPrice = posInt(input.cost_price) ?? 0;
+  const { data: created, error } = await ctx.db
+    .from("products")
+    .insert({
+      store_id: DEMO_STORE_ID,
+      nm_id: nmId,
+      title: title.slice(0, 200),
+      vendor_code: String(input.vendor_code ?? "").trim() || null,
+      brand: String(input.brand ?? "").trim() || null,
+      category: String(input.category ?? "").trim() || null,
+      status: "Новинка",
+      cost_price: costPrice,
+      responsible_user_id: authorId(ctx.user),
+    })
+    .select("id")
+    .single();
   if (error) {
     // unique (store_id, nm_id)
     if (error.code === "23505") return `Товар с артикулом ${nmId} уже есть в каталоге.`;
     return `Не удалось создать товар: ${error.message}`;
+  }
+  if (costPrice > 0 && created?.id) {
+    await ctx.db.from("product_cost_history").insert({
+      product_id: created.id,
+      cost_price: costPrice,
+      source: "manual",
+      created_by: authorId(ctx.user),
+    });
   }
   ctx.touch();
   return `Карточка «${title}» (арт. ${nmId}) создана.`;
@@ -1302,7 +1682,17 @@ async function resolveTxInput(
   direction: "in" | "out",
 ): Promise<
   | { ok: false; message: string }
-  | { ok: true; amount: number; categoryId: string; categoryName: string; accountId: string; accountName: string; date: string }
+  | {
+      ok: true;
+      amount: number;
+      categoryId: string;
+      categoryName: string;
+      accountId: string;
+      accountName: string;
+      accountCurrency: Currency;
+      autoPicked: boolean;
+      date: string;
+    }
 > {
   const amount = Number(input.amount);
   if (!Number.isFinite(amount) || amount <= 0) {
@@ -1317,7 +1707,7 @@ async function resolveTxInput(
       ok: false,
       message:
         `Статья «${query}» не найдена. Доступные: ${all.map((c) => c.name).join(", ")}. ` +
-        "Уточни у сотрудника, какая подходит (или предложи создать новую в CRM → Финансы).",
+        "Уточни у сотрудника, какая подходит — или предложи создать новую (инструмент create_expense_category).",
     };
   }
   if (matches.length > 1) {
@@ -1328,52 +1718,42 @@ async function resolveTxInput(
   }
   const category = matches[0];
 
-  let account: { id: string; name: string } | null = null;
-  const accountQuery = String(input.account ?? "").trim();
-  if (accountQuery) {
-    const found = await findAccounts(ctx.db, accountQuery);
-    if (!found.length) {
-      const all = await findAccounts(ctx.db, "");
-      return {
-        ok: false,
-        message: `Счёт «${accountQuery}» не найден. Есть: ${all.map((a) => a.name).join(", ")}.`,
-      };
-    }
-    if (found.length > 1) {
-      return {
-        ok: false,
-        message: `Подходит несколько счетов: ${found.map((a) => a.name).join(", ")}. Уточни, с какого.`,
-      };
-    }
-    account = { id: found[0].id, name: found[0].name };
-  } else {
-    const fallback = await pickDefaultAccount(ctx.db);
-    if (!fallback) {
-      return {
-        ok: false,
-        message: "Счетов кассы ещё нет. Заведите счёт: CRM → Финансы → Касса → «Новый счёт».",
-      };
-    }
-    account = { id: fallback.id, name: fallback.name };
-  }
+  const acc = await resolveAccountStrict(ctx, input.account);
+  if (!acc.ok) return { ok: false, message: acc.message };
 
   return {
     ok: true,
     amount,
     categoryId: category.id,
     categoryName: category.name,
-    accountId: account.id,
-    accountName: account.name,
+    accountId: acc.account.id,
+    accountName: acc.account.name,
+    accountCurrency: acc.account.currency,
+    autoPicked: acc.autoPicked,
     date: isoOr(input.date, localIsoDate()) ?? localIsoDate(),
   };
 }
 
 async function execAddExpense(
   ctx: ToolCtx,
-  input: { amount?: number; category?: string; account?: string; note?: string; date?: string },
+  input: {
+    amount?: number;
+    category?: string;
+    account?: string;
+    note?: string;
+    date?: string;
+    confirm?: boolean;
+  },
 ): Promise<string> {
   const parsed = await resolveTxInput(ctx, input, "out");
   if (!parsed.ok) return parsed.message;
+
+  const gate = confirmGate(
+    toRub(parsed.amount, parsed.accountCurrency),
+    input.confirm,
+    `расход ${num(parsed.amount)} ${CURRENCY_LABEL[parsed.accountCurrency] ?? "₽"} · статья «${parsed.categoryName}» · счёт «${parsed.accountName}» · ${parsed.date}`,
+  );
+  if (gate) return gate;
 
   const result = await createCashTx(ctx.db, cashActorOf(ctx.user), {
     kind: "out",
@@ -1389,16 +1769,30 @@ async function execAddExpense(
   return (
     `Расход записан: ${num(result.amountRub)} ₽ · статья «${parsed.categoryName}» · ` +
     `счёт «${parsed.accountName}» · дата ${parsed.date}. ` +
-    (input.account ? "" : "Счёт выбран автоматически — скажи об этом сотруднику, чтобы он поправил, если платили с другого.")
+    (parsed.autoPicked ? "Счёт в кассе один — взят он." : "")
   );
 }
 
 async function execAddIncome(
   ctx: ToolCtx,
-  input: { amount?: number; category?: string; account?: string; note?: string; date?: string },
+  input: {
+    amount?: number;
+    category?: string;
+    account?: string;
+    note?: string;
+    date?: string;
+    confirm?: boolean;
+  },
 ): Promise<string> {
   const parsed = await resolveTxInput(ctx, input, "in");
   if (!parsed.ok) return parsed.message;
+
+  const gate = confirmGate(
+    toRub(parsed.amount, parsed.accountCurrency),
+    input.confirm,
+    `приход ${num(parsed.amount)} ${CURRENCY_LABEL[parsed.accountCurrency] ?? "₽"} · статья «${parsed.categoryName}» · счёт «${parsed.accountName}» · ${parsed.date}`,
+  );
+  if (gate) return gate;
 
   const result = await createCashTx(ctx.db, cashActorOf(ctx.user), {
     kind: "in",
@@ -1413,8 +1807,208 @@ async function execAddIncome(
   ctx.touch();
   return (
     `Поступление записано: ${num(result.amountRub)} ₽ · статья «${parsed.categoryName}» · ` +
-    `счёт «${parsed.accountName}» · дата ${parsed.date}.`
+    `счёт «${parsed.accountName}» · дата ${parsed.date}.` +
+    (parsed.autoPicked ? " Счёт в кассе один — взят он." : "")
   );
+}
+
+// ── Перевод между счетами и удаление ошибочной операции ─────────────────────
+
+async function execTransferMoney(
+  ctx: ToolCtx,
+  input: {
+    from_account?: string;
+    to_account?: string;
+    amount?: number;
+    amount_to?: number;
+    date?: string;
+    note?: string;
+    confirm?: boolean;
+  },
+): Promise<string> {
+  const amount = Number(input.amount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return "Ошибка: нужна сумма перевода больше нуля.";
+  }
+  const fromQ = String(input.from_account ?? "").trim();
+  const toQ = String(input.to_account ?? "").trim();
+  if (!fromQ || !toQ) return "Ошибка: нужны оба счёта — откуда и куда переводим.";
+
+  const from = await resolveAccountStrict(ctx, fromQ);
+  if (!from.ok) return from.message;
+  const to = await resolveAccountStrict(ctx, toQ);
+  if (!to.ok) return to.message;
+  if (from.account.id === to.account.id) {
+    return "Счёт списания и счёт зачисления совпали — уточни, между какими счетами перевод.";
+  }
+
+  const cross = from.account.currency !== to.account.currency;
+  const amountTo = Number(input.amount_to);
+  // amount_to уважаем и при одной валюте: «перевёл 100к, дошло 98 500» (комиссия)
+  const hasTo = Number.isFinite(amountTo) && amountTo > 0;
+  if (cross && !hasTo) {
+    return (
+      `Счета в разных валютах («${from.account.name}» ${CURRENCY_LABEL[from.account.currency]} → ` +
+      `«${to.account.name}» ${CURRENCY_LABEL[to.account.currency]}). ` +
+      "Спроси, сколько зачислено на второй счёт (курс сделки), и повтори с amount_to."
+    );
+  }
+
+  const gate = confirmGate(
+    toRub(amount, from.account.currency),
+    input.confirm,
+    `перевод ${num(amount)} ${CURRENCY_LABEL[from.account.currency]} со счёта «${from.account.name}» на «${to.account.name}»`,
+  );
+  if (gate) return gate;
+
+  const result = await createCashTx(ctx.db, cashActorOf(ctx.user), {
+    kind: "transfer",
+    accountId: from.account.id,
+    toAccountId: to.account.id,
+    amount,
+    amountTo: hasTo ? amountTo : null,
+    occurredOn: isoOr(input.date, localIsoDate()),
+    note: input.note ? String(input.note) : null,
+    source: "ai",
+  });
+  if (!result.ok) return `Не удалось провести перевод: ${result.message}`;
+  ctx.touch();
+  return (
+    `Перевод проведён: ${num(amount)} ${CURRENCY_LABEL[from.account.currency]} · ` +
+    `«${from.account.name}» → «${to.account.name}»` +
+    (hasTo && (cross || amountTo !== amount)
+      ? ` (зачислено ${num(amountTo)} ${CURRENCY_LABEL[to.account.currency]})`
+      : "") +
+    "."
+  );
+}
+
+async function execDeleteCashTx(
+  ctx: ToolCtx,
+  input: { amount?: number; date?: string; query?: string; account?: string },
+): Promise<string> {
+  const amount = Number(input.amount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return "Ошибка: назови сумму операции, которую нужно удалить.";
+  }
+  const date = isoOr(input.date, null);
+  const q = String(input.query ?? "").trim().toLowerCase();
+  const accQ = String(input.account ?? "").trim().toLowerCase();
+
+  // Ищем за последние 60 дней ТОЛЬКО ручные операции (manual/bot/ai):
+  // системные нельзя — удаление оплаты заявки рассинхронизирует payout_requests,
+  // а поступление WB воскреснет при следующем синке. Сумму матчим и в валюте
+  // операции, и в рублях (сотрудник обычно называет рубли), допуск ±1.
+  const since = localIsoDate(new Date(Date.now() - 60 * 86_400_000));
+  const LIMIT = 100;
+  let sel = ctx.db
+    .from("cash_tx")
+    .select(
+      "id, kind, amount, currency, amount_rub, occurred_on, note, account:cash_accounts!cash_tx_account_id_fkey(name), category:expense_categories(name)",
+    )
+    .eq("org_id", DEMO_ORG_ID)
+    .in("source", ["manual", "bot", "ai"])
+    .gte("occurred_on", since)
+    .or(
+      `and(amount.gte.${amount - 1},amount.lte.${amount + 1}),` +
+        `and(amount_rub.gte.${amount - 1},amount_rub.lte.${amount + 1})`,
+    )
+    .order("occurred_on", { ascending: false })
+    .limit(LIMIT);
+  if (date) sel = sel.eq("occurred_on", date);
+  const { data, error } = await sel;
+  if (error) return `Не удалось найти операцию: ${error.message}`;
+  if ((data ?? []).length >= LIMIT) {
+    return "Слишком много операций с такой суммой — уточни дату (yyyy-mm-dd), и я поищу точнее.";
+  }
+
+  type Row = {
+    id: string;
+    kind: string;
+    amount: number;
+    currency: string;
+    amount_rub: number;
+    occurred_on: string;
+    note: string | null;
+    account: { name: string } | { name: string }[] | null;
+    category: { name: string } | { name: string }[] | null;
+  };
+  let rows = ((data ?? []) as unknown as Row[]).map((r) => ({
+    ...r,
+    accountName: one(r.account)?.name ?? "—",
+    categoryName: one(r.category)?.name ?? "",
+  }));
+  if (q) {
+    rows = rows.filter(
+      (r) =>
+        r.categoryName.toLowerCase().includes(q) || (r.note ?? "").toLowerCase().includes(q),
+    );
+  }
+  if (accQ) rows = rows.filter((r) => r.accountName.toLowerCase().includes(accQ));
+
+  const label = (r: (typeof rows)[number]) =>
+    `${r.occurred_on}: ${r.kind === "in" ? "приход" : r.kind === "transfer" ? "перевод" : "расход"} ` +
+    `${num(r.amount)} ${CURRENCY_LABEL[r.currency] ?? r.currency} · ${r.categoryName || "без статьи"} · ` +
+    `счёт «${r.accountName}»${r.note ? ` · ${r.note}` : ""}`;
+
+  if (!rows.length) {
+    return (
+      `Операция на ${num(amount)} за последние 60 дней не найдена среди ручных записей. ` +
+      "Уточни сумму, дату или статью. Системные операции (оплата заявки, поступление WB, оплата поставки) " +
+      "я не удаляю — их отменяют в своих карточках."
+    );
+  }
+  if (rows.length > 1) {
+    // Удаление необратимо — при любой неоднозначности только спрашиваем
+    return (
+      `Нашлось несколько операций, ничего не удалено:\n` +
+      rows.slice(0, 6).map((r) => `- ${label(r)}`).join("\n") +
+      "\nУточни дату или комментарий, чтобы я удалил ровно одну."
+    );
+  }
+
+  const target = rows[0];
+  const res = await deleteCashTx(ctx.db, cashActorOf(ctx.user), target.id);
+  if (!res.ok) return `Не удалось удалить: ${res.message}`;
+  ctx.touch();
+  return `Удалена операция: ${label(target)}. Действие необратимо — назови её сотруднику полностью.`;
+}
+
+async function execCreateExpenseCategory(
+  ctx: ToolCtx,
+  input: {
+    name?: string;
+    direction?: string;
+    in_pnl?: boolean;
+    emoji?: string;
+    confirm_new?: boolean;
+  },
+): Promise<string> {
+  const name = String(input.name ?? "").trim();
+  const direction = String(input.direction ?? "").trim() as "in" | "out";
+  if (!name) return "Ошибка: нужно название статьи.";
+  if (!["in", "out"].includes(direction)) {
+    return "Ошибка: direction должен быть out (расход) или in (приход).";
+  }
+
+  // Защита от дублей: похожая статья уже есть → сначала подтверждение
+  const similar = await findCategories(ctx.db, name, direction);
+  if (similar.length && input.confirm_new !== true) {
+    return (
+      `Похожая статья уже есть: ${similar.map((c) => `«${c.name}»`).join(", ")}. ` +
+      "Спроси сотрудника: использовать её или точно создать новую? Для новой повтори с confirm_new=true."
+    );
+  }
+
+  const res = await createExpenseCategory(ctx.db, cashActorOf(ctx.user), {
+    name,
+    direction,
+    inPnl: input.in_pnl !== false,
+    emoji: input.emoji ? String(input.emoji) : null,
+  });
+  if (!res.ok) return `Не удалось создать статью: ${res.message}`;
+  ctx.touch();
+  return `${res.message} Направление: ${direction === "out" ? "расход" : "приход"}${input.in_pnl === false ? ", в прибыль не входит (движение активов)" : ""}.`;
 }
 
 async function execCashBalance(ctx: ToolCtx): Promise<string> {
@@ -1538,6 +2132,138 @@ async function execCompanyExpenses(ctx: ToolCtx, input: { days?: number }): Prom
   ].join("\n");
 }
 
+// ── Юнит-экономика (agg_unit_econ) ──────────────────────────────────────────
+// Компактная копия расчёта из data/supabase.ts getUnitEconomics: тот модуль
+// использует alias-импорты и не годится для tsx-бота, а сюда нужен только
+// текстовый срез. Хранение/приёмку берём из детальных отчётов, если они уже
+// синхронизированы (сумма > 0), иначе из финотчёта — как на странице.
+
+type UnitEconAggRow = {
+  nm_id: number;
+  sale_qty: number;
+  return_qty: number;
+  revenue_rub: number;
+  commission_rub: number;
+  acquiring_rub: number;
+  logistics_rub: number;
+  storage_fin_rub: number;
+  storage_rub: number;
+  acceptance_fin_rub: number;
+  acceptance_rub: number;
+  penalty_rub: number;
+  deduction_rub: number;
+  advert_rub: number;
+};
+
+async function execUnitEconomics(
+  ctx: ToolCtx,
+  input: { days?: number; product?: string },
+): Promise<string> {
+  const days = Math.min(90, Math.max(7, posInt(input.days) ?? 30));
+  const to = new Date();
+  to.setHours(0, 0, 0, 0);
+  const from = new Date(to);
+  from.setDate(from.getDate() - (days - 1));
+
+  const [aggRes, prodRes] = await Promise.all([
+    ctx.db.rpc("agg_unit_econ", {
+      p_store: DEMO_STORE_ID,
+      p_from: localIsoDate(from),
+      p_to: localIsoDate(to),
+    }),
+    ctx.db
+      .from("products")
+      .select("nm_id, title, cost_price")
+      .eq("store_id", DEMO_STORE_ID),
+  ]);
+  if (aggRes.error) return `Не удалось получить юнит-экономику: ${aggRes.error.message}`;
+  const agg = (aggRes.data ?? []) as UnitEconAggRow[];
+  if (!agg.length) {
+    return `Юнит-экономика за ${days} дн.: данных нет (нет продаж или отчёты WB ещё не синхронизированы).`;
+  }
+  const prodByNm = new Map(
+    ((prodRes.data ?? []) as { nm_id: number; title: string; cost_price: number | null }[]).map(
+      (p) => [Number(p.nm_id), p],
+    ),
+  );
+
+  // Источник хранения/приёмки выбираем глобально — как на странице «Экономика»
+  const useDailyStorage = agg.reduce((t, r) => t + Number(r.storage_rub ?? 0), 0) > 0;
+  const useDetailAcceptance = agg.reduce((t, r) => t + Number(r.acceptance_rub ?? 0), 0) > 0;
+
+  const items = agg.map((r) => {
+    const nm = Number(r.nm_id);
+    const p = prodByNm.get(nm);
+    const qty = Math.max(0, Number(r.sale_qty ?? 0) - Number(r.return_qty ?? 0));
+    const revenue = Number(r.revenue_rub ?? 0);
+    const storage = Number(useDailyStorage ? r.storage_rub : r.storage_fin_rub) || 0;
+    const acceptance = Number(useDetailAcceptance ? r.acceptance_rub : r.acceptance_fin_rub) || 0;
+    const wbFees =
+      Number(r.commission_rub ?? 0) +
+      Number(r.acquiring_rub ?? 0) +
+      Number(r.logistics_rub ?? 0) +
+      storage +
+      acceptance +
+      Number(r.penalty_rub ?? 0) +
+      Number(r.deduction_rub ?? 0);
+    const advert = Number(r.advert_rub ?? 0);
+    const costPrice = Number(p?.cost_price ?? 0);
+    const cogs = costPrice * qty;
+    const profit = revenue - wbFees - advert - cogs;
+    return {
+      nm,
+      title: nm === 0 ? "Нераспределённое (медийная реклама, хранение без товара)" : (p?.title ?? `nm ${nm}`),
+      qty,
+      revenue,
+      wbFees,
+      advert,
+      cogs,
+      costPrice,
+      profit,
+      marginPct: revenue > 0 ? Math.round((profit / revenue) * 100) : 0,
+      drrPct: revenue > 0 ? Math.round((advert / revenue) * 1000) / 10 : 0,
+    };
+  });
+
+  const fmtRow = (i: (typeof items)[number]) =>
+    `«${i.title}»: продано ${num(i.qty)} шт, выручка ${num(i.revenue)} ₽, ` +
+    `удержания WB ${num(i.wbFees)} ₽, реклама ${num(i.advert)} ₽ (ДРР ${i.drrPct}%), ` +
+    `себестоимость ${num(i.cogs)} ₽${i.costPrice === 0 && i.nm !== 0 ? " (⚠ себестоимость не заполнена!)" : ""}, ` +
+    `прибыль ${num(i.profit)} ₽ (маржа ${i.marginPct}%)`;
+
+  // Разбор одного товара
+  const q = String(input.product ?? "").trim();
+  if (q) {
+    const norm = q.toLowerCase();
+    const matches = items.filter(
+      (i) => i.nm !== 0 && (i.title.toLowerCase().includes(norm) || String(i.nm) === q.replace(/\D/g, "")),
+    );
+    const picked = pickOne(matches, (i) => i.title, q, "Товара с продажами за период");
+    if ("ask" in picked) return picked.ask;
+    return `ЮНИТ-ЭКОНОМИКА за ${days} дн.:\n${fmtRow(picked.row)}`;
+  }
+
+  const products = items.filter((i) => i.nm !== 0).sort((a, b) => b.profit - a.profit);
+  const unallocated = items.find((i) => i.nm === 0);
+  const totals = items.reduce(
+    (s, i) => ({ revenue: s.revenue + i.revenue, profit: s.profit + i.profit }),
+    { revenue: 0, profit: 0 },
+  );
+  const losers = products.filter((i) => i.profit < 0).slice(-3).reverse();
+  const noCost = products.filter((i) => i.costPrice === 0).length;
+
+  return [
+    `ЮНИТ-ЭКОНОМИКА за ${days} дн.: выручка ${num(totals.revenue)} ₽, прибыль ${num(totals.profit)} ₽ по ${products.length} SKU.` +
+      (noCost > 0 ? ` ⚠ У ${noCost} SKU не заполнена себестоимость — их прибыль завышена.` : ""),
+    "Топ по прибыли:",
+    ...products.slice(0, 5).map((i) => `- ${fmtRow(i)}`),
+    ...(losers.length ? ["Убыточные:", ...losers.map((i) => `- ${fmtRow(i)}`)] : []),
+    ...(unallocated && (unallocated.wbFees !== 0 || unallocated.advert !== 0)
+      ? [`Нераспределённое (не привязано к товарам): удержания ${num(unallocated.wbFees)} ₽, реклама ${num(unallocated.advert)} ₽.`]
+      : []),
+  ].join("\n");
+}
+
 // ── Заявки на выплату (правила — в data/payouts-core) ───────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1579,18 +2305,35 @@ async function resolveEmployee(
 
 async function execPaySalary(
   ctx: ToolCtx,
-  input: { employee?: string; amount?: number; kind?: string; account?: string; date?: string; note?: string },
+  input: {
+    employee?: string;
+    amount?: number;
+    kind?: string;
+    account?: string;
+    date?: string;
+    note?: string;
+    confirm?: boolean;
+  },
 ): Promise<string> {
   const amount = Number(input.amount);
   if (!Number.isFinite(amount) || amount <= 0) {
     return "Ошибка: нужна сумма больше нуля. Спроси, сколько начислить.";
   }
 
+  // Тип выплаты — строго: премия, попавшая в статью «Зарплата», перекашивает ФОТ
+  const kindRaw = String(input.kind ?? "").trim();
+  if (!Object.hasOwn(SALARY_CATEGORY, kindRaw)) {
+    return (
+      "Уточни тип выплаты: зарплата или аванс (salary), премия (bonus), " +
+      "гонорар за услуги (contractor) или возмещение расходов (reimbursement)."
+    );
+  }
+
   const found = await resolveEmployee(ctx, String(input.employee ?? ""));
   if ("ask" in found) return found.ask;
   const member = found.member;
 
-  const wantedCategory = SALARY_CATEGORY[String(input.kind ?? "salary")] ?? SALARY_CATEGORY.salary;
+  const wantedCategory = SALARY_CATEGORY[kindRaw];
   const categories = await findCategories(ctx.db, wantedCategory, "out");
   if (!categories.length) {
     const all = await findCategories(ctx.db, "", "out");
@@ -1601,25 +2344,19 @@ async function execPaySalary(
   }
   const category = categories[0];
 
-  let account: { id: string; name: string } | null = null;
-  const accountQuery = String(input.account ?? "").trim();
-  if (accountQuery) {
-    const found = await findAccounts(ctx.db, accountQuery);
-    if (!found.length) {
-      const all = await findAccounts(ctx.db, "");
-      return `Счёт «${accountQuery}» не найден. Есть: ${all.map((a) => a.name).join(", ")}.`;
-    }
-    if (found.length > 1) {
-      return `Подходит несколько счетов: ${found.map((a) => a.name).join(", ")}. Уточни, с какого платим.`;
-    }
-    account = { id: found[0].id, name: found[0].name };
-  } else {
-    const fallback = await pickDefaultAccount(ctx.db);
-    if (!fallback) return "Счетов кассы ещё нет — заведите счёт в CRM → Финансы → Касса.";
-    account = { id: fallback.id, name: fallback.name };
-  }
+  const acc = await resolveAccountStrict(ctx, input.account);
+  if (!acc.ok) return acc.message;
+  const account = acc.account;
 
   const date = isoOr(input.date, localIsoDate()) ?? localIsoDate();
+
+  const gate = confirmGate(
+    toRub(amount, account.currency),
+    input.confirm,
+    `${member.name} · ${num(amount)} ${CURRENCY_LABEL[account.currency] ?? "₽"} · статья «${category.name}» · счёт «${account.name}» · ${date}`,
+  );
+  if (gate) return gate;
+
   const result = await createCashTx(ctx.db, cashActorOf(ctx.user), {
     kind: "out",
     accountId: account.id,
@@ -1637,7 +2374,7 @@ async function execPaySalary(
     `Выплата проведена: ${num(result.amountRub)} ₽ · ${member.name} (${member.roleLabel}) · ` +
     `статья «${category.name}» · счёт «${account.name}» · дата ${date}. ` +
     "Сумма попала в отчёт «Выплаты команде»; сотруднику ушло уведомление в Telegram, если его аккаунт привязан." +
-    (accountQuery ? "" : " Счёт выбран автоматически — скажи об этом, чтобы поправили, если платили с другого.")
+    (acc.autoPicked ? " Счёт в кассе один — взят он." : "")
   );
 }
 
@@ -1795,9 +2532,24 @@ async function execRequestPayout(
     supply?: string;
   },
 ): Promise<string> {
-  const kind = ["salary", "contractor", "factory", "reimbursement", "other"].includes(String(input.kind))
-    ? (String(input.kind) as PayoutKind)
-    : "contractor";
+  // Тип и валюта — строго, без тихих дефолтов: юаневый счёт фабрики, молча
+  // записанный в рублях, разъедется с реальностью в ~12 раз.
+  const kindRaw = String(input.kind ?? "").trim();
+  if (!["salary", "contractor", "factory", "reimbursement", "other"].includes(kindRaw)) {
+    return (
+      "Уточни тип выплаты: зарплата/аванс (salary), подрядчик или услуги (contractor), " +
+      "счёт фабрики (factory), возмещение сотруднику (reimbursement) или прочее (other)."
+    );
+  }
+  const kind = kindRaw as PayoutKind;
+
+  const currencyRaw = String(input.currency ?? "").trim().toLowerCase();
+  if (!["rub", "kgs", "cny", "uzs"].includes(currencyRaw)) {
+    return (
+      "Уточни валюту заявки: рубли (rub), сомы (kgs), юани (cny) или сумы (uzs). " +
+      "Не подставляй рубли сам, если валюта не звучала."
+    );
+  }
 
   // Счёт фабрики стараемся привязать к поставке — тогда оплата закроет долг
   let supplyId: string | null = null;
@@ -1820,9 +2572,7 @@ async function execRequestPayout(
     kind,
     title: String(input.title ?? "").trim(),
     amount: Number(input.amount),
-    currency: (["rub", "kgs", "cny", "uzs"].includes(String(input.currency))
-      ? String(input.currency)
-      : "rub") as Currency,
+    currency: currencyRaw as Currency,
     payee: input.payee ? String(input.payee) : null,
     payeeUserId,
     dueDate: input.due_date ? String(input.due_date) : null,
@@ -1859,7 +2609,10 @@ async function findPayout(
   ctx: ToolCtx,
   query: string,
   statuses: string[],
-): Promise<{ ask: string } | { row: { id: string; title: string } }> {
+): Promise<
+  | { ask: string; notFound?: boolean }
+  | { row: { id: string; title: string; amount: number; currency: string; amountRub: number } }
+> {
   const view = await getPayouts(ctx.db, { id: ctx.user.id, role: ctx.user.role });
   const pool = view.items.filter((p) => statuses.includes(p.status));
   const norm = query.trim().toLowerCase();
@@ -1867,19 +2620,28 @@ async function findPayout(
   if (!matches.length) {
     return {
       ask: `Заявка «${query}» не найдена среди тех, что ${statuses.includes("approved") ? "ждут оплаты" : "ждут решения"}.`,
+      notFound: true,
     };
   }
   if (matches.length > 1) {
     return { ask: `Подходит несколько заявок: ${matches.map((m) => `«${m.title}»`).join(", ")}. Уточни, какая.` };
   }
-  return { row: { id: matches[0].id, title: matches[0].title } };
+  const m = matches[0];
+  return {
+    row: { id: m.id, title: m.title, amount: m.amount, currency: m.currency, amountRub: m.amountRub },
+  };
 }
 
 async function execDecidePayout(
   ctx: ToolCtx,
   input: { payout?: string; decision?: string; note?: string },
 ): Promise<string> {
-  const decision = input.decision === "reject" ? "reject" : "approve";
+  // Строго approve|reject: раньше любая опечатка модели тихо СОГЛАСОВЫВАЛА заявку
+  const decision =
+    input.decision === "reject" ? "reject" : input.decision === "approve" ? "approve" : null;
+  if (!decision) {
+    return "Не понял решение по заявке. Спроси у руководителя явно: согласовать или отклонить?";
+  }
   const found = await findPayout(ctx, String(input.payout ?? ""), ["pending"]);
   if ("ask" in found) return found.ask;
   const res = await decidePayout(ctx.db, cashActorOf(ctx.user), found.row.id, decision, input.note ?? null);
@@ -1890,31 +2652,78 @@ async function execDecidePayout(
 
 async function execPayPayout(
   ctx: ToolCtx,
-  input: { payout?: string; account?: string; paid_on?: string },
+  input: { payout?: string; account?: string; paid_on?: string; confirm?: boolean },
 ): Promise<string> {
-  const found = await findPayout(ctx, String(input.payout ?? ""), ["approved", "pending"]);
-  if ("ask" in found) return found.ask;
-
-  let accountId: string | null = null;
-  if (input.account) {
-    const accounts = await findAccounts(ctx.db, String(input.account));
-    if (!accounts.length) return `Счёт «${input.account}» не найден.`;
-    if (accounts.length > 1) {
-      return `Подходит несколько счетов: ${accounts.map((a) => a.name).join(", ")}. Уточни, с какого платим.`;
+  // Оплачиваем ТОЛЬКО согласованные. В вебе оплата pending трактуется как
+  // «согласовал и оплатил» одним кликом руководителя, но для голосового/чатового
+  // ввода это слишком опасно — оставляем два явных шага.
+  const found = await findPayout(ctx, String(input.payout ?? ""), ["approved"]);
+  if ("ask" in found) {
+    // В pending заглядываем ТОЛЬКО когда среди согласованных ничего нет:
+    // на «нашлось несколько согласованных» надо уточнять, а не предлагать
+    // согласовать постороннюю pending-заявку с похожим названием
+    if (found.notFound) {
+      const pending = await findPayout(ctx, String(input.payout ?? ""), ["pending"]);
+      if (!("ask" in pending)) {
+        return (
+          `Заявка «${pending.row.title}» ещё НЕ согласована — сначала согласование (decide_payout), потом оплата. ` +
+          "Если руководитель сказал «согласуй и оплати» — сделай оба шага по очереди."
+        );
+      }
     }
-    accountId = accounts[0].id;
+    return found.ask;
+  }
+  const payout = found.row;
+
+  // Счёт: указан → строгий резолв; не указан → предпочитаем счёт в валюте
+  // заявки (как в вебе), а не первый попавшийся
+  let account: AccountRef;
+  let autoPicked = false;
+  const accQuery = String(input.account ?? "").trim();
+  if (accQuery) {
+    const acc = await resolveAccountStrict(ctx, accQuery);
+    if (!acc.ok) return acc.message;
+    account = acc.account;
   } else {
-    const fallback = await pickDefaultAccount(ctx.db);
-    if (!fallback) return "Счетов кассы ещё нет — заведите счёт в CRM → Финансы → Касса.";
-    accountId = fallback.id;
+    const all = await findAccounts(ctx.db, "");
+    if (!all.length) return "Счетов кассы ещё нет — заведите счёт в CRM → Финансы → Касса.";
+    const matching = all.filter((a) => a.currency === payout.currency);
+    const pool = matching.length ? matching : all;
+    if (pool.length > 1) {
+      return (
+        `С какого счёта оплатить «${payout.title}» (${money(payout.amount, payout.currency)})? ` +
+        `Подходящие: ${pool.map((a) => `${a.name} (${CURRENCY_LABEL[a.currency] ?? a.currency})`).join(", ")}. ` +
+        "Уточни у сотрудника."
+      );
+    }
+    account = pool[0];
+    autoPicked = true;
   }
 
-  const res = await payPayout(ctx.db, cashActorOf(ctx.user), found.row.id, accountId, {
+  // Валюта счёта ≠ валюте заявки: сумма запишется в валюте счёта БЕЗ пересчёта
+  // (5000 ¥ с рублёвого счёта = 5000 ₽ в кассе) — только с явным подтверждением
+  if (account.currency !== payout.currency && input.confirm !== true) {
+    return (
+      `Заявка в ${CURRENCY_LABEL[payout.currency] ?? payout.currency} (${money(payout.amount, payout.currency)}), ` +
+      `а счёт «${account.name}» — в ${CURRENCY_LABEL[account.currency] ?? account.currency}. ` +
+      "Сумма запишется в валюте счёта БЕЗ пересчёта и исказит кассу. " +
+      "Лучше укажи счёт в валюте заявки; если платили именно с этого счёта — подтверди у сотрудника и повтори с confirm=true."
+    );
+  }
+
+  const gate = confirmGate(
+    payout.amountRub,
+    input.confirm,
+    `оплата заявки «${payout.title}» ~${num(payout.amountRub)} ₽ со счёта «${account.name}»`,
+  );
+  if (gate) return gate;
+
+  const res = await payPayout(ctx.db, cashActorOf(ctx.user), payout.id, account.id, {
     paidOn: input.paid_on ?? null,
   });
   if (!res.ok) return `Не удалось оплатить: ${res.message}`;
   ctx.touch();
-  return `${res.message}${input.account ? "" : " Счёт выбран автоматически — скажи об этом сотруднику."}`;
+  return `${res.message}${autoPicked ? ` Счёт: «${account.name}» (подобран по валюте заявки).` : ""}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2001,6 +2810,7 @@ async function execCreateSupply(
     sewing_currency?: string;
     cargo_cost?: number;
     cargo_currency?: string;
+    cost_unknown?: boolean;
     product?: string;
   },
 ): Promise<string> {
@@ -2012,13 +2822,29 @@ async function execCreateSupply(
     return "Ошибка: нужны фабрика, наименование поставки и количество.";
   }
 
+  // «Бесплатная» поставка портит долги фабрике и себестоимость — стоимость
+  // отшивки обязательна, ноль допустим только по явному «внесём позже»
+  const sewingCost = posInt(input.sewing_cost);
+  const costUnknown = input.cost_unknown === true;
+  if ((sewingCost === null || sewingCost === 0) && !costUnknown) {
+    return (
+      "Спроси стоимость отшивки (долг фабрике) и её валюту — без неё отчёт по долгам будет врать. " +
+      "Если сотрудник говорит, что стоимость пока неизвестна, повтори вызов с cost_unknown=true."
+    );
+  }
+
   const { data: factories } = await db
     .from("factories")
     .select("id, name, country")
     .eq("org_id", DEMO_ORG_ID)
     .ilike("name", `%${likeSafe(factoryQ)}%`)
     .limit(8);
-  const picked = pickOne((factories ?? []) as { id: string; name: string }[], (f) => f.name, factoryQ, "Фабрики");
+  const picked = pickOne(
+    (factories ?? []) as { id: string; name: string; country: string }[],
+    (f) => f.name,
+    factoryQ,
+    "Фабрики",
+  );
   if ("ask" in picked) {
     return picked.ask + " Если фабрики ещё нет — заведи её инструментом create_factory.";
   }
@@ -2029,6 +2855,12 @@ async function execCreateSupply(
     if (matches.length === 1) productId = matches[0].id;
   }
 
+  // Валюта по умолчанию — из страны фабрики, а не слепое cny
+  const defaultCurrency = picked.row.country === "uzbekistan" ? "uzs" : "cny";
+  const sewingCurrency = currencyOr(input.sewing_currency, defaultCurrency);
+  const cargoCost = posInt(input.cargo_cost);
+  const cargoCurrency = currencyOr(input.cargo_currency, defaultCurrency);
+
   const { error } = await db.from("supplies").insert({
     org_id: DEMO_ORG_ID,
     store_id: DEMO_STORE_ID,
@@ -2037,16 +2869,24 @@ async function execCreateSupply(
     title: title.slice(0, 200),
     quantity,
     ship_date: isoOr(input.ship_date, localIsoDate()),
-    sewing_cost: posInt(input.sewing_cost) ?? 0,
-    sewing_currency: currencyOr(input.sewing_currency, "cny"),
-    cargo_cost: posInt(input.cargo_cost) ?? 0,
-    cargo_currency: currencyOr(input.cargo_currency, "cny"),
+    sewing_cost: sewingCost ?? 0,
+    sewing_currency: sewingCurrency,
+    cargo_cost: cargoCost ?? 0,
+    cargo_currency: cargoCurrency,
     status: "in_transit",
     created_by: authorId(ctx.user),
   });
   if (error) return `Не удалось создать поставку: ${error.message}`;
   ctx.touch();
-  return `Поставка «${title}» с фабрики «${picked.row.name}» создана: ${num(quantity)} шт, статус «в пути».`;
+  return (
+    `Поставка «${title}» с фабрики «${picked.row.name}» создана: ${num(quantity)} шт, статус «в пути». ` +
+    (sewingCost
+      ? `Отшивка: ${num(sewingCost)} ${CURRENCY_LABEL[sewingCurrency]}${input.sewing_currency ? "" : " (валюта по стране фабрики — проверь)"}.`
+      : "Стоимость отшивки НЕ внесена (по слову сотрудника) — напомни внести позже, долги фабрике пока не считаются.") +
+    (cargoCost
+      ? ` Карго: ${num(cargoCost)} ${CURRENCY_LABEL[cargoCurrency]}.`
+      : " Карго не указано — добавится позже через оплату или карточку поставки.")
+  );
 }
 
 // ── РАСХОД: оплата по поставке (за товар или за карго) ──────────────────────
@@ -2602,6 +3442,8 @@ const HANDLERS: Record<string, Handler> = {
   team_report: execTeamReport as Handler,
   my_duties: (ctx) => execMyDuties(ctx),
   complete_my_duty: execCompleteMyDuty as Handler,
+  duty_stats: execDutyStats as Handler,
+  complete_duty_for: execCompleteDutyFor as Handler,
   product_info: execProductInfo as Handler,
   stock_report: execStockReport as Handler,
   update_product: execUpdateProduct as Handler,
@@ -2609,12 +3451,16 @@ const HANDLERS: Record<string, Handler> = {
   set_sales_plan: execSetSalesPlan as Handler,
   add_expense: execAddExpense as Handler,
   add_income: execAddIncome as Handler,
+  transfer_money: execTransferMoney as Handler,
+  delete_cash_tx: execDeleteCashTx as Handler,
+  create_expense_category: execCreateExpenseCategory as Handler,
   pay_salary: execPaySalary as Handler,
   payroll_report: execPayrollReport as Handler,
   my_salary: execMySalary as Handler,
   cash_balance: (ctx) => execCashBalance(ctx),
   pnl_report: execPnlReport as Handler,
   company_expenses: execCompanyExpenses as Handler,
+  unit_economics: execUnitEconomics as Handler,
   request_payout: execRequestPayout as Handler,
   payouts_list: (ctx) => execPayoutsList(ctx),
   decide_payout: execDecidePayout as Handler,
@@ -2652,11 +3498,23 @@ export async function executeTool(
   if (spec.permission && !can(user.role, spec.permission)) {
     return `Ошибка: у роли «${user.roleLabel}» нет прав на это действие.`;
   }
+  if (spec.permissionsAny && !spec.permissionsAny.some((p) => can(user.role, p))) {
+    return `Ошибка: у роли «${user.roleLabel}» нет прав на это действие.`;
+  }
 
   try {
     return await handler({ db, user, touch: () => onMutation?.() }, input as Record<string, never>);
   } catch (e) {
-    console.error(`[ai/tools] ${name}:`, e);
-    return "Ошибка выполнения действия, попробуйте ещё раз.";
+    // Вход логируем обрезанным: там могут быть длинные тексты отчётов
+    console.error(`[ai/tools] ${name}:`, JSON.stringify(input ?? {}).slice(0, 500), e);
+    const code = (e as { code?: string } | null)?.code;
+    const known: Record<string, string> = {
+      "23505": "такая запись уже существует",
+      "23503": "ссылка на несуществующую запись",
+      "22P02": "не найдено (неверный идентификатор)",
+      PGRST116: "не найдено",
+    };
+    const hint = code && known[code] ? ` (${known[code]})` : "";
+    return `Ошибка выполнения действия «${name}»${hint}. Скажи пользователю, что не получилось, и предложи попробовать ещё раз.`;
   }
 }

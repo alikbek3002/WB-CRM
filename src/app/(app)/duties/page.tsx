@@ -1,8 +1,9 @@
 import { NoAccess } from "@/frontend/components/layout/no-access";
 import { DutiesList } from "@/frontend/components/duties/duties-list";
+import { DutyStatsSection } from "@/frontend/components/duties/duty-stats";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
-import { getMyDuties, getReportsBoard } from "@/backend/data";
+import { getDutyStats, getMyDuties, getReportsBoard } from "@/backend/data";
 import type { DutyItem } from "@/shared/types";
 
 export const dynamic = "force-dynamic";
@@ -27,6 +28,9 @@ export default async function DutiesPage() {
   } else {
     mine = await getMyDuties(session.user.id);
   }
+  // Дисциплина за период — после readDuties: тот уже сгенерировал сегодняшние
+  // наряды и пометил просроченные
+  const stats = await getDutyStats();
 
   const today = new Date().toLocaleDateString("ru-RU", {
     day: "numeric",
@@ -45,6 +49,12 @@ export default async function DutiesPage() {
       </div>
 
       <DutiesList duties={mine} canComplete={canComplete} />
+
+      <DutyStatsSection
+        stats={stats}
+        currentUserId={session.user.id}
+        seesTeam={seesTeam}
+      />
 
       {seesTeam && team.length > 0 && (
         <div className="space-y-2 pt-2">

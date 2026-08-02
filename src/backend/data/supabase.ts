@@ -16,8 +16,10 @@ import type {
   FulfillmentSummary,
   IntegrationStatus,
   PlanFactDay,
+  CostPriceSource,
   ProductListItem,
   ProductStockRow,
+  ProductUnitEcon,
   ReportsBoard,
   SalesPlanView,
   StocksOverview,
@@ -33,8 +35,11 @@ import type {
   TaskItem,
   TaskReportItem,
   TeamMember,
+  UnitEconRow,
+  UnitEconView,
   WarehouseStock,
   WbDistribution,
+  WbIncomeGroup,
 } from "@/shared/types";
 import {
   assembleSupply,
@@ -186,7 +191,7 @@ export async function getProductList(
   const { data: prods, error } = await db
     .from("products")
     .select(
-      "id, nm_id, vendor_code, title, brand, category, status, cost_price, logistics_cost, photo_url, photos, description, price_wb, price_discounted_wb, responsible:profiles(full_name)",
+      "id, nm_id, vendor_code, title, brand, category, status, cost_price, cost_price_source, cost_price_updated_at, logistics_cost, photo_url, photos, description, price_wb, price_discounted_wb, responsible:profiles(full_name)",
     )
     .eq("store_id", DEMO_STORE_ID)
     .order("nm_id");
@@ -235,6 +240,17 @@ export async function getProductList(
     ]),
   );
 
+  // Юнит-экономика за 30 дней (agg_unit_econ 0035). Ошибка не роняет список:
+  // до применения миграции/бэкфилла колонка «Маржа» просто пустая.
+  const ueTo = new Date();
+  ueTo.setHours(0, 0, 0, 0);
+  const ueFrom = new Date(ueTo);
+  ueFrom.setDate(ueFrom.getDate() - 29);
+  const ueRows = await readUnitEconAgg(db, ueFrom, ueTo).catch(() => [] as UnitEconAggRow[]);
+  const ueByNm = new Map(ueRows.map((r) => [Number(r.nm_id), r]));
+  const useDailyStorage = ueRows.some((r) => Number(r.storage_rub) > 0);
+  const useDetailAcceptance = ueRows.some((r) => Number(r.acceptance_rub) > 0);
+
   return prods.map((p) => {
     const responsible = p.responsible as { full_name?: string } | null;
     const nmId = Number(p.nm_id);
@@ -245,6 +261,51 @@ export async function getProductList(
     const avgDailySales = Math.round(avgExact * 10) / 10;
     const daysOfCover = avgExact > 0 ? Math.round(stockQty / avgExact) : null;
     const isWeak = salesRank30d < 120 || (daysOfCover !== null && daysOfCover > 120);
+
+    // Экономика за 30 дней: полный водопад из фактических отчётов WB
+    const cost = Number(p.cost_price ?? 0);
+    const ue = ueByNm.get(nmId);
+    let econ: ProductUnitEcon | null = null;
+    if (ue) {
+      const netQty = Number(ue.sale_qty) - Number(ue.return_qty);
+      const revenue = Number(ue.revenue_rub);
+      if (netQty > 0 && revenue > 0) {
+        const storage = Number(useDailyStorage ? ue.storage_rub : ue.storage_fin_rub);
+        const acceptance = Number(
+          useDetailAcceptance ? ue.acceptance_rub : ue.acceptance_fin_rub,
+        );
+        const advert = Number(ue.advert_rub);
+        const cogs = cost * netQty;
+        const fees =
+          Number(ue.commission_rub) +
+          Number(ue.acquiring_rub) +
+          Number(ue.logistics_rub) +
+          storage +
+          acceptance +
+          Number(ue.penalty_rub) +
+          Number(ue.deduction_rub);
+        const profit = revenue - fees - advert - cogs;
+        econ = {
+          periodDays: 30,
+          saleQty: netQty,
+          priceRub: Math.round(revenue / netQty),
+          commissionRub: Math.round(
+            (Number(ue.commission_rub) + Number(ue.acquiring_rub)) / netQty,
+          ),
+          logisticsRub: Math.round(Number(ue.logistics_rub) / netQty),
+          storageRub: Math.round(storage / netQty),
+          acceptanceRub: Math.round(acceptance / netQty),
+          advertRub: Math.round(advert / netQty),
+          costPrice: cost,
+          profitPerUnitRub: Math.round(profit / netQty),
+          profitRub: Math.round(profit),
+          marginPct: Math.round((profit / revenue) * 1000) / 10,
+          roiPct: cogs > 0 ? Math.round((profit / cogs) * 1000) / 10 : 0,
+          drrPct: Math.round((advert / revenue) * 1000) / 10,
+        };
+      }
+    }
+
     return {
       id: p.id as string,
       nmId,
@@ -253,7 +314,10 @@ export async function getProductList(
       brand: (p.brand as string) ?? "—",
       category: (p.category as string) ?? "—",
       status: (p.status as string) ?? "—",
-      costPrice: Number(p.cost_price ?? 0),
+      costPrice: cost,
+      costPriceSource: ((p.cost_price_source as CostPriceSource) ?? "manual"),
+      costPriceUpdatedAt: (p.cost_price_updated_at as string) ?? null,
+      econ,
       logisticsCost: Number(p.logistics_cost ?? 0),
       stockQty,
       responsible: responsible?.full_name ?? "—",
@@ -270,6 +334,310 @@ export async function getProductList(
       isWeak,
     };
   });
+}
+
+// ─── Юнит-экономика (agg_unit_econ, миграция 0035) ───────────────────────────
+
+// Строка агрегата: все деньги по nm_id за период. Хранение и приёмка в двух
+// вариантах: *_fin_rub — из финотчёта (обычно висит на nm_id=0), обычные — из
+// детальных отчётов (paid_storage / acceptance_report), распределены по товарам.
+type UnitEconAggRow = {
+  nm_id: number;
+  sale_qty: number;
+  return_qty: number;
+  revenue_rub: number;
+  for_pay_rub: number;
+  commission_rub: number;
+  acquiring_rub: number;
+  logistics_rub: number;
+  storage_fin_rub: number;
+  storage_rub: number;
+  acceptance_fin_rub: number;
+  acceptance_rub: number;
+  penalty_rub: number;
+  deduction_rub: number;
+  advert_rub: number;
+  advert_views: number;
+  advert_clicks: number;
+};
+
+function readUnitEconAgg(
+  db: SupabaseClient,
+  from: Date,
+  to: Date,
+): Promise<UnitEconAggRow[]> {
+  return rpcAll<UnitEconAggRow>(db, "agg_unit_econ", {
+    p_store: DEMO_STORE_ID,
+    p_from: isoDate(from),
+    p_to: isoDate(to),
+  });
+}
+
+export async function getUnitEconomics(
+  db: SupabaseClient,
+  days = 30,
+): Promise<UnitEconView> {
+  const to = new Date();
+  to.setHours(0, 0, 0, 0);
+  const from = new Date(to);
+  from.setDate(from.getDate() - (days - 1));
+
+  const [agg, prodRes] = await Promise.all([
+    readUnitEconAgg(db, from, to),
+    db
+      .from("products")
+      .select("nm_id, title, category, photo_url, cost_price, cost_price_source")
+      .eq("store_id", DEMO_STORE_ID),
+  ]);
+  if (prodRes.error) throw prodRes.error;
+  const prodByNm = new Map(
+    (prodRes.data ?? []).map((p) => [Number(p.nm_id), p]),
+  );
+
+  // Хранение/приёмка: детальные отчёты точнее (по товарам), но если они ещё не
+  // синхронизированы — берём суммы финотчёта, чтобы итог всё равно сходился.
+  const sumBy = (pick: (r: UnitEconAggRow) => number) =>
+    agg.reduce((t, r) => t + Number(pick(r) ?? 0), 0);
+  const storageDailyTotal = sumBy((r) => r.storage_rub);
+  const storageFinTotal = sumBy((r) => r.storage_fin_rub);
+  const useDailyStorage = storageDailyTotal > 0;
+  const accDetailTotal = sumBy((r) => r.acceptance_rub);
+  const accFinTotal = sumBy((r) => r.acceptance_fin_rub);
+  const useDetailAcceptance = accDetailTotal > 0;
+
+  const buildRow = (r: UnitEconAggRow): UnitEconRow => {
+    const nm = Number(r.nm_id);
+    const p = prodByNm.get(nm);
+    const netQty = Number(r.sale_qty) - Number(r.return_qty);
+    const revenue = Number(r.revenue_rub);
+    const storage = Number(useDailyStorage ? r.storage_rub : r.storage_fin_rub);
+    const acceptance = Number(
+      useDetailAcceptance ? r.acceptance_rub : r.acceptance_fin_rub,
+    );
+    const costPrice = Number(p?.cost_price ?? 0);
+    const cogs = costPrice * Math.max(netQty, 0);
+    const fees =
+      Number(r.commission_rub) +
+      Number(r.acquiring_rub) +
+      Number(r.logistics_rub) +
+      storage +
+      acceptance +
+      Number(r.penalty_rub) +
+      Number(r.deduction_rub);
+    const advert = Number(r.advert_rub);
+    const profit = revenue - fees - advert - cogs;
+    return {
+      nmId: nm,
+      title: (p?.title as string) ?? (nm === 0 ? "Нераспределённое" : `Товар ${nm}`),
+      photoUrl: (p?.photo_url as string) ?? null,
+      category: (p?.category as string) ?? "—",
+      saleQty: netQty,
+      revenueRub: Math.round(revenue),
+      commissionRub: Math.round(Number(r.commission_rub)),
+      acquiringRub: Math.round(Number(r.acquiring_rub)),
+      logisticsRub: Math.round(Number(r.logistics_rub)),
+      storageRub: Math.round(storage),
+      acceptanceRub: Math.round(acceptance),
+      penaltyRub: Math.round(Number(r.penalty_rub)),
+      deductionRub: Math.round(Number(r.deduction_rub)),
+      advertRub: Math.round(advert),
+      drrPct: revenue > 0 ? Math.round((advert / revenue) * 1000) / 10 : 0,
+      costPrice,
+      costPriceSource: p ? ((p.cost_price_source as CostPriceSource) ?? "manual") : null,
+      cogsRub: Math.round(cogs),
+      profitRub: Math.round(profit),
+      profitPerUnitRub: netQty > 0 ? Math.round(profit / netQty) : 0,
+      marginPct: revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : 0,
+      roiPct: cogs > 0 ? Math.round((profit / cogs) * 1000) / 10 : 0,
+    };
+  };
+
+  const rows = agg
+    .filter((r) => Number(r.nm_id) > 0)
+    .map(buildRow)
+    .filter(
+      (r) =>
+        r.saleQty !== 0 ||
+        r.revenueRub !== 0 ||
+        r.advertRub !== 0 ||
+        r.storageRub !== 0 ||
+        r.profitRub !== 0,
+    )
+    .sort((a, b) => b.profitRub - a.profitRub);
+
+  // «Нераспределённое»: строка nm_id=0 из отчётов + сверка детального хранения
+  // и приёмки с финотчётом (разница остаётся здесь, чтобы итог бился с ОПиУ)
+  const zero = agg.find((r) => Number(r.nm_id) === 0);
+  let unallocated: UnitEconRow | null = zero ? buildRow(zero) : null;
+  const storageDelta = useDailyStorage ? Math.round(storageFinTotal - storageDailyTotal) : 0;
+  const accDelta = useDetailAcceptance ? Math.round(accFinTotal - accDetailTotal) : 0;
+  if (storageDelta !== 0 || accDelta !== 0) {
+    unallocated = unallocated ?? {
+      nmId: 0,
+      title: "Нераспределённое",
+      photoUrl: null,
+      category: "—",
+      saleQty: 0,
+      revenueRub: 0,
+      commissionRub: 0,
+      acquiringRub: 0,
+      logisticsRub: 0,
+      storageRub: 0,
+      acceptanceRub: 0,
+      penaltyRub: 0,
+      deductionRub: 0,
+      advertRub: 0,
+      drrPct: 0,
+      costPrice: 0,
+      costPriceSource: null,
+      cogsRub: 0,
+      profitRub: 0,
+      profitPerUnitRub: 0,
+      marginPct: 0,
+      roiPct: 0,
+    };
+    unallocated.storageRub += storageDelta;
+    unallocated.acceptanceRub += accDelta;
+    unallocated.profitRub -= storageDelta + accDelta;
+  }
+  if (
+    unallocated &&
+    unallocated.revenueRub === 0 &&
+    unallocated.profitRub === 0 &&
+    unallocated.advertRub === 0 &&
+    unallocated.storageRub === 0 &&
+    unallocated.acceptanceRub === 0 &&
+    unallocated.deductionRub === 0
+  ) {
+    unallocated = null;
+  }
+
+  const all = unallocated ? [...rows, unallocated] : rows;
+  const total = (pick: (r: UnitEconRow) => number) =>
+    all.reduce((t, r) => t + pick(r), 0);
+  const totalRevenue = total((r) => r.revenueRub);
+  const totalProfit = total((r) => r.profitRub);
+
+  // Покрытие себестоимостью — по проданным штукам
+  const soldQty = rows.reduce((t, r) => t + Math.max(r.saleQty, 0), 0);
+  const coveredQty = rows.reduce(
+    (t, r) => t + (r.costPrice > 0 ? Math.max(r.saleQty, 0) : 0),
+    0,
+  );
+
+  return {
+    from: isoDate(from),
+    to: isoDate(to),
+    days,
+    rows,
+    unallocated,
+    totals: {
+      saleQty: soldQty,
+      revenueRub: totalRevenue,
+      wbFeesRub: total(
+        (r) =>
+          r.commissionRub +
+          r.acquiringRub +
+          r.logisticsRub +
+          r.storageRub +
+          r.acceptanceRub +
+          r.penaltyRub +
+          r.deductionRub,
+      ),
+      advertRub: total((r) => r.advertRub),
+      cogsRub: total((r) => r.cogsRub),
+      profitRub: totalProfit,
+      marginPct: totalRevenue > 0 ? Math.round((totalProfit / totalRevenue) * 1000) / 10 : 0,
+    },
+    storageSource: useDailyStorage ? "daily" : "finance",
+    costCoveragePct: soldQty > 0 ? Math.round((coveredQty / soldQty) * 100) : 0,
+  };
+}
+
+// ─── Поставки FBW: приёмки складов WB (raw_incomes) ──────────────────────────
+
+export async function getWbIncomes(db: SupabaseClient): Promise<WbIncomeGroup[]> {
+  const since = new Date();
+  since.setDate(since.getDate() - 90);
+
+  type Row = {
+    income_id: number;
+    income_date: string | null;
+    date_close: string | null;
+    warehouse: string | null;
+    status: string | null;
+    nm_id: number;
+    quantity: number;
+  };
+  // PostgREST режет ответ до 1000 строк — тянем страницами
+  const rows: Row[] = [];
+  const PAGE = 1000;
+  for (let fromIdx = 0; ; fromIdx += PAGE) {
+    const { data, error } = await db
+      .from("raw_incomes")
+      .select("income_id, income_date, date_close, warehouse, status, nm_id, quantity")
+      .eq("store_id", DEMO_STORE_ID)
+      .gte("income_date", isoDate(since))
+      .order("income_date", { ascending: false })
+      .range(fromIdx, fromIdx + PAGE - 1);
+    if (error) throw error;
+    rows.push(...((data ?? []) as Row[]));
+    if (!data || data.length < PAGE) break;
+  }
+  if (!rows.length) return [];
+
+  const { data: prods } = await db
+    .from("products")
+    .select("nm_id, title")
+    .eq("store_id", DEMO_STORE_ID);
+  const titleByNm = new Map(
+    (prods ?? []).map((p) => [Number(p.nm_id), String(p.title)]),
+  );
+
+  const groups = new Map<
+    number,
+    WbIncomeGroup & { qtyByNm: Map<number, number> }
+  >();
+  for (const r of rows) {
+    const id = Number(r.income_id);
+    const g = groups.get(id) ?? {
+      incomeId: id,
+      date: r.income_date ?? "",
+      dateClose: r.date_close,
+      warehouse: r.warehouse ?? "—",
+      totalQty: 0,
+      positions: 0,
+      status: r.status ?? "—",
+      items: [],
+      qtyByNm: new Map<number, number>(),
+    };
+    g.totalQty += Number(r.quantity ?? 0);
+    const nm = Number(r.nm_id);
+    if (nm > 0) g.qtyByNm.set(nm, (g.qtyByNm.get(nm) ?? 0) + Number(r.quantity ?? 0));
+    if (r.date_close && (!g.dateClose || r.date_close > g.dateClose)) g.dateClose = r.date_close;
+    groups.set(id, g);
+  }
+
+  return [...groups.values()]
+    .sort((a, b) => (b.date > a.date ? 1 : -1))
+    .slice(0, 20)
+    .map((g) => ({
+      incomeId: g.incomeId,
+      date: g.date,
+      dateClose: g.dateClose,
+      warehouse: g.warehouse,
+      totalQty: g.totalQty,
+      positions: g.qtyByNm.size,
+      status: g.status,
+      items: [...g.qtyByNm.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([nm, qty]) => ({
+          nmId: nm,
+          title: titleByNm.get(nm) ?? `Товар ${nm}`,
+          qty,
+        })),
+    }));
 }
 
 // ─── Цепочка поставок (Фабрики · Поставки · Фул-фирма) ────────────────────────
@@ -538,7 +906,7 @@ export async function getTasks(db: SupabaseClient): Promise<TaskItem[]> {
   const { data, error } = await db
     .from("tasks")
     .select(
-      "id, title, description, status, priority, due_date, assignee_id, completion_report, completed_at, completed_on_time, assignee:profiles!tasks_assignee_id_fkey(full_name), product:products(title)",
+      "id, title, description, status, priority, due_date, assignee_id, created_by, completion_report, completed_at, completed_on_time, assignee:profiles!tasks_assignee_id_fkey(full_name), product:products(title)",
     )
     .eq("org_id", DEMO_ORG_ID)
     .neq("status", "cancelled")
@@ -557,6 +925,7 @@ export async function getTasks(db: SupabaseClient): Promise<TaskItem[]> {
       priority: t.priority as TaskItem["priority"],
       assignee: assignee?.full_name ?? "—",
       assigneeId: (t.assignee_id as string) ?? null,
+      createdById: (t.created_by as string) ?? null,
       dueDate: (t.due_date as string) ?? null,
       productLabel: product?.title ?? null,
       report: (t.completion_report as string) ?? null,
@@ -926,6 +1295,9 @@ export async function getReportsBoard(
   };
 }
 
+// Статистика дисциплины за период — в чистом модуле (нужна и инструменту ИИ).
+export { getDutyStats } from "./duties-core";
+
 // Отчёты по задачам, закрытым за день (руководству — страница «Отчёты»)
 export async function getTaskReports(
   db: SupabaseClient,
@@ -966,7 +1338,7 @@ export async function getRnpProducts(
   const { data: products, error } = await db
     .from("products")
     .select(
-      "id, nm_id, title, status, cost_price, logistics_cost, responsible:profiles(full_name)",
+      "id, nm_id, title, status, category, cost_price, logistics_cost, responsible:profiles(full_name)",
     )
     .eq("store_id", DEMO_STORE_ID)
     .order("nm_id");
@@ -985,12 +1357,15 @@ export async function getRnpProducts(
   // PostgREST режет и rpc-ответы до 1000 строк (терялись данные РНП!).
   type StockSizeRow = { product_id: string; size: string | null; on_stock: number; in_transit: number; in_production: number };
   type RnpDailyRow = { nm_id: number; day: string; orders_qty: number; orders_sum: number; sales_qty: number; sales_sum: number; spp_avg: number };
-  const [plansRes, stock, rnpDaily, funnelRes, advertRes] = await Promise.all([
+  const [plansRes, stock, rnpDaily, funnelRes, advertRes, ueRows, tariffRes] = await Promise.all([
     db.from("rnp_plans").select("product_id, iso_year, iso_week, plan_orders, plan_sales, plan_views, giveaways").in("product_id", pids),
     rpcAll<StockSizeRow>(db, "agg_stock_sizes", { p_store: DEMO_STORE_ID }),
     rpcAll<RnpDailyRow>(db, "agg_rnp_daily", { p_store: DEMO_STORE_ID, p_since: windowStart.toISOString() }),
     db.from("raw_funnel_daily").select("nm_id, stat_date, open_card_count, add_to_cart_count, orders_count, buyouts_count").eq("store_id", DEMO_STORE_ID).gte("stat_date", isoDate(windowStart)),
     db.from("raw_advert_daily").select("nm_id, stat_date, views, clicks, sum").eq("store_id", DEMO_STORE_ID).gte("stat_date", isoDate(windowStart)),
+    // Факт удержаний по товарам за окно (ошибка не роняет РНП — фолбэк на тарифы)
+    readUnitEconAgg(db, windowStart, today).catch(() => [] as UnitEconAggRow[]),
+    db.from("wb_commission_tariffs").select("subject_name, kgvp_marketplace").eq("store_id", DEMO_STORE_ID),
   ]);
 
   for (const res of [plansRes, funnelRes, advertRes]) {
@@ -999,6 +1374,14 @@ export async function getRnpProducts(
   const plans = plansRes.data ?? [];
   const funnel = funnelRes.data ?? [];
   const advert = advertRes.data ?? [];
+  const ueByNm = new Map(ueRows.map((r) => [Number(r.nm_id), r]));
+  // Комиссия по категории (тарифы WB) — фолбэк, когда продаж в окне не было
+  const tariffByCategory = new Map(
+    (tariffRes.data ?? []).map((t) => [
+      String(t.subject_name ?? "").toLowerCase(),
+      Number(t.kgvp_marketplace ?? 0),
+    ]),
+  );
 
   // Группировка дневных агрегатов по артикулу
   const dailyByNm = new Map<number, RnpDailyRow[]>();
@@ -1120,15 +1503,29 @@ export async function getRnpProducts(
       ],
     };
 
-    // Экономика (окно 5 недель — из дневных агрегатов)
+    // Экономика (окно 5 недель). Удержания — факт из отчётов WB (agg_unit_econ);
+    // если продаж в окне не было — прогноз: комиссия по тарифу категории,
+    // логистика из карточки товара.
     const winOrdersQty = pd.reduce((t, r) => t + Number(r.orders_qty), 0);
     const winSalesQty = pd.reduce((t, r) => t + Number(r.sales_qty), 0);
     const ordersSumWin = pd.reduce((t, r) => t + Number(r.orders_sum), 0);
     const priceRub = winOrdersQty ? Math.round(ordersSumWin / winOrdersQty) : 0;
     const cost = Number(p.cost_price ?? 0);
-    const logistics = Number(p.logistics_cost ?? 0);
-    const commission = Math.round(priceRub * 0.245);
-    const profitPerUnit = priceRub - cost - commission - logistics;
+    const ue = ueByNm.get(nm);
+    const netQty = ue ? Number(ue.sale_qty) - Number(ue.return_qty) : 0;
+    const tariffPct =
+      tariffByCategory.get(String(p.category ?? "").toLowerCase()) || 24.5;
+    let commission = Math.round((priceRub * tariffPct) / 100);
+    let logistics = Number(p.logistics_cost ?? 0);
+    let storagePerUnit = 0;
+    if (ue && netQty > 0) {
+      commission = Math.round(
+        (Number(ue.commission_rub) + Number(ue.acquiring_rub)) / netQty,
+      );
+      logistics = Math.round(Number(ue.logistics_rub) / netQty);
+      storagePerUnit = Math.round(Number(ue.storage_rub) / netQty);
+    }
+    const profitPerUnit = priceRub - cost - commission - logistics - storagePerUnit;
     const totalViews = pa.reduce((t, a) => t + Number(a.views ?? 0), 0);
     const totalClicks = pa.reduce((t, a) => t + Number(a.clicks ?? 0), 0);
     const totalSpend = pa.reduce((t, a) => t + Number(a.sum ?? 0), 0);
@@ -1152,7 +1549,23 @@ export async function getRnpProducts(
         costPrice: cost,
         logistics,
         priceRub,
-        profitRub: Math.round(profitPerUnit * Math.max(winSalesQty, 1)),
+        // Прибыль за окно: факт (реализация − удержания − реклама − себестоимость),
+        // если отчёт WB уже покрыл окно; иначе оценка по прибыли с единицы
+        profitRub:
+          ue && Number(ue.revenue_rub) > 0
+            ? Math.round(
+                Number(ue.revenue_rub) -
+                  Number(ue.commission_rub) -
+                  Number(ue.acquiring_rub) -
+                  Number(ue.logistics_rub) -
+                  Number(ue.storage_rub) -
+                  Number(ue.acceptance_rub) -
+                  Number(ue.penalty_rub) -
+                  Number(ue.deduction_rub) -
+                  Number(ue.advert_rub) -
+                  cost * Math.max(netQty, 0),
+              )
+            : Math.round(profitPerUnit * Math.max(winSalesQty, 1)),
         marginPct: priceRub ? Math.round((profitPerUnit / priceRub) * 1000) / 10 : 0,
         profitabilityPct: cost ? Math.round((profitPerUnit / cost) * 1000) / 10 : 0,
         drrPct: ordersSumWin ? Math.round((totalSpend / ordersSumWin) * 1000) / 10 : 0,

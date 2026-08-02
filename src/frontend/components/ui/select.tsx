@@ -18,7 +18,15 @@ function collectItems(children: React.ReactNode, acc: LabeledItem[]): LabeledIte
     if (!React.isValidElement(child)) return
     if (child.type === SelectItem) {
       const props = child.props as SelectPrimitive.Item.Props
-      acc.push({ value: props.value ?? null, label: props.children })
+      const kids = props.children
+      acc.push({
+        value: props.value ?? null,
+        // Массив children (например `{emoji} {name}`) заворачиваем во фрагмент,
+        // иначе React ругается на отсутствие key при рендере подписи в кнопке
+        label: Array.isArray(kids)
+          ? React.createElement(React.Fragment, null, ...kids)
+          : kids,
+      })
       return
     }
     const nested = (child.props as { children?: React.ReactNode })?.children

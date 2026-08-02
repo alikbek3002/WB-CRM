@@ -666,6 +666,22 @@ export async function getPnlView(db: SupabaseClient, monthsBack = 6): Promise<Pn
     | { currency: string; current_amount: number; for_withdraw: number; checked_at: string }
     | null;
 
+  // Расшифровка «прочих удержаний» по видам операций (agg_deduction_details,
+  // 0035). Ошибка не роняет ОПиУ — до применения миграции строка просто пустая.
+  const dedRes = await db.rpc("agg_deduction_details", {
+    p_store: DEMO_STORE_ID,
+    p_since: sinceDate,
+  });
+  const deductionDetails = dedRes.error
+    ? []
+    : ((dedRes.data ?? []) as { month: string; oper_name: string; amount_rub: number }[]).map(
+        (r) => ({
+          month: String(r.month),
+          operName: String(r.oper_name),
+          amountRub: Math.round(Number(r.amount_rub)),
+        }),
+      );
+
   return {
     months,
     total,
@@ -692,6 +708,7 @@ export async function getPnlView(db: SupabaseClient, monthsBack = 6): Promise<Pn
           checkedAt: String(bal.checked_at),
         }
       : null,
+    deductionDetails,
   };
 }
 
@@ -730,19 +747,9 @@ export async function findAccounts(
     .map((a) => ({ id: a.id, name: a.name, currency: a.currency }));
 }
 
-// Счёт «по умолчанию» для голосового ввода («потратил 15 тысяч на рекламу»):
-// самый ходовой рублёвый счёт. Ассистент обязан назвать его в ответе, чтобы
-// человек заметил ошибку и поправил.
-export async function pickDefaultAccount(
-  db: SupabaseClient,
-): Promise<{ id: string; name: string; currency: Currency } | null> {
-  const { accounts } = await getCashOverview(db);
-  const rubles = accounts.filter((a) => a.currency === "rub");
-  const pool = rubles.length ? rubles : accounts;
-  if (!pool.length) return null;
-  const best = [...pool].sort((a, b) => b.txCount - a.txCount)[0];
-  return { id: best.id, name: best.name, currency: best.currency };
-}
+// «Счёт по умолчанию» удалён сознательно: молчаливое списание с угаданного
+// счёта — источник ошибок. ИИ теперь спрашивает счёт, если их несколько
+// (resolveAccountStrict в backend/ai/tools.ts).
 
 export async function findCategories(
   db: SupabaseClient,
@@ -762,19 +769,26 @@ export async function findCategories(
 
 // ─── Команда: кому платим ────────────────────────────────────────────────────
 
-export type MemberRef = { id: string; name: string; role: MemberRole; roleLabel: string };
+export type MemberRef = {
+  id: string;
+  name: string;
+  role: MemberRole;
+  roleLabel: string;
+  login: string | null;
+};
 
 // Сотрудники организации — справочник адресатов выплат для веба, бота и ИИ.
 export async function listMembers(db: SupabaseClient): Promise<MemberRef[]> {
   const { data, error } = await db
     .from("org_members")
-    .select("role, profile:profiles(id, full_name)")
+    .select("role, profile:profiles(id, full_name, login)")
     .eq("org_id", DEMO_ORG_ID)
     .limit(200);
   if (error) throw error;
+  type ProfileRow = { id: string; full_name: string | null; login: string | null };
   return ((data ?? []) as unknown as {
     role: MemberRole;
-    profile: { id: string; full_name: string | null } | { id: string; full_name: string | null }[] | null;
+    profile: ProfileRow | ProfileRow[] | null;
   }[])
     .map((m) => {
       const p = first(m.profile);
@@ -784,6 +798,7 @@ export async function listMembers(db: SupabaseClient): Promise<MemberRef[]> {
             name: p.full_name ?? "—",
             role: m.role,
             roleLabel: ROLE_LABELS[m.role] ?? String(m.role),
+            login: p.login ?? null,
           }
         : null;
     })
@@ -791,20 +806,24 @@ export async function listMembers(db: SupabaseClient): Promise<MemberRef[]> {
     .sort((a, b) => a.name.localeCompare(b.name, "ru"));
 }
 
-// Поиск сотрудника по id или по части имени — бот и ИИ получают «Азиз», а не uuid.
+// Поиск сотрудника по id, логину или части имени — бот и ИИ получают «Азиз», а не uuid.
 export async function findMembers(db: SupabaseClient, query: string): Promise<MemberRef[]> {
   const members = await listMembers(db);
   const q = query.trim().toLowerCase();
   if (!q) return members;
   const byId = members.filter((m) => m.id === q);
   if (byId.length) return byId;
+  const byLogin = members.filter((m) => (m.login ?? "").toLowerCase() === q);
+  if (byLogin.length) return byLogin;
   const exact = members.filter((m) => m.name.toLowerCase() === q);
   if (exact.length) return exact;
   const starts = members.filter((m) =>
     m.name.toLowerCase().split(/\s+/).some((part) => part.startsWith(q)),
   );
   if (starts.length) return starts;
-  return members.filter((m) => m.name.toLowerCase().includes(q));
+  return members.filter(
+    (m) => m.name.toLowerCase().includes(q) || (m.login ?? "").toLowerCase().startsWith(q),
+  );
 }
 
 async function findMember(db: SupabaseClient, id: string): Promise<MemberRef | null> {

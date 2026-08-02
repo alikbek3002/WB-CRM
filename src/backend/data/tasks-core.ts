@@ -30,6 +30,7 @@ type TaskRow = {
   title: string;
   status: string;
   assignee_id: string | null;
+  created_by: string | null;
   due_date: string | null;
   org_id: string;
 };
@@ -37,16 +38,19 @@ type TaskRow = {
 async function loadTask(db: SupabaseClient, taskId: string): Promise<TaskRow | null> {
   const { data, error } = await db
     .from("tasks")
-    .select("id, title, status, assignee_id, due_date, org_id")
+    .select("id, title, status, assignee_id, created_by, due_date, org_id")
     .eq("id", taskId)
     .maybeSingle();
   if (error) throw new Error(error.message);
   return (data as TaskRow) ?? null;
 }
 
-// Менять задачу может исполнитель либо руководитель (owner/admin/manager)
-function mayChange(task: TaskRow, actor: TaskActor): boolean {
-  return task.assignee_id === actor.id || isLead(actor.role);
+// Взять в работу / закрыть может ТОЛЬКО назначенный исполнитель — отчёт должен
+// принадлежать тому, кто делал работу. Задачу без исполнителя может взять
+// руководитель или её автор (при этом она самоназначается на актора).
+function mayExecute(task: TaskRow, actor: TaskActor): boolean {
+  if (task.assignee_id) return task.assignee_id === actor.id;
+  return isLead(actor.role) || task.created_by === actor.id;
 }
 
 // ── Взять в работу: open → in_progress ──────────────────────────────────────
@@ -57,8 +61,12 @@ export async function startTask(
 ): Promise<TaskResult> {
   const task = await loadTask(db, taskId);
   if (!task) return { ok: false, code: "not_found", message: "Задача не найдена." };
-  if (!mayChange(task, actor)) {
-    return { ok: false, code: "forbidden", message: "Можно менять только свои задачи." };
+  if (!mayExecute(task, actor)) {
+    return {
+      ok: false,
+      code: "forbidden",
+      message: "Взять задачу в работу может только назначенный исполнитель.",
+    };
   }
   if (task.status === "done") {
     return { ok: false, code: "conflict", message: "Задача уже закрыта." };
@@ -68,7 +76,12 @@ export async function startTask(
   }
   const { error } = await db
     .from("tasks")
-    .update({ status: "in_progress", updated_at: new Date().toISOString() })
+    .update({
+      status: "in_progress",
+      // Бесхозную задачу берёт на себя тот, кто стартовал
+      assignee_id: task.assignee_id ?? actor.id,
+      updated_at: new Date().toISOString(),
+    })
     .eq("id", taskId);
   if (error) return { ok: false, code: "db_error", message: error.message };
   return { ok: true, title: task.title, onTime: null, message: `«${task.title}» — взято в работу.` };
@@ -94,8 +107,12 @@ export async function completeTask(
 
   const task = await loadTask(db, taskId);
   if (!task) return { ok: false, code: "not_found", message: "Задача не найдена." };
-  if (!mayChange(task, actor)) {
-    return { ok: false, code: "forbidden", message: "Можно закрывать только свои задачи." };
+  if (!mayExecute(task, actor)) {
+    return {
+      ok: false,
+      code: "forbidden",
+      message: "Закрыть задачу может только назначенный исполнитель.",
+    };
   }
   if (task.status === "done") {
     return { ok: false, code: "conflict", message: "Задача уже закрыта." };
@@ -110,6 +127,7 @@ export async function completeTask(
     .from("tasks")
     .update({
       status: "done",
+      assignee_id: task.assignee_id ?? actor.id,
       completion_report: report.slice(0, TASK_REPORT_MAX),
       completed_at: new Date().toISOString(),
       completed_by: actor.id,

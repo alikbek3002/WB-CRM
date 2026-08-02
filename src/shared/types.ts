@@ -95,6 +95,27 @@ export type RnpProduct = {
   weeks: RnpWeek[];
 };
 
+// Происхождение себестоимости: руками / импорт из файла / из приёмки поставки
+export type CostPriceSource = "manual" | "import" | "supply";
+
+// Юнит-экономика товара за период (факт из отчётов WB, на единицу — где уместно)
+export type ProductUnitEcon = {
+  periodDays: number;
+  saleQty: number; // продано за период, шт (за вычетом возвратов)
+  priceRub: number; // средняя цена реализации за единицу
+  commissionRub: number; // комиссия WB + эквайринг, за единицу
+  logisticsRub: number; // логистика за единицу
+  storageRub: number; // хранение за единицу
+  acceptanceRub: number; // приёмка за единицу
+  advertRub: number; // реклама за единицу
+  costPrice: number; // себестоимость единицы
+  profitPerUnitRub: number;
+  profitRub: number; // прибыль за период (все продажи)
+  marginPct: number; // прибыль / выручка
+  roiPct: number; // прибыль / себестоимость проданного
+  drrPct: number; // реклама / выручка
+};
+
 export type ProductListItem = {
   id: string;
   nmId: number;
@@ -104,9 +125,12 @@ export type ProductListItem = {
   category: string;
   status: string;
   costPrice: number;
+  costPriceSource: CostPriceSource;
+  costPriceUpdatedAt: string | null;
   logisticsCost: number;
   stockQty: number;
   responsible: string;
+  econ: ProductUnitEcon | null; // юнит-экономика за 30 дней (null — продаж не было)
   // Контент WB (фото/описание/цены — из синхронизации кабинета)
   photoUrl: string | null;
   photos: string[]; // галерея (big)
@@ -356,6 +380,67 @@ export type PnlView = {
   advertSpendRub: number; // расход на рекламу из кабинета WB
   currency: string; // валюта кабинета из отчёта WB: RUB, KGS…
   wbBalance: { currency: string; current: number; forWithdraw: number; checkedAt: string } | null;
+  // Из чего складываются «прочие удержания» (самовыкупы, подмены…) по месяцам
+  deductionDetails: { month: string; operName: string; amountRub: number }[];
+};
+
+// ─── Юнит-экономика (страница «Экономика») ───────────────────────────────────
+
+export type UnitEconRow = {
+  nmId: number; // 0 — «нераспределённое»: медийная реклама, хранение/удержания без товара
+  title: string;
+  photoUrl: string | null;
+  category: string;
+  saleQty: number; // продано − возвраты, шт
+  revenueRub: number;
+  commissionRub: number; // комиссия WB
+  acquiringRub: number;
+  logisticsRub: number;
+  storageRub: number;
+  acceptanceRub: number;
+  penaltyRub: number;
+  deductionRub: number;
+  advertRub: number;
+  drrPct: number; // реклама / выручка
+  costPrice: number; // себестоимость единицы
+  costPriceSource: CostPriceSource | null;
+  cogsRub: number; // себестоимость проданного за период
+  profitRub: number;
+  profitPerUnitRub: number;
+  marginPct: number;
+  roiPct: number;
+};
+
+export type UnitEconView = {
+  from: string; // yyyy-mm-dd
+  to: string;
+  days: number;
+  rows: UnitEconRow[]; // товары, отсортированы по прибыли
+  unallocated: UnitEconRow | null; // nm_id=0 + сверка хранения/приёмки с финотчётом
+  totals: {
+    saleQty: number;
+    revenueRub: number;
+    wbFeesRub: number;
+    advertRub: number;
+    cogsRub: number;
+    profitRub: number;
+    marginPct: number;
+  };
+  storageSource: "daily" | "finance"; // откуда хранение: детальный отчёт или финотчёт
+  costCoveragePct: number; // % проданных штук с заполненной себестоимостью
+};
+
+// ─── Поставки FBW (приёмки складов WB) ───────────────────────────────────────
+
+export type WbIncomeGroup = {
+  incomeId: number;
+  date: string; // дата поставки, yyyy-mm-dd
+  dateClose: string | null; // дата принятия
+  warehouse: string;
+  totalQty: number;
+  positions: number; // позиций (артикулов)
+  status: string;
+  items: { nmId: number; title: string; qty: number }[]; // топ-позиции
 };
 
 export type TaskItem = {
@@ -366,6 +451,7 @@ export type TaskItem = {
   priority: "low" | "normal" | "high" | "urgent";
   assignee: string;
   assigneeId: string | null; // кто может закрывать (исполнитель) — для UI-кнопок
+  createdById: string | null; // автор задачи (может брать бесхозные свои задачи)
   dueDate: string | null;
   productLabel: string | null;
   // Отчёт о выполнении (обязателен при закрытии — миграция 0023)
@@ -526,6 +612,34 @@ export type ReportsBoard = {
   pending: number;
   items: DutyItem[]; // все назначения дня по всем сотрудникам (с отчётами)
 };
+
+// ─── Статистика дисциплины регламента за период ──────────────────────────────
+
+export type DutyGrade = "good" | "ok" | "bad";
+
+export type DutyEmployeeStat = {
+  assigneeId: string;
+  assigneeName: string;
+  total: number; // назначений за период (сегодняшние pending не в счёт)
+  done: number;
+  missed: number;
+  doneOnTime: number; // закрыто до дедлайна (по completed_at <= due_at)
+  completionPct: number; // 0..100
+  onTimePct: number; // 0..100
+  score: number; // 0..100 — половина за выполнение, половина за своевременность
+  grade: DutyGrade; // ≥80 good · 50–79 ok · <50 bad
+  problems: { title: string; missed: number; late: number }[]; // топ-3 срываемых
+};
+
+export type DutyStatsPeriod = {
+  days: 7 | 30;
+  from: string; // yyyy-mm-dd
+  employees: DutyEmployeeStat[]; // отсортированы по score (лучшие сверху)
+  teamCompletionPct: number;
+  teamOnTimePct: number;
+};
+
+export type DutyStats = { d7: DutyStatsPeriod; d30: DutyStatsPeriod };
 
 // ─── Остатки по складам (страница «Остатки») ─────────────────────────────────
 

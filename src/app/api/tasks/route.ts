@@ -23,12 +23,14 @@ export async function GET() {
   if (!can(session.role, "tasks:view")) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
-  // viewer видит только свои задачи (раздел 5.1) — в демо фильтруем по имени
+  // Руководители видят все задачи, остальные — только свои и созданные ими
   const tasks = await getTasks();
-  const visible =
-    session.role === "viewer"
-      ? tasks.filter((t) => t.assignee === session.user.name)
-      : tasks;
+  const lead = ["owner", "admin", "manager"].includes(session.role);
+  const visible = lead
+    ? tasks
+    : tasks.filter(
+        (t) => t.assigneeId === session.user.id || t.createdById === session.user.id,
+      );
   return NextResponse.json({ tasks: visible });
 }
 
@@ -80,6 +82,8 @@ export async function POST(request: Request) {
       due_date: parsed.data.dueDate ?? null,
       status: "open",
       assignee_id: assigneeId,
+      // Демо-сессии имеют id вида "demo-<role>" — в uuid-колонку такое не пишем
+      created_by: UUID.test(session.user.id) ? session.user.id : null,
     })
     .select("id")
     .single();

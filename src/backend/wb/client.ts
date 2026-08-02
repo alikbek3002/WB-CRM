@@ -391,6 +391,275 @@ export function fetchAdvertStats(
   return wbFetch<WbAdvertStat[]>(url, token, undefined, timeoutMs).then((r) => r ?? []);
 }
 
+// ─── Поставки FBW (supplies-api) ─────────────────────────────────────────────
+// Старый statistics /supplier/incomes удалён WB (404, проверено 2026-08).
+// Актуальный источник — Supplies API: POST /supplies (список), затем по каждой
+// поставке GET /{id} (склад, статус, стоимость приёмки) и GET /{id}/goods
+// (разбивка по товарам). Проверено вживую на кабинете.
+
+const SUPPLIES = "https://supplies-api.wildberries.ru";
+
+export type WbSupplyListItem = {
+  supplyID: number | null; // null — черновик (только preorderID)
+  preorderID: number | null;
+  createDate?: string;
+  supplyDate?: string | null;
+  factDate?: string | null;
+  updatedDate?: string;
+  statusID: number;
+};
+
+export function fetchWbSupplyList(
+  token: string,
+  limit = 500,
+): Promise<WbSupplyListItem[]> {
+  return wbFetch<WbSupplyListItem[]>(
+    `${SUPPLIES}/api/v1/supplies`,
+    token,
+    { method: "POST", body: JSON.stringify({ limit, next: 0 }) },
+    60_000,
+  ).then((r) => r ?? []);
+}
+
+export type WbSupplyDetail = {
+  statusID: number;
+  createDate?: string;
+  supplyDate?: string | null;
+  factDate?: string | null;
+  updatedDate?: string;
+  warehouseName?: string;
+  actualWarehouseName?: string;
+  acceptanceCost?: number;
+  quantity?: number;
+  acceptedQuantity?: number;
+};
+
+export function fetchWbSupplyDetail(token: string, supplyId: number): Promise<WbSupplyDetail> {
+  return wbFetch<WbSupplyDetail>(`${SUPPLIES}/api/v1/supplies/${supplyId}`, token, undefined, 30_000);
+}
+
+export type WbSupplyGood = {
+  barcode?: string;
+  vendorCode?: string;
+  nmID: number;
+  techSize?: string;
+  color?: string;
+  quantity?: number;
+  acceptedQuantity?: number;
+  readyForSaleQuantity?: number;
+};
+
+export function fetchWbSupplyGoods(token: string, supplyId: number): Promise<WbSupplyGood[]> {
+  return wbFetch<WbSupplyGood[]>(
+    `${SUPPLIES}/api/v1/supplies/${supplyId}/goods`,
+    token,
+    undefined,
+    30_000,
+  ).then((r) => r ?? []);
+}
+
+// ─── Seller Analytics: async-отчёты (платное хранение, платная приёмка) ─────
+// Одинаковый каркас с warehouse_remains: создать задачу → поллинг → скачать.
+// Лимит: ~1 создание задачи в минуту на отчёт — паузы делает вызывающая сторона.
+
+async function fetchAnalyticsTaskReport<T>(
+  token: string,
+  path: string,
+  query: string,
+): Promise<T[]> {
+  const created = await wbFetch<{ data: { taskId: string } }>(
+    `${ANALYTICS}/api/v1/${path}?${query}`,
+    token,
+    undefined,
+    30_000,
+  );
+  const taskId = created.data.taskId;
+
+  for (let i = 0; i < 24; i++) {
+    await new Promise((r) => setTimeout(r, 5_000));
+    const st = await wbFetch<{ data: { status: string } }>(
+      `${ANALYTICS}/api/v1/${path}/tasks/${taskId}/status`,
+      token,
+      undefined,
+      15_000,
+    );
+    if (st.data.status === "done") break;
+    if (i === 23) throw new Error(`${path}: отчёт не готов за 2 мин`);
+  }
+
+  // Пустой отчёт WB отдаёт 200 без тела → res.json() кидает SyntaxError
+  const rows = await wbFetch<T[]>(
+    `${ANALYTICS}/api/v1/${path}/tasks/${taskId}/download`,
+    token,
+    undefined,
+    120_000,
+  ).catch((e) => {
+    if (e instanceof SyntaxError) return [] as T[];
+    throw e;
+  });
+  return rows ?? [];
+}
+
+// Платное хранение по товару/дню/складу. Окно задачи — максимум 8 дней.
+export type WbStorageRow = {
+  date: string;
+  warehouse?: string;
+  warehousePrice?: number; // стоимость хранения за день, ₽
+  barcodesCount?: number;
+  volume?: number;
+  nmId: number;
+  chrtId?: number;
+  size?: string;
+  barcode?: string;
+};
+
+export function fetchPaidStorage(
+  token: string,
+  dateFrom: string,
+  dateTo: string,
+): Promise<WbStorageRow[]> {
+  return fetchAnalyticsTaskReport<WbStorageRow>(
+    token,
+    "paid_storage",
+    `dateFrom=${dateFrom}&dateTo=${dateTo}`,
+  );
+}
+
+// Платная приёмка по поставкам. Окно задачи — максимум 31 день.
+export type WbAcceptanceRow = {
+  incomeId: number;
+  nmID: number;
+  giCreateDate?: string;
+  count?: number;
+  total?: number; // стоимость приёмки, ₽
+  subjectName?: string;
+};
+
+export function fetchAcceptanceReport(
+  token: string,
+  dateFrom: string,
+  dateTo: string,
+): Promise<WbAcceptanceRow[]> {
+  return fetchAnalyticsTaskReport<WbAcceptanceRow>(
+    token,
+    "acceptance_report",
+    `dateFrom=${dateFrom}&dateTo=${dateTo}`,
+  );
+}
+
+// ─── Seller Analytics: воронка продаж по дням (sales-funnel v3) ───────────────
+// Старый nm-report удалён WB (404, проверено 2026-08); актуальный метод —
+// /api/analytics/v3/sales-funnel/products/history: {selectedPeriod:{start,end},
+// nmIds:[…]} → [{product:{nmId…}, history:[{date, openCount, cartCount…}]}].
+// Лимиты консервативно как у nm-report: ≤20 nmId, окно ≤7 дней, паузы 20+ с.
+
+export type WbFunnelHistoryDay = {
+  date: string;
+  openCount?: number; // переходы в карточку
+  cartCount?: number; // корзина
+  orderCount?: number;
+  orderSum?: number;
+  buyoutCount?: number;
+  buyoutSum?: number;
+  buyoutPercent?: number;
+  addToCartConversion?: number;
+  cartToOrderConversion?: number;
+};
+
+export type WbFunnelHistoryRow = {
+  product?: { nmId: number; title?: string; vendorCode?: string };
+  history?: WbFunnelHistoryDay[];
+};
+
+export async function fetchSalesFunnelHistory(
+  token: string,
+  nmIds: number[],
+  start: string,
+  end: string,
+  timeoutMs = 120_000, // 20 nmId × 7 дней бывает медленным — 60 с не хватало
+): Promise<WbFunnelHistoryRow[]> {
+  const res = await wbFetch<WbFunnelHistoryRow[]>(
+    `${ANALYTICS}/api/analytics/v3/sales-funnel/products/history`,
+    token,
+    {
+      method: "POST",
+      body: JSON.stringify({ selectedPeriod: { start, end }, nmIds }),
+    },
+    timeoutMs,
+  );
+  return res ?? [];
+}
+
+// ─── Тарифы WB (common-api): комиссия по категориям, логистика/хранение ─────
+
+export type WbCommissionTariff = {
+  subjectID: number;
+  subjectName?: string;
+  parentID?: number;
+  parentName?: string;
+  kgvpMarketplace?: number; // FBW, %
+  kgvpSupplier?: number; // FBS, %
+  kgvpSupplierExpress?: number;
+  paidStorageKgvp?: number;
+};
+
+export async function fetchCommissionTariffs(token: string): Promise<WbCommissionTariff[]> {
+  const res = await wbFetch<{ report?: WbCommissionTariff[] }>(
+    "https://common-api.wildberries.ru/api/v1/tariffs/commission?locale=ru",
+    token,
+    undefined,
+    30_000,
+  );
+  return res.report ?? [];
+}
+
+// Тарифы отдаются строками с запятой («48,5») — приводим к числу
+function numComma(v: unknown): number {
+  const n = Number(String(v ?? "0").replace(",", "."));
+  return Number.isFinite(n) ? n : 0;
+}
+
+export type WbBoxTariff = {
+  warehouseName: string;
+  deliveryBase: number;
+  deliveryLiter: number;
+  storageBase: number;
+  storageLiter: number;
+  exprPct: number;
+  dtFrom: string | null;
+  dtTill: string | null;
+};
+
+export async function fetchBoxTariffs(token: string, date: string): Promise<WbBoxTariff[]> {
+  const res = await wbFetch<{
+    response?: {
+      data?: {
+        dtNextBox?: string;
+        dtTillMax?: string;
+        warehouseList?: Record<string, unknown>[];
+      };
+    };
+  }>(
+    `https://common-api.wildberries.ru/api/v1/tariffs/box?date=${date}`,
+    token,
+    undefined,
+    30_000,
+  );
+  const data = res.response?.data;
+  return (data?.warehouseList ?? [])
+    .filter((w) => w.warehouseName)
+    .map((w) => ({
+      warehouseName: String(w.warehouseName),
+      deliveryBase: numComma(w.boxDeliveryBase),
+      deliveryLiter: numComma(w.boxDeliveryLiter),
+      storageBase: numComma(w.boxStorageBase),
+      storageLiter: numComma(w.boxStorageLiter),
+      exprPct: numComma(w.boxDeliveryCoefExpr ?? w.boxDeliveryAndStorageExpr),
+      dtFrom: data?.dtNextBox ? String(data.dtNextBox).slice(0, 10) : null,
+      dtTill: data?.dtTillMax ? String(data.dtTillMax).slice(0, 10) : null,
+    }));
+}
+
 // ─── Скоупы токена (для карточки интеграции) ─────────────────────────────────
 
 const SCOPE_BITS: Record<number, string> = {

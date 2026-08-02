@@ -14,6 +14,12 @@ export default async function TasksPage() {
 
   const [tasks, team] = await Promise.all([getTasks(), getTeam()]);
   const canAssign = ["owner", "admin", "manager"].includes(session.role);
+  // Руководители видят всю доску; специалист — только свои и созданные им
+  const visibleTasks = canAssign
+    ? tasks
+    : tasks.filter(
+        (t) => t.assigneeId === session.user.id || t.createdById === session.user.id,
+      );
   const teamOptions = team.map((m) => ({
     id: m.id,
     name: m.name,
@@ -33,7 +39,7 @@ export default async function TasksPage() {
         {canAssign && <TaskForm team={teamOptions} />}
       </div>
 
-      <TaskBoard tasks={tasks} userId={session.user.id} canLead={canAssign} />
+      <TaskBoard tasks={visibleTasks} userId={session.user.id} canLead={canAssign} />
     </div>
   );
 }
