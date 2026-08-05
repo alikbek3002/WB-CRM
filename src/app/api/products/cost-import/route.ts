@@ -5,7 +5,7 @@ import { DEMO_STORE_ID } from "@/shared/constants";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
-import { invalidateWbData } from "@/backend/data/revalidate";
+import { invalidateWbData, PRODUCT_SCOPES } from "@/backend/data/revalidate";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -300,7 +300,7 @@ export async function POST(request: Request) {
   );
   if (histErr) console.error("[cost-import] history insert failed:", histErr);
 
-  invalidateWbData();
+  invalidateWbData(...PRODUCT_SCOPES);
   return NextResponse.json({
     ok: true,
     mode,

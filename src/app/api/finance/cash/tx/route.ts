@@ -4,7 +4,7 @@ import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
 import { createCashTx, deleteCashTx } from "@/backend/data/cash-core";
-import { invalidateWbData } from "@/backend/data/revalidate";
+import { invalidateWbData, MONEY_SCOPES } from "@/backend/data/revalidate";
 
 export const runtime = "nodejs";
 
@@ -59,7 +59,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: result.code, message: result.message }, { status });
   }
 
-  invalidateWbData();
+  invalidateWbData(...MONEY_SCOPES);
   return NextResponse.json({
     ok: true,
     persisted: true,
@@ -98,6 +98,6 @@ export async function DELETE(request: Request) {
     return NextResponse.json({ error: result.code, message: result.message }, { status });
   }
 
-  invalidateWbData();
+  invalidateWbData(...MONEY_SCOPES);
   return NextResponse.json({ ok: true, persisted: true });
 }

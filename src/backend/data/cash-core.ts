@@ -476,7 +476,15 @@ export async function getPnlView(db: SupabaseClient, monthsBack = 6): Promise<Pn
   const sinceDate = isoDay(monthStart(monthsBack - 1));
   const today = isoDay(new Date());
 
-  const [salesRes, cogsRes, expRes, incomeRes, advRes, slicesRes, wbRes, balRes] =
+  // Все девять чтений — одним заходом. Раньше расшифровка удержаний
+  // (agg_deduction_details) ждала своей очереди уже ПОСЛЕ разбора остальных
+  // ответов и добавляла ОПиУ лишнюю круговую задержку на холодном кэше.
+  //
+  // Самое дорогое здесь — agg_wb_finance_monthly: сворачивает ~534k строк
+  // raw_finance_report (13 сумм на строку). Индексом это не ускорить — под
+  // условие периода попадает вся таблица, seq scan тут и есть верный план.
+  // Держится тёплым кэшем чтения (30 мин + прогрев после синка).
+  const [salesRes, cogsRes, expRes, incomeRes, advRes, slicesRes, wbRes, balRes, dedRes] =
     await Promise.all([
       db.rpc("agg_sales_monthly", { p_store: DEMO_STORE_ID, p_since: `${sinceDate}T00:00:00` }),
       db.rpc("agg_cogs_monthly", { p_store: DEMO_STORE_ID, p_since: `${sinceDate}T00:00:00` }),
@@ -490,6 +498,8 @@ export async function getPnlView(db: SupabaseClient, monthsBack = 6): Promise<Pn
         .select("currency, current_amount, for_withdraw, checked_at")
         .eq("store_id", DEMO_STORE_ID)
         .maybeSingle(),
+      // Ошибка не роняет ОПиУ — до применения миграции строка просто пустая
+      db.rpc("agg_deduction_details", { p_store: DEMO_STORE_ID, p_since: sinceDate }),
     ]);
   for (const r of [salesRes, cogsRes, expRes, incomeRes, advRes, slicesRes, wbRes]) {
     if (r.error) throw r.error;
@@ -666,12 +676,7 @@ export async function getPnlView(db: SupabaseClient, monthsBack = 6): Promise<Pn
     | { currency: string; current_amount: number; for_withdraw: number; checked_at: string }
     | null;
 
-  // Расшифровка «прочих удержаний» по видам операций (agg_deduction_details,
-  // 0035). Ошибка не роняет ОПиУ — до применения миграции строка просто пустая.
-  const dedRes = await db.rpc("agg_deduction_details", {
-    p_store: DEMO_STORE_ID,
-    p_since: sinceDate,
-  });
+  // Расшифровка «прочих удержаний» по видам операций (agg_deduction_details, 0035)
   const deductionDetails = dedRes.error
     ? []
     : ((dedRes.data ?? []) as { month: string; oper_name: string; amount_rub: number }[]).map(
@@ -1057,14 +1062,22 @@ export async function createCashTx(
 export async function mirrorSupplyPaymentToCash(
   db: SupabaseClient,
   actor: CashActor,
-  payment: { id: string; kind: "goods" | "cargo"; amount: number; currency: Currency; paidAt: string; note?: string | null; supplyTitle?: string | null },
+  payment: { id: string; kind: "goods" | "cargo" | "fulfillment"; amount: number; currency: Currency; paidAt: string; note?: string | null; supplyTitle?: string | null },
 ): Promise<boolean> {
   try {
     const { accounts, categories } = await getFinanceRefs(db);
     const account = accounts.find((a) => a.currency === payment.currency);
     if (!account) return false;
 
-    const wanted = payment.kind === "goods" ? "Закуп товара" : "Карго и доставка";
+    // Все три статьи имеют in_pnl = false (миграция 0037): эти деньги входят
+    // в себестоимость единицы и списываются в прибыль через себестоимость
+    // проданного. Учитывать их ещё и расходом периода — двойной счёт.
+    const wanted =
+      payment.kind === "goods"
+        ? "Закуп товара"
+        : payment.kind === "cargo"
+          ? "Карго и доставка"
+          : "Фулфилмент";
     const category =
       categories.find((c) => c.direction === "out" && c.name === wanted) ??
       categories.find((c) => c.direction === "out" && c.name === "Прочие расходы");

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
+import { invalidateWbData } from "@/backend/data/revalidate";
 import { notifyProfile, notifyRoles, tgEsc } from "@/backend/telegram/notify";
 
 export const runtime = "nodejs";
@@ -126,5 +127,6 @@ export async function PATCH(
     );
   }
 
+  invalidateWbData("design");
   return NextResponse.json({ ok: true, persisted: true, status: transition.to });
 }

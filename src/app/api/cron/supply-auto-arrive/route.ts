@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { SUPPLY_AUTO_ARRIVE_DAYS } from "@/shared/constants";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
-import { invalidateWbData } from "@/backend/data/revalidate";
+import { invalidateWbData, SUPPLY_SCOPES } from "@/backend/data/revalidate";
 
 export const runtime = "nodejs";
 
@@ -42,6 +42,6 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "db_error" }, { status: 500 });
   }
 
-  if ((data?.length ?? 0) > 0) invalidateWbData();
+  if ((data?.length ?? 0) > 0) invalidateWbData(...SUPPLY_SCOPES);
   return NextResponse.json({ ok: true, persisted: true, updated: data?.length ?? 0 });
 }

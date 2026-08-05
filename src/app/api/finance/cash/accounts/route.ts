@@ -59,7 +59,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: result.code, message: result.message }, { status });
   }
 
-  invalidateWbData();
+  invalidateWbData("cash", "finance-refs");
   return NextResponse.json({ ok: true, persisted: true, id: result.id });
 }
 
@@ -95,6 +95,6 @@ export async function PATCH(request: Request) {
     return NextResponse.json({ error: "db_error", message: error.message }, { status: 500 });
   }
 
-  invalidateWbData();
+  invalidateWbData("cash", "finance-refs");
   return NextResponse.json({ ok: true, persisted: true });
 }

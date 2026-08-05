@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { ImageOff, LayoutGrid, List } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { ImageOff, LayoutGrid, List, SearchX } from "lucide-react";
 import { Badge } from "@/frontend/components/ui/badge";
 import { Button } from "@/frontend/components/ui/button";
 import { Card, CardContent } from "@/frontend/components/ui/card";
@@ -18,8 +18,17 @@ import {
   ProductDialog,
 } from "@/frontend/components/products/product-card-dialog";
 import { CostImportDialog } from "@/frontend/components/products/cost-import-dialog";
+import {
+  applyFilters,
+  EMPTY_FILTERS,
+  ProductsFilters,
+  type ProductFilters,
+} from "@/frontend/components/products/products-filters";
 import { ProductForm } from "@/frontend/components/products/product-form";
-import { RecoButton } from "@/frontend/components/products/reco-button";
+import {
+  catalogContext,
+  RecoButton,
+} from "@/frontend/components/products/reco-button";
 import { formatNumber, formatRub } from "@/shared/format";
 import type { ProductListItem } from "@/shared/types";
 
@@ -41,9 +50,11 @@ function coverClass(days: number | null): string {
 function GridCard({
   product,
   canEdit,
+  catalog,
 }: {
   product: ProductListItem;
   canEdit: boolean;
+  catalog?: ReturnType<typeof catalogContext>;
 }) {
   const [open, setOpen] = useState(false);
 
@@ -121,13 +132,18 @@ function GridCard({
               onClick={(e) => e.stopPropagation()}
               onKeyDown={(e) => e.stopPropagation()}
             >
-              {product.isWeak && <RecoButton product={product} />}
+              {product.isWeak && <RecoButton product={product} catalog={catalog} />}
               {canEdit && <ProductForm product={product} />}
             </div>
           )}
         </div>
       </div>
-      <ProductDialog product={product} open={open} onOpenChange={setOpen} />
+      <ProductDialog
+        product={product}
+        open={open}
+        onOpenChange={setOpen}
+        catalog={catalog}
+      />
     </>
   );
 }
@@ -137,9 +153,11 @@ function GridCard({
 function ProductsTable({
   products,
   canEdit,
+  catalog,
 }: {
   products: ProductListItem[];
   canEdit: boolean;
+  catalog?: ReturnType<typeof catalogContext>;
 }) {
   return (
     <Card className="py-0">
@@ -165,7 +183,7 @@ function ProductsTable({
               <TableRow key={p.id}>
                 <TableCell>
                   <div className="flex items-center gap-2">
-                    <ProductCell product={p} />
+                    <ProductCell product={p} catalog={catalog} />
                     {p.isWeak && (
                       <Badge
                         variant="outline"
@@ -226,7 +244,7 @@ function ProductsTable({
                 </TableCell>
                 <TableCell className="text-right">
                   <div className="flex items-center justify-end gap-1">
-                    {p.isWeak && <RecoButton product={p} />}
+                    {p.isWeak && <RecoButton product={p} catalog={catalog} />}
                     {canEdit && <ProductForm product={p} />}
                   </div>
                 </TableCell>
@@ -249,6 +267,15 @@ export function ProductsView({
   canEdit: boolean;
 }) {
   const [view, setView] = useState<ViewMode>("cards");
+  const [filters, setFilters] = useState<ProductFilters>(EMPTY_FILTERS);
+
+  // Отбор идёт на клиенте: список товаров уже целиком пришёл с сервера, поэтому
+  // поиск и фильтры срабатывают мгновенно, без похода за данными.
+  const visible = useMemo(() => applyFilters(products, filters), [products, filters]);
+
+  // Медианы каталога считаем один раз и отдаём в разбор ИИ — чтобы он сравнивал
+  // товар с остальными товарами ЭТОГО продавца, а не с выдуманным рынком.
+  const catalog = useMemo(() => catalogContext(products), [products]);
 
   // Выбор вида сохраняется между визитами (localStorage, после маунта —
   // чтобы SSR-разметка не расходилась с клиентом)
@@ -277,43 +304,56 @@ export function ProductsView({
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <div className="text-sm text-muted-foreground">
-          {formatNumber(products.length)} товаров
-        </div>
-        <div className="flex items-center gap-2">
-          {canEdit && <CostImportDialog />}
-        <div className="flex gap-1 rounded-lg border border-border/60 p-0.5">
-          <Button
-            size="xs"
-            variant={view === "cards" ? "secondary" : "ghost"}
-            onClick={() => switchView("cards")}
-            aria-label="Карточки"
-          >
-            <LayoutGrid className="size-3.5" />
-            Карточки
-          </Button>
-          <Button
-            size="xs"
-            variant={view === "table" ? "secondary" : "ghost"}
-            onClick={() => switchView("table")}
-            aria-label="Список"
-          >
-            <List className="size-3.5" />
-            Список
-          </Button>
-        </div>
-        </div>
-      </div>
+      <ProductsFilters
+        products={products}
+        shown={visible.length}
+        filters={filters}
+        onChange={setFilters}
+        right={
+          <>
+            {canEdit && <CostImportDialog />}
+            <div className="flex gap-1 rounded-lg border border-border/60 p-0.5">
+              <Button
+                size="xs"
+                variant={view === "cards" ? "secondary" : "ghost"}
+                onClick={() => switchView("cards")}
+                aria-label="Карточки"
+              >
+                <LayoutGrid className="size-3.5" />
+                Карточки
+              </Button>
+              <Button
+                size="xs"
+                variant={view === "table" ? "secondary" : "ghost"}
+                onClick={() => switchView("table")}
+                aria-label="Список"
+              >
+                <List className="size-3.5" />
+                Список
+              </Button>
+            </div>
+          </>
+        }
+      />
 
-      {view === "cards" ? (
+      {visible.length === 0 ? (
+        <Card>
+          <CardContent className="flex flex-col items-center gap-2 py-12 text-center text-sm text-muted-foreground">
+            <SearchX className="size-6" />
+            Под фильтры не подошёл ни один товар.
+            <Button size="sm" variant="outline" onClick={() => setFilters(EMPTY_FILTERS)}>
+              Сбросить фильтры
+            </Button>
+          </CardContent>
+        </Card>
+      ) : view === "cards" ? (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
-          {products.map((p) => (
-            <GridCard key={p.id} product={p} canEdit={canEdit} />
+          {visible.map((p) => (
+            <GridCard key={p.id} product={p} canEdit={canEdit} catalog={catalog} />
           ))}
         </div>
       ) : (
-        <ProductsTable products={products} canEdit={canEdit} />
+        <ProductsTable products={visible} canEdit={canEdit} catalog={catalog} />
       )}
     </div>
   );

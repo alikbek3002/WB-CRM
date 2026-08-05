@@ -59,6 +59,17 @@ export function effectiveSupplyStatus(
   return { status, autoArrived: false };
 }
 
+export type SupplyItemInput = {
+  id: string;
+  productId: string | null;
+  title: string;
+  quantity: number;
+  receivedQty: number | null;
+  sewingCost: number;
+  sewingCurrency: Currency;
+  sewingRateToRub: number | null;
+};
+
 export type SupplyInput = {
   id: string;
   factoryId: string;
@@ -72,33 +83,100 @@ export type SupplyInput = {
   sewingCurrency: Currency;
   cargoCost: number;
   cargoCurrency: Currency;
+  cargoRateToRub: number | null;
   status: SupplyStatus;
   receivedAt: string | null;
   receivedQty: number | null;
   receiptComment: string | null;
   transitDays: number | null;
   responsible: string;
+  items: SupplyItemInput[];
+  fulfillmentPartnerId: string | null;
+  fulfillmentPartnerName: string | null;
+  fulfillmentRatePerUnitRub: number;
+  fulfillmentCostRub: number | null; // факт; null → тариф × принято
   payments: SupplyPayment[];
   distributions: WbDistribution[];
 };
 
-// Сборка карточки Supply с вычислимыми полями (оплаты в ₽, недостача, срок, авто-статус)
+// Сборка карточки Supply с вычислимыми полями (оплаты в ₽, недостача, срок,
+// авто-статус, себестоимость единицы по позициям).
 export function assembleSupply(input: SupplyInput): Supply {
   const eff = effectiveSupplyStatus(input.status, input.shipDate);
-  const paidGoodsRub = input.payments
-    .filter((p) => p.kind === "goods")
-    .reduce((t, p) => t + toRub(p.amount, p.currency), 0);
-  const paidCargoRub = input.payments
-    .filter((p) => p.kind === "cargo")
-    .reduce((t, p) => t + toRub(p.amount, p.currency), 0);
-  const totalDueRub =
-    toRub(input.sewingCost, input.sewingCurrency) + toRub(input.cargoCost, input.cargoCurrency);
-  const owedRub = Math.max(0, totalDueRub - paidGoodsRub - paidCargoRub);
+  const paidOf = (kind: SupplyPayment["kind"]) =>
+    input.payments
+      .filter((p) => p.kind === kind)
+      .reduce((t, p) => t + toRub(p.amount, p.currency), 0);
+  const paidGoodsRub = paidOf("goods");
+  const paidCargoRub = paidOf("cargo");
+  const paidFulfillmentRub = paidOf("fulfillment");
 
+  // Позиции: если их нет — синтетическая одна из полей самой поставки
+  // (карточки, заведённые до миграции 0037).
+  const rawItems: SupplyItemInput[] = input.items.length
+    ? input.items
+    : [
+        {
+          id: input.id,
+          productId: input.productId,
+          title: input.title,
+          quantity: input.quantity,
+          receivedQty: input.receivedQty,
+          sewingCost: input.sewingCost,
+          sewingCurrency: input.sewingCurrency,
+          sewingRateToRub: null,
+        },
+      ];
+
+  const qtyOf = (i: SupplyItemInput) =>
+    i.receivedQty != null && i.receivedQty > 0 ? i.receivedQty : i.quantity;
+  const totalQty = rawItems.reduce((t, i) => t + qtyOf(i), 0);
+
+  // Начисление фул-фирме: фактическая сумма важнее тарифа
+  const fulfillmentRub =
+    input.fulfillmentCostRub != null && input.fulfillmentCostRub > 0
+      ? input.fulfillmentCostRub
+      : Math.round(input.fulfillmentRatePerUnitRub * totalQty);
+
+  const cargoRubTotal = toRub(input.cargoCost, input.cargoCurrency);
+  const cargoPerUnit = totalQty > 0 ? cargoRubTotal / totalQty : 0;
+  const ffPerUnit = totalQty > 0 ? fulfillmentRub / totalQty : 0;
+  const r2 = (n: number) => Math.round(n * 100) / 100;
+
+  const items = rawItems.map((i) => {
+    const qty = qtyOf(i);
+    const sewingRub = qty > 0 ? toRub(i.sewingCost, i.sewingCurrency) / qty : 0;
+    return {
+      id: i.id,
+      productId: i.productId,
+      title: i.title,
+      quantity: i.quantity,
+      receivedQty: i.receivedQty,
+      sewingCost: i.sewingCost,
+      sewingCurrency: i.sewingCurrency,
+      sewingRub: r2(sewingRub),
+      cargoRub: r2(cargoPerUnit),
+      fulfillmentRub: r2(ffPerUnit),
+      unitCostRub: r2(sewingRub + cargoPerUnit + ffPerUnit),
+    };
+  });
+
+  const sewingTotalRub = rawItems.reduce(
+    (t, i) => t + toRub(i.sewingCost, i.sewingCurrency),
+    0,
+  );
+  const totalDueRub = sewingTotalRub + cargoRubTotal + fulfillmentRub;
+  const owedRub = Math.max(
+    0,
+    totalDueRub - paidGoodsRub - paidCargoRub - paidFulfillmentRub,
+  );
+
+  const shippedQty = rawItems.reduce((t, i) => t + i.quantity, 0);
+  const receivedTotal = rawItems.some((i) => i.receivedQty != null)
+    ? rawItems.reduce((t, i) => t + (i.receivedQty ?? 0), 0)
+    : null;
   const shortage =
-    input.receivedQty != null && input.receivedQty < input.quantity
-      ? input.quantity - input.receivedQty
-      : 0;
+    receivedTotal != null && receivedTotal < shippedQty ? shippedQty - receivedTotal : 0;
 
   const distributedQty = input.distributions.reduce((t, d) => t + d.quantity, 0);
 
@@ -135,9 +213,14 @@ export function assembleSupply(input: SupplyInput): Supply {
     transitDays: input.transitDays,
     shortage,
     responsible: input.responsible,
+    items,
     payments: input.payments,
     paidGoodsRub,
     paidCargoRub,
+    paidFulfillmentRub,
+    fulfillmentPartnerId: input.fulfillmentPartnerId,
+    fulfillmentPartnerName: input.fulfillmentPartnerName,
+    fulfillmentRub,
     owedRub,
     distributions: input.distributions,
     distributedQty,
@@ -178,9 +261,12 @@ export function computeFactories(factories: FactoryBase[], supplies: Supply[]): 
 }
 
 // Сводка фул-фирмы: приняли / в разборе / лежит / распределено / недостачи
+// и деньги — сколько ей начислено, оплачено и сколько должны.
 export function computeFulfillment(supplies: Supply[]): FulfillmentSummary {
   const cards = supplies.filter((s) => FULFILLMENT_STAGES.includes(s.status));
   const qty = (s: Supply) => s.receivedQty ?? s.quantity;
+  const chargedRub = cards.reduce((t, s) => t + s.fulfillmentRub, 0);
+  const paidRub = cards.reduce((t, s) => t + s.paidFulfillmentRub, 0);
   return {
     receivedQty: cards.reduce((t, s) => t + qty(s), 0),
     sortingQty: cards.filter((s) => s.status === "sorting").reduce((t, s) => t + qty(s), 0),
@@ -189,6 +275,9 @@ export function computeFulfillment(supplies: Supply[]): FulfillmentSummary {
       .filter((s) => s.status === "distributed")
       .reduce((t, s) => t + (s.distributedQty || qty(s)), 0),
     shortageQty: cards.reduce((t, s) => t + s.shortage, 0),
+    chargedRub,
+    paidRub,
+    owedRub: Math.max(0, chargedRub - paidRub),
     cards,
   };
 }

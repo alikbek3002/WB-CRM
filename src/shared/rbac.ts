@@ -50,6 +50,7 @@ export type Permission =
   | "supply:pay" // оплаты товар/карго (финансисты)
   | "supply:receive" // приёмка + распределение по WB (приёмщик Москва)
   | "fulfillment:view"
+  | "fulfillment:manage" // тарифы фул-фирмы и начисления за разбор
   // ─── Регламент и отчёты ───
   | "duty:view" // мои ежедневные обязанности
   | "duty:complete" // отметить выполнение + отчёт
@@ -83,6 +84,7 @@ const ALL: Permission[] = [
   "supply:pay",
   "supply:receive",
   "fulfillment:view",
+  "fulfillment:manage",
   "duty:view",
   "duty:complete",
   "reports:view",
@@ -115,6 +117,7 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
     "supply:pay",
     "supply:receive",
     "fulfillment:view",
+    "fulfillment:manage",
     "duty:view",
     "duty:complete",
     "reports:view", // старший менеджер видит отчёты команды

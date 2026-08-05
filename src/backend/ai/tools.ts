@@ -13,6 +13,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { DEMO_ORG_ID, DEMO_STORE_ID, toRub } from "../../shared/constants";
 import { can, type MemberRole, type Permission } from "../../shared/rbac";
+import { applySupplyCost } from "../data/cost-core";
 import type { Currency, PayoutKind } from "../../shared/types";
 import {
   CASH_NOTIFY_THRESHOLD_RUB,
@@ -3099,6 +3100,14 @@ async function execReceiveSupply(
     })
     .eq("id", supply.id);
   if (error) return `Не удалось провести приёмку: ${error.message}`;
+
+  // Тот же расчёт себестоимости, что и в веб-приёмке. Раньше этот путь его не
+  // вызывал вовсе: приёмка через бота молча оставляла старую себестоимость.
+  const cost = await applySupplyCost(
+    ctx.db,
+    supply.id,
+    UUID.test(ctx.user.id) ? ctx.user.id : null,
+  );
   ctx.touch();
 
   const shortfall = supply.quantity - received;
@@ -3110,10 +3119,25 @@ async function execReceiveSupply(
         `Принял: ${tgEsc(ctx.user.name)}`,
     );
   }
+
+  const costLine = cost.items.length
+    ? " Себестоимость пересчитана: " +
+      cost.items
+        .map(
+          (i) =>
+            `${money(i.appliedRub, "rub")}/шт (отшив ${money(i.sewingRub, "rub")} + карго ${money(i.cargoRub, "rub")}` +
+            (i.fulfillmentRub > 0 ? ` + фул-фирма ${money(i.fulfillmentRub, "rub")}` : "") +
+            ")",
+        )
+        .join(", ") +
+      "."
+    : "";
+
   return (
     `Поставка «${supply.title}» принята: ${num(received)} шт из ${num(supply.quantity)} шт, ` +
     `в пути была ${transitDays} дн.` +
-    (shortfall > 0 ? ` Недостача ${num(shortfall)} шт — руководству отправлено уведомление.` : " Пришла полностью.")
+    (shortfall > 0 ? ` Недостача ${num(shortfall)} шт — руководству отправлено уведомление.` : " Пришла полностью.") +
+    costLine
   );
 }
 

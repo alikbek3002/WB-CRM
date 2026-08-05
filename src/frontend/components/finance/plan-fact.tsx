@@ -31,15 +31,17 @@ import {
   SERIES,
   TOOLTIP_STYLE,
 } from "@/frontend/components/charts/palette";
-import { formatRub } from "@/shared/format";
+import {
+  currencySign,
+  formatAmount,
+  formatCompact,
+  formatCompactAmount,
+} from "@/shared/format";
 import { cn } from "@/shared/utils";
 import type { SalesPlanView } from "@/shared/types";
 
 const PLAN_COLOR = "rgba(144, 133, 233, 0.55)"; // фиолетовый — план
 const FACT_COLOR = SERIES[0]; // синий — факт
-
-const compactRub = (v: number) =>
-  v >= 1_000_000 ? `${(v / 1_000_000).toFixed(1)} млн` : v >= 1_000 ? `${Math.round(v / 1_000)} тыс` : String(v);
 
 type ChartPoint = {
   label: string;
@@ -51,9 +53,11 @@ type ChartPoint = {
 function PlanFactTooltip({
   active,
   payload,
+  currency,
 }: {
   active?: boolean;
   payload?: { payload?: ChartPoint }[];
+  currency?: string;
 }) {
   const p = payload?.[0]?.payload;
   if (!active || !p) return null;
@@ -61,12 +65,12 @@ function PlanFactTooltip({
   return (
     <div style={TOOLTIP_STYLE} className="px-3 py-2">
       <div className="font-medium">{p.label}</div>
-      <div>План: {formatRub(p.plan)}</div>
-      {p.fact !== null && <div>Факт: {formatRub(p.fact)}</div>}
+      <div>План: {formatAmount(p.plan, currency)}</div>
+      {p.fact !== null && <div>Факт: {formatAmount(p.fact, currency)}</div>}
       {diff !== null && (
         <div style={{ color: diff >= 0 ? "#34d399" : "#f87171" }}>
           {diff >= 0 ? "+" : ""}
-          {formatRub(diff)}
+          {formatAmount(diff, currency)}
         </div>
       )}
     </div>
@@ -92,7 +96,7 @@ function PlanDialog({
   async function submit() {
     const sum = Number(amount.replace(/[\s,]/g, "").replace(",", "."));
     if (!Number.isFinite(sum) || sum <= 0) {
-      toast.error("Укажите сумму плана в рублях");
+      toast.error("Укажите сумму плана из кабинета WB");
       return;
     }
     if (!start || !end || start >= end) {
@@ -124,8 +128,9 @@ function PlanDialog({
         <DialogHeader>
           <DialogTitle>План продаж WB на период</DialogTitle>
           <DialogDescription>
-            Сумма плана из кабинета WB — система разложит по дням и будет
-            сравнивать с фактом продаж автоматически.
+            Сумма из виджета «План продаж» в кабинете WB (программа скидки за
+            выполнение плана) — система разложит по дням и будет сравнивать с
+            фактом автоматически.
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3 sm:grid-cols-2 [&>div]:min-w-0">
@@ -148,14 +153,21 @@ function PlanDialog({
             />
           </div>
           <div className="grid gap-1.5 sm:col-span-2">
-            <Label htmlFor="plan-amount">План на период, ₽</Label>
+            <Label htmlFor="plan-amount">
+              План на период, {currencySign(view.currency)}
+            </Label>
             <Input
               id="plan-amount"
               inputMode="numeric"
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
-              placeholder="Например: 650000000"
+              placeholder="Например: 25254000000"
             />
+            {Number(amount.replace(/[\s,]/g, "")) > 0 && (
+              <span className="text-[11px] text-muted-foreground">
+                = {formatCompactAmount(Number(amount.replace(/[\s,]/g, "")), view.currency)}
+              </span>
+            )}
           </div>
         </div>
         <DialogFooter>
@@ -224,12 +236,32 @@ export function PlanFact({
     .reverse()
     .slice(0, 2)
     .join(".")}`;
+  const cur = view.currency;
 
-  const kpis = [
-    { label: `План на период (${periodLabel})`, value: view.hasPlan ? formatRub(view.amountRub) : "не задан", className: "" },
-    { label: "Факт продаж с начала периода", value: formatRub(view.factToDateRub), className: "" },
+  // Показатели — как в виджете «План продаж» ЛК WB: % от ВСЕГО плана,
+  // остаток, «нужно в день», прогноз по текущему темпу
+  type Kpi = {
+    label: string;
+    value: string;
+    className?: string;
+    hint?: string;
+    full?: string; // точная сумма — в title при наведении
+  };
+  const kpis: Kpi[] = [
     {
-      label: "Выполнение плана на сегодня",
+      label: `План WB на период (${periodLabel})`,
+      value: view.hasPlan ? formatCompactAmount(view.amountRub, cur) : "не задан",
+      full: view.hasPlan ? formatAmount(view.amountRub, cur) : undefined,
+      hint: view.hasPlan ? `${formatCompactAmount(view.dailyPlanRub, cur)} в день` : undefined,
+    },
+    {
+      label: "Выполнено с начала периода",
+      value: formatCompactAmount(view.factToDateRub, cur),
+      full: formatAmount(view.factToDateRub, cur),
+      hint: view.hasPlan ? `${view.completionTotalPct}% от всего плана` : undefined,
+    },
+    {
+      label: "Темп к графику плана",
       value: view.hasPlan ? `${view.completionPct}%` : "—",
       className: view.hasPlan
         ? view.completionPct >= 100
@@ -238,26 +270,60 @@ export function PlanFact({
             ? "text-amber-400"
             : "text-red-400"
         : "",
+      hint: view.hasPlan
+        ? `факт против плана на сегодня (${formatCompactAmount(view.planToDateRub, cur)})`
+        : undefined,
+    },
+    {
+      label: "Осталось продать",
+      value: view.hasPlan ? formatCompactAmount(view.remainingRub, cur) : "—",
+      full: view.hasPlan ? formatAmount(view.remainingRub, cur) : undefined,
+      hint: view.hasPlan ? `${view.remainingDays} дней до конца периода` : undefined,
     },
     {
       label: "Нужно продавать в день",
-      value: view.hasPlan ? formatRub(view.neededDailyRub) : "—",
-      className: "",
-      hint: view.hasPlan ? `план ${formatRub(view.dailyPlanRub)}/дн` : undefined,
+      value: view.hasPlan ? formatCompactAmount(view.neededDailyRub, cur) : "—",
+      full: view.hasPlan ? formatAmount(view.neededDailyRub, cur) : undefined,
+      className:
+        view.hasPlan && view.neededDailyRub > view.avgDailyFactRub * 1.05
+          ? "text-red-400"
+          : view.hasPlan
+            ? "text-emerald-400"
+            : "",
+      hint:
+        view.avgDailyFactRub > 0
+          ? `сейчас темп ${formatCompactAmount(view.avgDailyFactRub, cur)}/день`
+          : undefined,
+    },
+    {
+      label: "Прогноз к концу периода",
+      value: view.hasPlan ? formatCompactAmount(view.forecastRub, cur) : "—",
+      full: view.hasPlan ? formatAmount(view.forecastRub, cur) : undefined,
+      className: view.hasPlan
+        ? view.forecastPct >= 100
+          ? "text-emerald-400"
+          : view.forecastPct >= 80
+            ? "text-amber-400"
+            : "text-red-400"
+        : "",
+      hint: view.hasPlan ? `${view.forecastPct}% плана при текущем темпе` : undefined,
     },
   ];
 
   return (
     <div className="space-y-3">
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
         {kpis.map((k) => (
           <Card key={k.label}>
             <CardContent className="py-4">
               <div className="text-xs text-muted-foreground">{k.label}</div>
-              <div className={cn("text-xl font-semibold tabular-nums", k.className)}>
+              <div
+                className={cn("text-xl font-semibold tabular-nums", k.className)}
+                title={k.full}
+              >
                 {k.value}
               </div>
-              {"hint" in k && k.hint && (
+              {k.hint && (
                 <div className="text-[11px] text-muted-foreground">{k.hint}</div>
               )}
             </CardContent>
@@ -311,7 +377,9 @@ export function PlanFact({
           <div className="mb-2 flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
             <span>
               План на {monthTitle.toLowerCase()}:{" "}
-              <span className="font-medium text-foreground">{formatRub(monthPlan)}</span>
+              <span className="font-medium text-foreground">
+                {formatAmount(monthPlan, cur)}
+              </span>
             </span>
             <span>
               Факт:{" "}
@@ -321,7 +389,7 @@ export function PlanFact({
                   monthFact >= monthPlan ? "text-emerald-400" : "text-foreground",
                 )}
               >
-                {formatRub(monthFact)}
+                {formatAmount(monthFact, cur)}
               </span>
             </span>
           </div>
@@ -339,10 +407,13 @@ export function PlanFact({
                 tick={AXIS_TICK}
                 tickLine={false}
                 axisLine={false}
-                tickFormatter={compactRub}
-                width={56}
+                tickFormatter={formatCompact}
+                width={64}
               />
-              <Tooltip content={<PlanFactTooltip />} cursor={{ fill: "rgba(255,255,255,0.04)" }} />
+              <Tooltip
+                content={<PlanFactTooltip currency={cur} />}
+                cursor={{ fill: "rgba(255,255,255,0.04)" }}
+              />
               {view.hasPlan && (
                 <Bar dataKey="plan" name="План" fill={PLAN_COLOR} radius={[3, 3, 0, 0]} />
               )}

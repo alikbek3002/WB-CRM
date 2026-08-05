@@ -94,6 +94,6 @@ export async function POST(
   }
 
   // Иначе статистика дисциплины (кэш duty-stats) отстаёт до 5 минут
-  invalidateWbData();
+  invalidateWbData("duty-stats");
   return NextResponse.json({ ok: true, persisted: true, onTime });
 }

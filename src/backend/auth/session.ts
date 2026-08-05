@@ -3,7 +3,8 @@ import { unstable_cache } from "next/cache";
 import { cookies } from "next/headers";
 import { isMemberRole, ROLE_LABELS, type MemberRole } from "@/shared/rbac";
 import { DEMO_ORG_ID } from "@/shared/constants";
-import { WB_DATA_TAG } from "@/backend/data";
+import { SESSION_TAG } from "@/backend/data";
+import { getVerifiedUser } from "@/backend/auth/claims";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
 import {
   createSupabaseServerClient,
@@ -14,6 +15,11 @@ type MemberRow = {
   profile: { id: string; full_name?: string; email?: string } | null;
   org: { id: string; name: string } | null;
 };
+
+// ВАЖНО про тег: раньше эти два кэша висели на WB_DATA_TAG — то есть ЛЮБАЯ
+// мутация (закрыл задачу, добавил расход) выбрасывала и строку членства, и
+// следующая навигация снова шла в Supabase за одной строкой. Членство меняется
+// только на вкладке «Команда», поэтому у него отдельный тег SESSION_TAG.
 
 // Членство авторизованного пользователя (личный кабинет) — кэш по user_id
 const loadMemberByUserId = unstable_cache(
@@ -29,12 +35,11 @@ const loadMemberByUserId = unstable_cache(
     return (data as unknown as MemberRow & { role: string }) ?? null;
   },
   ["session-member-uid"],
-  { revalidate: 120, tags: [WB_DATA_TAG] },
+  { revalidate: 600, tags: [SESSION_TAG] },
 );
 
 // Выполняется в layout на КАЖДОЙ навигации — кэшируем между запросами, чтобы
 // не ходить в Supabase за одной строкой при каждом переключении вкладки.
-// Ключ — роль; сбрасывается общим тегом (изменения команды → revalidateTag).
 const loadMemberByRole = unstable_cache(
   async (role: MemberRole): Promise<MemberRow | null> => {
     const admin = getSupabaseAdmin();
@@ -49,7 +54,7 @@ const loadMemberByRole = unstable_cache(
     return (data as unknown as MemberRow) ?? null;
   },
   ["session-member"],
-  { revalidate: 120, tags: [WB_DATA_TAG] },
+  { revalidate: 600, tags: [SESSION_TAG] },
 );
 
 export const DEMO_ROLE_COOKIE = "wbcrm-demo-role";
@@ -72,12 +77,12 @@ const DEMO_USERS: Partial<Record<MemberRole, { name: string; email: string }>> =
 // затем демо-переключатель ролей (cookie) для показа системы без логина.
 // cache() дедуплицирует запрос в рамках одного запроса/рендера.
 export const getSession = cache(async (): Promise<Session> => {
-  // 1) Личный кабинет: авторизованный пользователь Supabase Auth
+  // 1) Личный кабинет: авторизованный пользователь Supabase Auth.
+  // Токен проверяется ЛОКАЛЬНО (getVerifiedUser) — раньше здесь был getUser()
+  // с походом по сети (~300–500 мс) на каждый рендер каждой страницы.
   const supa = await createSupabaseServerClient();
   if (supa && getSupabaseAdmin()) {
-    const {
-      data: { user },
-    } = await supa.auth.getUser();
+    const user = await getVerifiedUser(supa);
     if (user) {
       const member = await loadMemberByUserId(user.id);
       const profile = member?.profile ?? null;

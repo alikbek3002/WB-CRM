@@ -116,6 +116,13 @@ export type ProductUnitEcon = {
   drrPct: number; // реклама / выручка
 };
 
+// Остаток одного размера товара (последний снимок складов WB)
+export type ProductSizeStock = {
+  size: string;
+  onStock: number; // на складах WB
+  inTransit: number; // в пути между складами WB
+};
+
 export type ProductListItem = {
   id: string;
   nmId: number;
@@ -127,8 +134,14 @@ export type ProductListItem = {
   costPrice: number;
   costPriceSource: CostPriceSource;
   costPriceUpdatedAt: string | null;
+  // Из чего сложилась себестоимость (₽/шт). Сумма трёх = costPrice, когда
+  // источник «supply». При ручном вводе и импорте разбивки нет — всё в отшиве.
+  costSewingRub: number;
+  costCargoRub: number;
+  costFulfillmentRub: number;
   logisticsCost: number;
   stockQty: number;
+  sizes: ProductSizeStock[]; // разбивка остатка по размерам (сумма = stockQty)
   responsible: string;
   econ: ProductUnitEcon | null; // юнит-экономика за 30 дней (null — продаж не было)
   // Контент WB (фото/описание/цены — из синхронизации кабинета)
@@ -155,6 +168,9 @@ export type PlanFactDay = {
   isFuture: boolean; // день ещё не наступил (факта нет по определению)
 };
 
+// Показатели — как в виджете плана ЛК WB (программа «скидка за выполнение
+// плана»): план на период ставит WB, суммы в валюте кабинета (у киргизского
+// юрлица — сомы). Поля *Rub исторические — значение в валюте `currency`.
 export type SalesPlanView = {
   hasPlan: boolean;
   periodStart: string; // yyyy-mm-dd
@@ -162,9 +178,16 @@ export type SalesPlanView = {
   amountRub: number; // план на период
   factToDateRub: number; // факт с начала периода
   planToDateRub: number; // план с начала периода по сегодня
-  completionPct: number; // факт / план-на-сегодня
-  dailyPlanRub: number; // план на день
-  neededDailyRub: number; // сколько нужно в день до конца периода
+  completionPct: number; // темп: факт / план-на-сегодня
+  completionTotalPct: number; // как в ЛК: факт / ВЕСЬ план на период
+  dailyPlanRub: number; // план на день (план / дни периода)
+  neededDailyRub: number; // остаток / оставшиеся дни (включая сегодня)
+  remainingRub: number; // осталось продать до плана
+  remainingDays: number; // осталось дней (включая сегодня)
+  avgDailyFactRub: number; // текущий темп: средний факт за последние 14 дней
+  forecastRub: number; // прогноз на конец периода по текущему темпу
+  forecastPct: number; // прогноз / план
+  currency: string; // валюта кабинета: RUB, KGS…
   days: PlanFactDay[];
 };
 
@@ -516,7 +539,7 @@ export type Factory = {
 
 export type SupplyPayment = {
   id: string;
-  kind: "goods" | "cargo"; // за товар / за карго
+  kind: "goods" | "cargo" | "fulfillment"; // за товар / за карго / фул-фирме
   amount: number;
   currency: Currency;
   paidAt: string;
@@ -527,6 +550,37 @@ export type WbDistribution = {
   id: string;
   warehouse: string;
   quantity: number;
+};
+
+// Позиция поставки: один артикул со своим количеством и отшивом.
+// Карго и услуги фул-фирмы — общие на поставку, распределяются между позициями
+// пропорционально количеству (см. backend/data/cost-core.ts).
+export type SupplyItem = {
+  id: string;
+  productId: string | null;
+  title: string;
+  quantity: number; // отгружено
+  receivedQty: number | null; // принято
+  sewingCost: number;
+  sewingCurrency: Currency;
+  // Себестоимость единицы по этой позиции (₽), считается из партии
+  sewingRub: number;
+  cargoRub: number;
+  fulfillmentRub: number;
+  unitCostRub: number;
+};
+
+// Фул-фирма: тариф за единицу приёмки/разбора/упаковки
+export type FulfillmentPartner = {
+  id: string;
+  name: string;
+  ratePerUnitRub: number;
+  note: string | null;
+  archived: boolean;
+  suppliesCount: number; // сколько поставок разобрала
+  chargedRub: number; // начислено всего
+  paidRub: number; // оплачено
+  owedRub: number; // долг
 };
 
 export type Supply = {
@@ -552,10 +606,16 @@ export type Supply = {
   transitDays: number | null;
   shortage: number; // недостача = quantity − receivedQty (если принято меньше)
   responsible: string;
+  items: SupplyItem[]; // позиции (пусто — поставка по старой схеме «один товар»)
   payments: SupplyPayment[];
   paidGoodsRub: number; // оплачено за товар, ₽
   paidCargoRub: number; // оплачено за карго, ₽
-  owedRub: number; // сколько ещё должны (отшивка+карго − оплачено), ₽
+  paidFulfillmentRub: number; // оплачено фул-фирме, ₽
+  // Услуги фул-фирмы: факт, либо тариф партнёра × принято
+  fulfillmentPartnerId: string | null;
+  fulfillmentPartnerName: string | null;
+  fulfillmentRub: number; // начислено фул-фирме за эту поставку, ₽
+  owedRub: number; // сколько ещё должны (отшивка + карго + ФФ − оплачено), ₽
   distributions: WbDistribution[];
   distributedQty: number;
 };
@@ -566,6 +626,10 @@ export type FulfillmentSummary = {
   inStockQty: number; // лежит
   distributedQty: number; // распределено по WB
   shortageQty: number; // суммарная недостача
+  // Деньги фул-фирмы: до 0037 модуль был только в штуках
+  chargedRub: number; // начислено за услуги
+  paidRub: number; // оплачено
+  owedRub: number; // долг фул-фирме
   cards: Supply[]; // карточки на стадии фул-фирмы
 };
 
@@ -688,10 +752,43 @@ export type DesignRequest = {
 };
 
 // Единый контракт ответа рекомендаций по товару (Claude или эвристика)
+// К чему относится совет — чтобы в карточке было сразу видно, что чинить:
+// фото, цену, описание, размерный ряд, рекламу или поставку.
+export type ProductRecoArea =
+  | "photo"
+  | "price"
+  | "description"
+  | "sizes"
+  | "ads"
+  | "supply"
+  | "other";
+
+// Воронка карточки за период: показы → корзина → заказ → выкуп.
+// Именно она отвечает на «почему товар слабый»: провал показ→корзина — вопрос
+// к фото/цене/заголовку, корзина→заказ — к цене, низкий выкуп — к описанию
+// и размерной сетке (люди заказали, померили и вернули).
+export type ProductFunnel = {
+  days: number;
+  opens: number;
+  carts: number;
+  orders: number;
+  buyouts: number;
+  cartRate: number; // % показов, дошедших до корзины
+  orderRate: number; // % корзин, дошедших до заказа
+  buyoutRate: number; // % заказов, выкупленных
+};
+
 export type ProductRecommendation = {
   productId: string;
   source: "claude" | "heuristic";
+  verdict: "strong" | "ok" | "weak";
   summary: string;
   problems: { metric: string; severity: "low" | "medium" | "high"; reason: string }[];
-  recommendations: { action: string; impact: string; priority: number }[];
+  recommendations: {
+    area: ProductRecoArea;
+    action: string;
+    impact: string;
+    priority: number;
+  }[];
+  funnel?: ProductFunnel | null; // показываем цифры рядом с разбором
 };

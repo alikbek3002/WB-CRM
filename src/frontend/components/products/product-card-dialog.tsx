@@ -10,14 +10,110 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/frontend/components/ui/dialog";
+import {
+  catalogContext,
+  RecoButton,
+} from "@/frontend/components/products/reco-button";
 import { formatNumber, formatRub } from "@/shared/format";
-import type { CostPriceSource, ProductListItem } from "@/shared/types";
+import type {
+  CostPriceSource,
+  ProductListItem,
+  ProductSizeStock,
+} from "@/shared/types";
 
 const COST_SOURCE_LABEL: Record<CostPriceSource, string> = {
   manual: "вручную",
   import: "импорт из файла",
   supply: "из поставки",
 };
+
+// Остатки по размерам — прямо в карточке, без раскрытия и догрузки.
+// Цвет подсказывает, где дырка в размерном ряду: 0 — размера нет в продаже,
+// «мало» — меньше 5% общего остатка товара (типовой признак вымывания).
+function SizeStocks({ sizes }: { sizes: ProductSizeStock[] }) {
+  if (sizes.length === 0) return null;
+
+  const total = sizes.reduce((t, s) => t + s.onStock, 0);
+  const transit = sizes.reduce((t, s) => t + s.inTransit, 0);
+  const out = sizes.filter((s) => s.onStock === 0).length;
+
+  return (
+    <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
+      <div className="mb-2 flex items-baseline justify-between gap-2">
+        <span className="text-xs font-medium text-muted-foreground">
+          Остатки по размерам · {sizes.length}
+        </span>
+        <span className="text-[11px] text-muted-foreground">
+          {out > 0 ? `нет в наличии: ${out}` : "весь ряд в наличии"}
+        </span>
+      </div>
+
+      <div className="flex flex-wrap gap-1.5">
+        {sizes.map((s) => {
+          const empty = s.onStock === 0;
+          const low = !empty && total > 0 && s.onStock / total < 0.05;
+          return (
+            <div
+              key={s.size}
+              title={
+                s.inTransit > 0
+                  ? `${s.size}: ${formatNumber(s.onStock)} шт на складах, ${formatNumber(s.inTransit)} шт в пути`
+                  : `${s.size}: ${formatNumber(s.onStock)} шт на складах`
+              }
+              className={`min-w-14 rounded-md border px-2 py-1 text-center ${
+                empty
+                  ? "border-red-500/40 bg-red-500/5"
+                  : low
+                    ? "border-amber-500/40 bg-amber-500/5"
+                    : "border-border/60 bg-background/40"
+              }`}
+            >
+              <div className="truncate text-[10px] leading-tight text-muted-foreground">
+                {s.size}
+              </div>
+              <div
+                className={`text-sm font-medium leading-tight tabular-nums ${
+                  empty ? "text-red-400" : low ? "text-amber-400" : ""
+                }`}
+              >
+                {formatNumber(s.onStock)}
+              </div>
+              {s.inTransit > 0 && (
+                <div className="text-[10px] leading-tight text-muted-foreground">
+                  +{formatNumber(s.inTransit)}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {transit > 0 && (
+        <div className="mt-2 text-[11px] text-muted-foreground">
+          Серым «+N» — в пути между складами WB, всего {formatNumber(transit)} шт
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Из чего сложилась себестоимость. Показываем только когда она пришла из
+// приёмки поставки — при ручном вводе и импорте разбивки нет, там просто число.
+function CostBreakdown({ product }: { product: ProductListItem }) {
+  const parts = [
+    { label: "отшив", value: product.costSewingRub },
+    { label: "карго", value: product.costCargoRub },
+    { label: "фул-фирма", value: product.costFulfillmentRub },
+  ].filter((p) => p.value > 0);
+
+  if (product.costPriceSource !== "supply" || parts.length < 2) return null;
+
+  return (
+    <span className="mt-0.5 block text-[10px] font-normal leading-tight text-muted-foreground">
+      {parts.map((p) => `${p.label} ${formatRub(p.value)}`).join(" + ")}
+    </span>
+  );
+}
 
 function costSourceLabel(product: ProductListItem): string | null {
   if (product.costPrice <= 0) return null;
@@ -35,10 +131,12 @@ export function ProductDialog({
   product,
   open,
   onOpenChange,
+  catalog,
 }: {
   product: ProductListItem;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  catalog?: ReturnType<typeof catalogContext>;
 }) {
   const [photo, setPhoto] = useState(0);
   const gallery = product.photos.length
@@ -63,6 +161,23 @@ export function ProductDialog({
               {product.vendorCode ? ` · ${product.vendorCode}` : ""}
             </DialogDescription>
           </DialogHeader>
+
+          {/* Разбор ИИ доступен для ЛЮБОГО товара, а не только помеченного
+              слабым: понять, почему хороший товар хороший, не менее полезно. */}
+          <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
+            <span className="text-xs text-muted-foreground">
+              Почему товар продаётся так, и что улучшить — фото, цену, описание,
+              размеры
+            </span>
+            <RecoButton
+              product={product}
+              catalog={catalog}
+              size="sm"
+              variant="secondary"
+              label="Разобрать через ИИ"
+              className="ml-auto"
+            />
+          </div>
 
           <div className="grid gap-4 sm:grid-cols-[240px_1fr]">
             {/* Фото + галерея */}
@@ -165,10 +280,13 @@ export function ProductDialog({
                       {costSourceLabel(product)}
                     </span>
                   )}
+                  <CostBreakdown product={product} />
                 </span>
                 <span className="text-muted-foreground">Ответственный</span>
                 <span className="truncate text-right">{product.responsible}</span>
               </div>
+
+              <SizeStocks sizes={product.sizes} />
 
               {product.econ && (
                 <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
@@ -254,7 +372,13 @@ export function ProductDialog({
 }
 
 // Ячейка товара в таблице: миниатюра + название, клик открывает карточку.
-export function ProductCell({ product }: { product: ProductListItem }) {
+export function ProductCell({
+  product,
+  catalog,
+}: {
+  product: ProductListItem;
+  catalog?: ReturnType<typeof catalogContext>;
+}) {
   const [open, setOpen] = useState(false);
 
   return (
@@ -284,7 +408,12 @@ export function ProductCell({ product }: { product: ProductListItem }) {
           </span>
         </span>
       </button>
-      <ProductDialog product={product} open={open} onOpenChange={setOpen} />
+      <ProductDialog
+        product={product}
+        open={open}
+        onOpenChange={setOpen}
+        catalog={catalog}
+      />
     </>
   );
 }

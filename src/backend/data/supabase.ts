@@ -13,11 +13,13 @@ import type {
   DutyItem,
   Factory,
   FinanceRow,
+  FulfillmentPartner,
   FulfillmentSummary,
   IntegrationStatus,
   PlanFactDay,
   CostPriceSource,
   ProductListItem,
+  ProductSizeStock,
   ProductStockRow,
   ProductUnitEcon,
   ReportsBoard,
@@ -47,7 +49,9 @@ import {
   computeFulfillment,
   type FactoryBase,
   type SupplyInput,
+  type SupplyItemInput,
 } from "@/shared/supply";
+import { storeCurrency } from "./cash-core";
 
 // ─── локальные хелперы дат (без toISOString — не сдвигают день в UTC+5/6) ────
 
@@ -66,19 +70,41 @@ function dayLabel(iso: string) {
 // PostgREST режет ЛЮБОЙ ответ (включая rpc!) до 1000 строк — большие выборки
 // тянем страницами через .range() до неполной страницы. Без этого agg_rnp_daily
 // (~4.5k строк) и agg_stock_sizes (~1.4k) молча теряли данные.
+//
+// Страницы берём ПАЧКАМИ параллельно: раньше цикл был строго последовательным,
+// и agg_rnp_daily (5 страниц) стоил 5 круговых задержек до Supabase (~0.5 с
+// каждая) — это и делало РНП самой медленной вкладкой. Пачка из BATCH страниц
+// сокращает 5 последовательных ожиданий до 2. Больше 3 параллельных запросов не
+// берём: каждый прогоняет агрегат целиком, и шторм ловил statement timeout.
 async function rpcAll<T>(
   db: SupabaseClient,
   fn: string,
   args: Record<string, unknown>,
 ): Promise<T[]> {
   const PAGE = 1000;
+  const BATCH = 3;
   const all: T[] = [];
-  for (let from = 0; ; from += PAGE) {
+
+  const page = async (index: number): Promise<T[]> => {
+    const from = index * PAGE;
     const { data, error } = await db.rpc(fn, args).range(from, from + PAGE - 1);
     if (error) throw new Error(`${fn}: ${error.message}`);
-    const rows = (data ?? []) as T[];
-    all.push(...rows);
-    if (rows.length < PAGE) return all;
+    return (data ?? []) as T[];
+  };
+
+  // Первая страница отдельно: у подавляющего большинства агрегатов она же и
+  // последняя — лишние параллельные запросы делать незачем.
+  const first = await page(0);
+  all.push(...first);
+  if (first.length < PAGE) return all;
+
+  for (let start = 1; ; start += BATCH) {
+    const batch = await Promise.all(
+      Array.from({ length: BATCH }, (_, i) => page(start + i)),
+    );
+    for (const rows of batch) all.push(...rows);
+    // Неполная страница внутри пачки = данные кончились
+    if (batch.some((rows) => rows.length < PAGE)) return all;
   }
 }
 
@@ -89,6 +115,35 @@ const MONTHS_RU = [
 
 const WEEKDAYS = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"];
 const SIZES_ORDER = ["XXS", "XS", "S", "M", "L", "XL", "XXL", "2XL", "3XL", "4XL", "5XL"];
+
+// Размеры в кабинете разнородные: буквенные (M, XL), возрастные («5 лет»,
+// «9-12 мес», слитное «5лет»), ростовки (134, 146), числовые (42-44) и обувные
+// («38-39 M6/W8»). Сортируем по «системе размеров», затем по величине внутри
+// неё — иначе список в карточке идёт как попало (алфавитом «10 лет» < «2 года»).
+function sizeRank(size: string): [number, number, string] {
+  const s = size.trim();
+  const upper = s.toUpperCase();
+
+  const letter = SIZES_ORDER.indexOf(upper);
+  if (letter >= 0) return [0, letter, upper];
+
+  const num = s.match(/\d+/);
+  if (num) {
+    let value = Number(num[0]);
+    // «9-12 мес» меньше года: без перевода в годы месяцы встают после
+    // «2 года» (9 > 2) и порядок ломается.
+    if (/мес/i.test(s)) value /= 12;
+    return [1, value, upper];
+  }
+
+  return [2, 0, upper]; // one-size и прочее — в конец
+}
+
+function compareSizes(a: string, b: string): number {
+  const [ga, va, sa] = sizeRank(a);
+  const [gb, vb, sb] = sizeRank(b);
+  return ga - gb || va - vb || sa.localeCompare(sb, "ru");
+}
 
 // Понедельник недели, к которой относится дата (локально)
 function mondayOf(d: Date): Date {
@@ -188,32 +243,76 @@ export async function getDashboardData(
 export async function getProductList(
   db: SupabaseClient,
 ): Promise<ProductListItem[]> {
-  const { data: prods, error } = await db
-    .from("products")
-    .select(
-      "id, nm_id, vendor_code, title, brand, category, status, cost_price, cost_price_source, cost_price_updated_at, logistics_cost, photo_url, photos, description, price_wb, price_discounted_wb, responsible:profiles(full_name)",
-    )
-    .eq("store_id", DEMO_STORE_ID)
-    .order("nm_id");
-  if (error) throw error;
+  // Все пять выборок независимы — раньше они шли строго друг за другом и стоили
+  // пяти круговых задержек до Supabase (~0.5 с каждая, итого ~2.5 с только на
+  // ожидание сети). Ни одна не использует результат предыдущей: связываются они
+  // уже в памяти, в финальном map. Поэтому запускаем их одним Promise.all.
+  const since = new Date();
+  since.setHours(0, 0, 0, 0);
+  since.setDate(since.getDate() - 29);
+
+  const ueTo = new Date();
+  ueTo.setHours(0, 0, 0, 0);
+  const ueFrom = new Date(ueTo);
+  ueFrom.setDate(ueFrom.getDate() - 29);
+
+  type SizeRow = { product_id: string; size: string | null; on_stock: number; in_transit: number };
+
+  const [prodRes, stockRes, sizeRows, supplies, salesRes, ueRows] = await Promise.all([
+    db
+      .from("products")
+      .select(
+        "id, nm_id, vendor_code, title, brand, category, status, cost_price, cost_price_source, cost_price_updated_at, cost_sewing_rub, cost_cargo_rub, cost_fulfillment_rub, logistics_cost, photo_url, photos, description, price_wb, price_discounted_wb, responsible:profiles(full_name)",
+      )
+      .eq("store_id", DEMO_STORE_ID)
+      .order("nm_id"),
+    // Остатки — последний снимок каждого товара, агрегированный в Postgres
+    // (rpc 0016; сырые строки снапшотов PostgREST режет до 1000). Только on_stock:
+    // транзит WB не смешиваем («В пути в МСК» — отдельная колонка из поставок).
+    db.rpc("agg_stock_by_product", { p_store: DEMO_STORE_ID }),
+    // Разбивка того же остатка по размерам — показывается прямо в карточке
+    // товара. Через rpcAll: строк уже под тысячу (PostgREST режет на 1000).
+    rpcAll<SizeRow>(db, "agg_stock_sizes", { p_store: DEMO_STORE_ID }),
+    // В пути в Москву — по поставкам (in_transit/arrived)
+    readSupplies(db),
+    // Продажи за 30 дней по nm_id → скорость и «на сколько хватит»
+    db.rpc("agg_sales_by_nm", {
+      p_store: DEMO_STORE_ID,
+      p_since: since.toISOString(),
+    }),
+    // Юнит-экономика за 30 дней (agg_unit_econ 0035). Ошибка не роняет список:
+    // до применения миграции/бэкфилла колонка «Маржа» просто пустая.
+    readUnitEconAgg(db, ueFrom, ueTo).catch(() => [] as UnitEconAggRow[]),
+  ]);
+
+  if (prodRes.error) throw prodRes.error;
+  const prods = prodRes.data;
   if (!prods || prods.length === 0) return [];
 
-  // Остатки — последний снимок каждого товара, агрегированный в Postgres
-  // (rpc 0016; сырые строки снапшотов PostgREST режет до 1000). Только on_stock:
-  // транзит WB не смешиваем («В пути в МСК» — отдельная колонка из поставок).
-  const { data: stockAgg, error: stockErr } = await db.rpc("agg_stock_by_product", {
-    p_store: DEMO_STORE_ID,
-  });
-  if (stockErr) throw stockErr;
+  if (stockRes.error) throw stockRes.error;
   const stockByProduct = new Map<string, number>(
-    ((stockAgg ?? []) as { product_id: string; on_stock: number }[]).map((r) => [
+    ((stockRes.data ?? []) as { product_id: string; on_stock: number }[]).map((r) => [
       r.product_id,
       Number(r.on_stock),
     ]),
   );
 
-  // В пути в Москву — по поставкам (in_transit/arrived), сгруппировано по product_id
-  const supplies = await readSupplies(db);
+  // Размеры по товарам: группируем и сразу упорядочиваем, чтобы клиент просто
+  // рисовал готовый список. Размеры без остатка и транзита не показываем —
+  // это снятые с продажи позиции, они только зашумляют карточку.
+  const sizesByProduct = new Map<string, ProductSizeStock[]>();
+  for (const r of sizeRows) {
+    const onStock = Number(r.on_stock ?? 0);
+    const inTransit = Number(r.in_transit ?? 0);
+    if (onStock === 0 && inTransit === 0) continue;
+    const list = sizesByProduct.get(r.product_id) ?? [];
+    list.push({ size: r.size?.trim() || "б/р", onStock, inTransit });
+    sizesByProduct.set(r.product_id, list);
+  }
+  for (const list of sizesByProduct.values()) {
+    list.sort((a, b) => compareSizes(a.size, b.size));
+  }
+
   const inTransitByProduct = new Map<string, number>();
   for (const s of supplies) {
     if (!s.productId) continue;
@@ -224,29 +323,14 @@ export async function getProductList(
     );
   }
 
-  // Продажи за 30 дней по nm_id → скорость и «на сколько хватит» (rpc-агрегат)
-  const since = new Date();
-  since.setHours(0, 0, 0, 0);
-  since.setDate(since.getDate() - 29);
-  const { data: salesAgg, error: sales30Err } = await db.rpc("agg_sales_by_nm", {
-    p_store: DEMO_STORE_ID,
-    p_since: since.toISOString(),
-  });
-  if (sales30Err) throw sales30Err;
+  if (salesRes.error) throw salesRes.error;
   const salesByNm = new Map<number, number>(
-    ((salesAgg ?? []) as { nm_id: number; cnt: number }[]).map((r) => [
+    ((salesRes.data ?? []) as { nm_id: number; cnt: number }[]).map((r) => [
       Number(r.nm_id),
       Number(r.cnt),
     ]),
   );
 
-  // Юнит-экономика за 30 дней (agg_unit_econ 0035). Ошибка не роняет список:
-  // до применения миграции/бэкфилла колонка «Маржа» просто пустая.
-  const ueTo = new Date();
-  ueTo.setHours(0, 0, 0, 0);
-  const ueFrom = new Date(ueTo);
-  ueFrom.setDate(ueFrom.getDate() - 29);
-  const ueRows = await readUnitEconAgg(db, ueFrom, ueTo).catch(() => [] as UnitEconAggRow[]);
   const ueByNm = new Map(ueRows.map((r) => [Number(r.nm_id), r]));
   const useDailyStorage = ueRows.some((r) => Number(r.storage_rub) > 0);
   const useDetailAcceptance = ueRows.some((r) => Number(r.acceptance_rub) > 0);
@@ -317,9 +401,13 @@ export async function getProductList(
       costPrice: cost,
       costPriceSource: ((p.cost_price_source as CostPriceSource) ?? "manual"),
       costPriceUpdatedAt: (p.cost_price_updated_at as string) ?? null,
+      costSewingRub: Number(p.cost_sewing_rub ?? 0),
+      costCargoRub: Number(p.cost_cargo_rub ?? 0),
+      costFulfillmentRub: Number(p.cost_fulfillment_rub ?? 0),
       econ,
       logisticsCost: Number(p.logistics_cost ?? 0),
       stockQty,
+      sizes: sizesByProduct.get(p.id as string) ?? [],
       responsible: responsible?.full_name ?? "—",
       photoUrl: (p.photo_url as string) ?? null,
       photos: Array.isArray(p.photos) ? (p.photos as string[]) : [],
@@ -648,7 +736,7 @@ async function readSupplies(db: SupabaseClient): Promise<Supply[]> {
   const { data: rows, error } = await db
     .from("supplies")
     .select(
-      "id, factory_id, product_id, title, quantity, ship_date, sewing_cost, sewing_currency, cargo_cost, cargo_currency, status, received_at, received_qty, receipt_comment, transit_days, factory:factories(name, country), responsible:profiles!supplies_responsible_user_id_fkey(full_name)",
+      "id, factory_id, product_id, title, quantity, ship_date, sewing_cost, sewing_currency, cargo_cost, cargo_currency, cargo_rate_to_rub, fulfillment_partner_id, fulfillment_cost_rub, status, received_at, received_qty, receipt_comment, transit_days, factory:factories(name, country), partner:fulfillment_partners(name, rate_per_unit_rub), responsible:profiles!supplies_responsible_user_id_fkey(full_name)",
     )
     .eq("org_id", DEMO_ORG_ID)
     .order("ship_date", { ascending: false });
@@ -656,7 +744,7 @@ async function readSupplies(db: SupabaseClient): Promise<Supply[]> {
   if (!rows || rows.length === 0) return [];
 
   const ids = rows.map((r) => r.id as string);
-  const [paymentsRes, distsRes] = await Promise.all([
+  const [paymentsRes, distsRes, itemsRes] = await Promise.all([
     db
       .from("supply_payments")
       .select("id, supply_id, kind, amount, currency, paid_at, note")
@@ -665,11 +753,35 @@ async function readSupplies(db: SupabaseClient): Promise<Supply[]> {
       .from("wb_distributions")
       .select("id, supply_id, warehouse, quantity")
       .in("supply_id", ids),
+    db
+      .from("supply_items")
+      .select(
+        "id, supply_id, product_id, title, quantity, received_qty, sewing_cost, sewing_currency, sewing_rate_to_rub",
+      )
+      .in("supply_id", ids),
   ]);
-  // Ошибка вторичного чтения → оплаты/распределения нельзя считать «пустыми»
-  // (иначе долг фабрике покажется на всю сумму) — пробрасываем.
+  // Ошибка вторичного чтения → оплаты/распределения/позиции нельзя считать
+  // «пустыми» (иначе долг фабрике покажется на всю сумму) — пробрасываем.
   if (paymentsRes.error) throw paymentsRes.error;
   if (distsRes.error) throw distsRes.error;
+  if (itemsRes.error) throw itemsRes.error;
+
+  const itemsBySupply = new Map<string, SupplyItemInput[]>();
+  for (const i of (itemsRes.data ?? []) as unknown as Record<string, unknown>[]) {
+    const sid = String(i.supply_id);
+    const list = itemsBySupply.get(sid) ?? [];
+    list.push({
+      id: String(i.id),
+      productId: (i.product_id as string) ?? null,
+      title: (i.title as string) ?? "—",
+      quantity: Number(i.quantity ?? 0),
+      receivedQty: i.received_qty == null ? null : Number(i.received_qty),
+      sewingCost: Number(i.sewing_cost ?? 0),
+      sewingCurrency: i.sewing_currency as Currency,
+      sewingRateToRub: i.sewing_rate_to_rub == null ? null : Number(i.sewing_rate_to_rub),
+    });
+    itemsBySupply.set(sid, list);
+  }
 
   const paymentsBySupply = new Map<string, SupplyPayment[]>();
   for (const p of paymentsRes.data ?? []) {
@@ -700,6 +812,7 @@ async function readSupplies(db: SupabaseClient): Promise<Supply[]> {
 
   return rows.map((r) => {
     const factory = r.factory as { name?: string; country?: string } | null;
+    const partner = r.partner as { name?: string; rate_per_unit_rub?: number } | null;
     const responsible = r.responsible as { full_name?: string } | null;
     const input: SupplyInput = {
       id: r.id as string,
@@ -714,12 +827,18 @@ async function readSupplies(db: SupabaseClient): Promise<Supply[]> {
       sewingCurrency: r.sewing_currency as Currency,
       cargoCost: Number(r.cargo_cost ?? 0),
       cargoCurrency: r.cargo_currency as Currency,
+      cargoRateToRub: r.cargo_rate_to_rub == null ? null : Number(r.cargo_rate_to_rub),
       status: r.status as SupplyStatus,
       receivedAt: (r.received_at as string) ?? null,
       receivedQty: r.received_qty == null ? null : Number(r.received_qty),
       receiptComment: (r.receipt_comment as string) ?? null,
       transitDays: r.transit_days == null ? null : Number(r.transit_days),
       responsible: responsible?.full_name ?? "—",
+      items: itemsBySupply.get(r.id as string) ?? [],
+      fulfillmentPartnerId: (r.fulfillment_partner_id as string) ?? null,
+      fulfillmentPartnerName: partner?.name ?? null,
+      fulfillmentRatePerUnitRub: Number(partner?.rate_per_unit_rub ?? 0),
+      fulfillmentCostRub: r.fulfillment_cost_rub == null ? null : Number(r.fulfillment_cost_rub),
       payments: paymentsBySupply.get(r.id as string) ?? [],
       distributions: distsBySupply.get(r.id as string) ?? [],
     };
@@ -753,6 +872,38 @@ export async function getFulfillment(
   db: SupabaseClient,
 ): Promise<FulfillmentSummary> {
   return computeFulfillment(await readSupplies(db));
+}
+
+// Фул-фирмы с тарифом + сколько им начислено/оплачено по всем поставкам
+export async function getFulfillmentPartners(
+  db: SupabaseClient,
+): Promise<FulfillmentPartner[]> {
+  const { data, error } = await db
+    .from("fulfillment_partners")
+    .select("id, name, rate_per_unit_rub, note, archived")
+    .eq("org_id", DEMO_ORG_ID)
+    .order("archived")
+    .order("name");
+  if (error) throw error;
+  if (!data || data.length === 0) return [];
+
+  const supplies = await readSupplies(db);
+  return (data as unknown as Record<string, unknown>[]).map((p) => {
+    const own = supplies.filter((s) => s.fulfillmentPartnerId === p.id);
+    const chargedRub = own.reduce((t, s) => t + s.fulfillmentRub, 0);
+    const paidRub = own.reduce((t, s) => t + s.paidFulfillmentRub, 0);
+    return {
+      id: String(p.id),
+      name: String(p.name),
+      ratePerUnitRub: Number(p.rate_per_unit_rub ?? 0),
+      note: (p.note as string) ?? null,
+      archived: Boolean(p.archived),
+      suppliesCount: own.length,
+      chargedRub,
+      paidRub,
+      owedRub: Math.max(0, chargedRub - paidRub),
+    };
+  });
 }
 
 // ─── Финансы ─────────────────────────────────────────────────────────────────
@@ -814,8 +965,9 @@ export async function getFinanceRows(
 // ─── План продаж WB (полугодие): план/факт по дням ───────────────────────────
 
 // Текущее полугодие WB (клиент: план со 2 июля). Дефолт до ввода суммы.
+// Период программы WB «скидка за выполнение плана»: полугодие 02.07–31.12
 const DEFAULT_PLAN_START = "2026-07-02";
-const DEFAULT_PLAN_END = "2026-12-28";
+const DEFAULT_PLAN_END = "2026-12-31";
 
 export async function getSalesPlanView(
   db: SupabaseClient,
@@ -859,6 +1011,7 @@ export async function getSalesPlanView(
   const dailyPlanRub = Math.round(amountRub / totalDays);
   let factToDateRub = 0;
   let passedDays = 0;
+  const pastFacts: number[] = []; // полные прошедшие дни (без сегодняшнего)
   for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
     const iso = isoDate(d);
     const isFuture = iso > today;
@@ -866,12 +1019,28 @@ export async function getSalesPlanView(
     if (!isFuture) {
       factToDateRub += factRub;
       passedDays += 1;
+      if (iso < today) pastFacts.push(factRub);
     }
     days.push({ date: iso, label: dayLabel(iso), planRub: dailyPlanRub, factRub, isFuture });
   }
 
   const planToDateRub = dailyPlanRub * passedDays;
-  const remainingDays = Math.max(1, totalDays - passedDays);
+  // «Осталось дней» — как в ЛК: сегодня ещё можно продавать, считаем его
+  const remainingDays = Math.max(1, totalDays - passedDays + (passedDays > 0 ? 1 : 0));
+  const remainingRub = Math.max(0, Math.round(amountRub - factToDateRub));
+
+  // Текущий темп — средний факт за последние 14 полных дней (сегодняшний день
+  // неполный и занизил бы прогноз)
+  const tail = pastFacts.slice(-14);
+  const avgDailyFactRub = tail.length
+    ? Math.round(tail.reduce((t, v) => t + v, 0) / tail.length)
+    : 0;
+  const futureDays = Math.max(0, totalDays - passedDays);
+  const forecastRub = Math.round(factToDateRub + avgDailyFactRub * futureDays);
+
+  // Валюта кабинета: statistics-заказы приходят в ней же (сверено с финотчётом)
+  const currency = await storeCurrency(db);
+
   return {
     hasPlan: amountRub > 0,
     periodStart,
@@ -880,9 +1049,16 @@ export async function getSalesPlanView(
     factToDateRub,
     planToDateRub,
     completionPct: planToDateRub > 0 ? Math.round((factToDateRub / planToDateRub) * 100) : 0,
+    completionTotalPct:
+      amountRub > 0 ? Math.round((factToDateRub / amountRub) * 1000) / 10 : 0,
     dailyPlanRub,
-    neededDailyRub:
-      amountRub > 0 ? Math.max(0, Math.round((amountRub - factToDateRub) / remainingDays)) : 0,
+    neededDailyRub: amountRub > 0 ? Math.max(0, Math.round(remainingRub / remainingDays)) : 0,
+    remainingRub,
+    remainingDays,
+    avgDailyFactRub,
+    forecastRub,
+    forecastPct: amountRub > 0 ? Math.round((forecastRub / amountRub) * 100) : 0,
+    currency,
     days,
   };
 }
@@ -1220,12 +1396,36 @@ type DutyTemplateRow = {
 export { ensureDutyAssignments } from "./duties-core";
 import { ensureDutyAssignments as ensureDuties } from "./duties-core";
 
+// Генерация нарядов — идемпотентная запись в БД (3–4 запроса к Supabase, ~1.5 с).
+// Раньше она шла на КАЖДЫЙ рендер «Регламента» и «Отчётов», из-за чего эти две
+// вкладки были единственными, что оставались медленными даже с тёплым кэшем.
+// Наряды и так генерирует cron (/api/cron/duties); ленивый вызов здесь —
+// подстраховка. Пять минут: наряды выдаются на день, а пометка просроченных
+// (missed) считается от due_time с точностью до часа — задержка в пределах
+// пяти минут на неё не влияет, зато вкладка перестаёт платить ~2 с за проверку.
+const ENSURE_DUTIES_TTL_MS = 5 * 60_000;
+let ensureDutiesAt = 0;
+let ensureDutiesInFlight: Promise<void> | null = null;
+
+async function ensureDutiesThrottled(db: SupabaseClient): Promise<void> {
+  if (Date.now() - ensureDutiesAt < ENSURE_DUTIES_TTL_MS) return;
+  // Параллельные рендеры не должны запускать генерацию несколько раз
+  ensureDutiesInFlight ??= ensureDuties(db)
+    .then(() => {
+      ensureDutiesAt = Date.now();
+    })
+    .finally(() => {
+      ensureDutiesInFlight = null;
+    });
+  return ensureDutiesInFlight;
+}
+
 async function readDuties(
   db: SupabaseClient,
   date: string,
   assigneeId?: string,
 ): Promise<DutyItem[]> {
-  await ensureDuties(db);
+  await ensureDutiesThrottled(db);
 
   let q = db
     .from("duty_assignments")
@@ -1335,17 +1535,6 @@ export async function getTaskReports(
 export async function getRnpProducts(
   db: SupabaseClient,
 ): Promise<RnpProduct[]> {
-  const { data: products, error } = await db
-    .from("products")
-    .select(
-      "id, nm_id, title, status, category, cost_price, logistics_cost, responsible:profiles(full_name)",
-    )
-    .eq("store_id", DEMO_STORE_ID)
-    .order("nm_id");
-  if (error) throw error;
-  if (!products || products.length === 0) return [];
-
-  const pids = products.map((p) => p.id as string);
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const curMonday = mondayOf(today);
@@ -1355,10 +1544,16 @@ export async function getRnpProducts(
   // Заказы/продажи/остатки — дневные агрегаты в Postgres (rpc 0016/0022).
   // agg_rnp_daily (~4.5k строк) и agg_stock_sizes (~1.4k) — через rpcAll:
   // PostgREST режет и rpc-ответы до 1000 строк (терялись данные РНП!).
+  //
+  // Товары раньше читались ОТДЕЛЬНЫМ ожиданием перед этим блоком — только ради
+  // списка pids для фильтра планов. Планы теперь отбираются inner-join'ом по
+  // products.store_id, поэтому все восемь запросов идут параллельно (минус одна
+  // круговая задержка, плюс исчез URL с 300+ uuid в параметре .in()).
   type StockSizeRow = { product_id: string; size: string | null; on_stock: number; in_transit: number; in_production: number };
   type RnpDailyRow = { nm_id: number; day: string; orders_qty: number; orders_sum: number; sales_qty: number; sales_sum: number; spp_avg: number };
-  const [plansRes, stock, rnpDaily, funnelRes, advertRes, ueRows, tariffRes] = await Promise.all([
-    db.from("rnp_plans").select("product_id, iso_year, iso_week, plan_orders, plan_sales, plan_views, giveaways").in("product_id", pids),
+  const [prodRes, plansRes, stock, rnpDaily, funnelRes, advertRes, ueRows, tariffRes] = await Promise.all([
+    db.from("products").select("id, nm_id, title, status, category, cost_price, logistics_cost, responsible:profiles(full_name)").eq("store_id", DEMO_STORE_ID).order("nm_id"),
+    db.from("rnp_plans").select("product_id, iso_year, iso_week, plan_orders, plan_sales, plan_views, giveaways, products!inner(store_id)").eq("products.store_id", DEMO_STORE_ID),
     rpcAll<StockSizeRow>(db, "agg_stock_sizes", { p_store: DEMO_STORE_ID }),
     rpcAll<RnpDailyRow>(db, "agg_rnp_daily", { p_store: DEMO_STORE_ID, p_since: windowStart.toISOString() }),
     db.from("raw_funnel_daily").select("nm_id, stat_date, open_card_count, add_to_cart_count, orders_count, buyouts_count").eq("store_id", DEMO_STORE_ID).gte("stat_date", isoDate(windowStart)),
@@ -1367,6 +1562,10 @@ export async function getRnpProducts(
     readUnitEconAgg(db, windowStart, today).catch(() => [] as UnitEconAggRow[]),
     db.from("wb_commission_tariffs").select("subject_name, kgvp_marketplace").eq("store_id", DEMO_STORE_ID),
   ]);
+
+  if (prodRes.error) throw prodRes.error;
+  const products = prodRes.data;
+  if (!products || products.length === 0) return [];
 
   for (const res of [plansRes, funnelRes, advertRes]) {
     if (res.error) throw res.error;

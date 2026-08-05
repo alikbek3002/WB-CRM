@@ -48,10 +48,17 @@ export function formatAmount(value: number, currency = "RUB"): string {
 // оси — визуальный шум.
 export function formatCompact(value: number): string {
   const abs = Math.abs(value);
+  if (abs >= 10_000_000_000) return `${Math.round(value / 1_000_000_000)} млрд`;
+  if (abs >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(1).replace(".", ",")} млрд`;
   if (abs >= 10_000_000) return `${Math.round(value / 1_000_000)} млн`;
   if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(1).replace(".", ",")} млн`;
   if (abs >= 1_000) return `${Math.round(value / 1_000)} тыс`;
   return String(Math.round(value));
+}
+
+// Компактная сумма в валюте кабинета: «25,3 млрд сом», «138 млн ₽»
+export function formatCompactAmount(value: number, currency = "RUB"): string {
+  return `${formatCompact(value)} ${currencySign(currency)}`;
 }
 
 export function formatMoney(value: number, currency: string): string {

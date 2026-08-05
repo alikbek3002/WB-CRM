@@ -4,15 +4,16 @@ import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
 import { mirrorSupplyPaymentToCash } from "@/backend/data/cash-core";
-import { invalidateWbData } from "@/backend/data/revalidate";
+import { invalidateWbData, SUPPLY_SCOPES, MONEY_SCOPES } from "@/backend/data/revalidate";
 
 export const runtime = "nodejs";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Оплата по поставке (КП 4.2: финансисты — товар/карго, мультивалюта). Роль supply:pay.
+// Оплата по поставке (КП 4.2: финансисты — товар/карго/фул-фирма, мультивалюта).
+// Роль supply:pay.
 const paymentSchema = z.object({
-  kind: z.enum(["goods", "cargo"]),
+  kind: z.enum(["goods", "cargo", "fulfillment"]),
   amount: z.number().min(0),
   currency: z.enum(["cny", "uzs", "rub"]),
   paidAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
@@ -82,6 +83,6 @@ export async function POST(
     },
   );
 
-  invalidateWbData();
+  invalidateWbData(...SUPPLY_SCOPES, ...MONEY_SCOPES);
   return NextResponse.json({ ok: true, persisted: true });
 }

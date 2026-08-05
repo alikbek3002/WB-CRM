@@ -5,7 +5,7 @@ import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
 import { getProductList } from "@/backend/data";
-import { invalidateWbData } from "@/backend/data/revalidate";
+import { invalidateWbData, PRODUCT_SCOPES } from "@/backend/data/revalidate";
 
 export const runtime = "nodejs";
 
@@ -89,7 +89,7 @@ export async function POST(request: Request) {
     });
   }
 
-  invalidateWbData();
+  invalidateWbData(...PRODUCT_SCOPES);
   return NextResponse.json({ ok: true, persisted: true, id: data.id });
 }
 
@@ -167,6 +167,6 @@ export async function PATCH(request: Request) {
     });
   }
 
-  invalidateWbData();
+  invalidateWbData(...PRODUCT_SCOPES);
   return NextResponse.json({ ok: true, persisted: true });
 }

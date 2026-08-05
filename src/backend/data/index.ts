@@ -23,8 +23,41 @@ import * as db from "./supabase";
 
 export const dataSource = () => (getSupabaseAdmin() ? "supabase" : "mock");
 
-// Общий тег для точечного сброса кэша чтения после любой мутации.
+// Общий тег: сбрасывает ВЕСЬ кэш чтения. Нужен только там, где меняется всё
+// сразу (синк WB, ручной сброс). Точечные мутации должны звать invalidateWbData
+// со списком затронутых областей — см. ./revalidate.
 export const WB_DATA_TAG = "wb-data";
+
+// Отдельный тег для строки членства в getSession(). Раньше она висела на
+// WB_DATA_TAG, и любая мутация заставляла layout снова идти в Supabase.
+export const SESSION_TAG = "wb-session";
+
+// Области кэша = ключи cachedRead ниже. Мутация сбрасывает только свои.
+export type WbScope =
+  | "dashboard"
+  | "products"
+  | "finance"
+  | "sales-plan"
+  | "cash"
+  | "finance-refs"
+  | "expenses"
+  | "payroll"
+  | "members"
+  | "pnl"
+  | "unit-econ"
+  | "wb-incomes"
+  | "tasks"
+  | "integrations"
+  | "tariffs"
+  | "rnp"
+  | "team"
+  | "factories"
+  | "supplies"
+  | "fulfillment"
+  | "fulfillment-partners"
+  | "stocks-overview"
+  | "duty-stats"
+  | "design";
 
 // Сколько переиспользовать результат чтения между навигациями (сек).
 // 30 мин — в такт авто-синку WB: каждый синк сбрасывает тег и тут же прогревает
@@ -79,13 +112,20 @@ export const getSalesPlanView = cachedRead(
   () => ({
     hasPlan: false,
     periodStart: "2026-07-02",
-    periodEnd: "2026-12-28",
+    periodEnd: "2026-12-31",
     amountRub: 0,
     factToDateRub: 0,
     planToDateRub: 0,
     completionPct: 0,
+    completionTotalPct: 0,
     dailyPlanRub: 0,
     neededDailyRub: 0,
+    remainingRub: 0,
+    remainingDays: 0,
+    avgDailyFactRub: 0,
+    forecastRub: 0,
+    forecastPct: 0,
+    currency: "RUB",
     days: [],
   }),
 );
@@ -277,6 +317,12 @@ export const getFulfillment = cachedRead(
   mock.getFulfillment,
 );
 
+export const getFulfillmentPartners = cachedRead(
+  "fulfillment-partners",
+  db.getFulfillmentPartners,
+  () => [],
+);
+
 // ─── Остатки по складам ───────────────────────────────────────────────────────
 
 export const getStocksOverview = cachedRead(
@@ -296,10 +342,11 @@ export const getProductWarehouseOrders = (nmId: number) =>
   );
 
 // ─── Дизайн карточек ──────────────────────────────────────────────────────────
-// Без кэша: рабочая очередь дизайнера, мутации частые — свежесть важнее.
-
-export const getDesignRequests = () =>
-  fromDb(db.getDesignRequests, () => []);
+// Кэшируем под своим тегом. Раньше очередь дизайнера читалась мимо кэша ради
+// свежести — и вкладка стабильно стоила ~1.9 с на каждый заход. Свежесть от
+// кэша не страдает: оба роута дизайна зовут invalidateWbData("design") после
+// записи, поэтому изменение видно сразу, а не через TTL.
+export const getDesignRequests = cachedRead("design", db.getDesignRequests, () => []);
 
 // ─── Регламент и отчёты ───────────────────────────────────────────────────────
 // НЕ кэшируются: readDuties() → ensureDutyAssignments() пишет в БД (генерация
@@ -358,6 +405,7 @@ export async function warmReadCache(): Promise<{ ms: number; failed: number }> {
     getFactories,
     getSupplies,
     getFulfillment,
+    getFulfillmentPartners,
   ];
   let failed = 0;
   for (let i = 0; i < getters.length; i += 4) {

@@ -2,7 +2,12 @@ import { NoAccess } from "@/frontend/components/layout/no-access";
 import { SuppliesBoard } from "@/frontend/components/supplies/supplies-board";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
-import { getFactories, getProductList, getSupplies } from "@/backend/data";
+import {
+  getFactories,
+  getFulfillmentPartners,
+  getProductList,
+  getSupplies,
+} from "@/backend/data";
 
 export default async function SuppliesPage() {
   const session = await getSession();
@@ -10,10 +15,11 @@ export default async function SuppliesPage() {
     return <NoAccess roleLabel={session.roleLabel} />;
   }
 
-  const [supplies, factories, products] = await Promise.all([
+  const [supplies, factories, products, partners] = await Promise.all([
     getSupplies(),
     getFactories(),
     getProductList(),
+    getFulfillmentPartners(),
   ]);
 
   const canEdit = can(session.role, "supply:edit");
@@ -34,6 +40,9 @@ export default async function SuppliesPage() {
         supplies={supplies}
         factories={factories.map((f) => ({ id: f.id, name: f.name, country: f.country }))}
         products={products.map((p) => ({ id: p.id, title: p.title }))}
+        partners={partners
+          .filter((p) => !p.archived)
+          .map((p) => ({ id: p.id, name: p.name, ratePerUnitRub: p.ratePerUnitRub }))}
         canEdit={canEdit}
         canPay={canPay}
         canReceive={canReceive}

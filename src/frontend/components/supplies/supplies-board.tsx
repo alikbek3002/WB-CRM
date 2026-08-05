@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { Plus } from "lucide-react";
+import { Plus, X } from "lucide-react";
 import { Badge } from "@/frontend/components/ui/badge";
 import { Button } from "@/frontend/components/ui/button";
 import { Card, CardContent } from "@/frontend/components/ui/card";
@@ -33,11 +33,30 @@ import {
   TableRow,
 } from "@/frontend/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/frontend/components/ui/tabs";
+import { toRub } from "@/shared/constants";
 import { formatMoney, formatNumber, formatRub } from "@/shared/format";
 import type { Currency, Supply, SupplyStatus } from "@/shared/types";
 
 type FactoryOpt = { id: string; name: string; country: "china" | "uzbekistan" };
 type ProductOpt = { id: string; title: string };
+type PartnerOpt = { id: string; name: string; ratePerUnitRub: number };
+
+// Черновик позиции в форме создания поставки (строки — потому что это поля ввода)
+type ItemDraft = {
+  productId: string; // "none" — без привязки к карточке WB
+  title: string;
+  quantity: string;
+  sewingCost: string;
+  sewingCurrency: Currency;
+};
+
+const emptyItem = (cur: Currency): ItemDraft => ({
+  productId: "none",
+  title: "",
+  quantity: "",
+  sewingCost: "",
+  sewingCurrency: cur,
+});
 
 const CURRENCY_LABEL: Record<Currency, string> = {
   cny: "¥ юань",
@@ -98,6 +117,7 @@ export function SuppliesBoard({
   supplies,
   factories,
   products,
+  partners,
   canEdit,
   canPay,
   canReceive,
@@ -105,6 +125,7 @@ export function SuppliesBoard({
   supplies: Supply[];
   factories: FactoryOpt[];
   products: ProductOpt[];
+  partners: PartnerOpt[];
   canEdit: boolean;
   canPay: boolean;
   canReceive: boolean;
@@ -206,6 +227,7 @@ export function SuppliesBoard({
 
       {canEdit && (
         <CreateSupplyDialog
+          partners={partners}
           open={createOpen}
           onOpenChange={setCreateOpen}
           factories={factories}
@@ -230,72 +252,103 @@ function CreateSupplyDialog({
   onOpenChange,
   factories,
   products,
+  partners,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   factories: FactoryOpt[];
   products: ProductOpt[];
+  partners: PartnerOpt[];
 }) {
   const router = useRouter();
   const [factoryId, setFactoryId] = useState(factories[0]?.id ?? "");
-  const [productId, setProductId] = useState("none");
   const [title, setTitle] = useState("");
-  const [quantity, setQuantity] = useState("");
   const [shipDate, setShipDate] = useState(todayIso());
-  const [sewingCost, setSewingCost] = useState("");
-  const [sewingCurrency, setSewingCurrency] = useState<Currency>("cny");
+  const [items, setItems] = useState<ItemDraft[]>([emptyItem("cny")]);
   const [cargoCost, setCargoCost] = useState("");
   const [cargoCurrency, setCargoCurrency] = useState<Currency>("cny");
+  const [partnerId, setPartnerId] = useState("none");
   const [saving, setSaving] = useState(false);
 
   function pickFactory(id: string) {
     setFactoryId(id);
     const f = factories.find((x) => x.id === id);
     const cur: Currency = f?.country === "uzbekistan" ? "uzs" : "cny";
-    setSewingCurrency(cur);
     setCargoCurrency(cur);
+    setItems((prev) => prev.map((i) => ({ ...i, sewingCurrency: cur })));
   }
 
-  function pickProduct(id: string) {
-    setProductId(id);
-    if (id !== "none" && !title.trim()) {
-      const p = products.find((x) => x.id === id);
-      if (p) setTitle(p.title);
-    }
+  const patchItem = (idx: number, patch: Partial<ItemDraft>) =>
+    setItems((prev) => prev.map((i, n) => (n === idx ? { ...i, ...patch } : i)));
+
+  function pickItemProduct(idx: number, id: string) {
+    const p = products.find((x) => x.id === id);
+    // Наименование подставляем из карточки, если его ещё не вводили руками
+    patchItem(idx, {
+      productId: id,
+      title: !items[idx].title.trim() && p ? p.title : items[idx].title,
+    });
   }
+
+  // Предпросчёт себестоимости единицы — та же формула, что и на приёмке
+  // (backend/data/cost-core.ts): карго и услуги ФФ делятся между позициями
+  // пропорционально количеству.
+  const totalQty = items.reduce((t, i) => t + (Number(i.quantity) || 0), 0);
+  const partner = partners.find((p) => p.id === partnerId) ?? null;
+  const cargoRub = toRub(Number(cargoCost) || 0, cargoCurrency);
+  const ffRub = partner ? partner.ratePerUnitRub * totalQty : 0;
+  const perUnitShared = totalQty > 0 ? (cargoRub + ffRub) / totalQty : 0;
 
   async function submit() {
     if (!factoryId) return toast.error("Выберите фабрику");
-    if (!title.trim()) return toast.error("Укажите наименование товара");
+    const filled = items.filter((i) => i.title.trim() || Number(i.quantity) > 0);
+    if (filled.length === 0) return toast.error("Добавьте хотя бы одну позицию");
+    if (filled.some((i) => !i.title.trim())) {
+      return toast.error("У каждой позиции должно быть наименование");
+    }
+
     setSaving(true);
     try {
+      const headTitle =
+        title.trim() ||
+        (filled.length === 1
+          ? filled[0].title.trim()
+          : `${filled[0].title.trim()} и ещё ${filled.length - 1}`);
+
       const res = await fetch("/api/supplies", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           factoryId,
-          productId: productId === "none" ? null : productId,
-          title: title.trim(),
-          quantity: Number(quantity) || 0,
+          title: headTitle,
+          quantity: totalQty,
           shipDate,
-          sewingCost: Number(sewingCost) || 0,
-          sewingCurrency,
+          // Отшив теперь живёт на позициях; в шапке оставляем нули
+          sewingCost: 0,
+          sewingCurrency: items[0]?.sewingCurrency ?? "cny",
           cargoCost: Number(cargoCost) || 0,
           cargoCurrency,
+          fulfillmentPartnerId: partnerId === "none" ? null : partnerId,
+          items: filled.map((i) => ({
+            productId: i.productId === "none" ? null : i.productId,
+            title: i.title.trim(),
+            quantity: Number(i.quantity) || 0,
+            sewingCost: Number(i.sewingCost) || 0,
+            sewingCurrency: i.sewingCurrency,
+          })),
         }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error ?? "Ошибка");
       toast.success(
         data.persisted
-          ? `Поставка «${title.trim()}» создана — статус «В пути»`
+          ? `Поставка «${headTitle}» создана — ${filled.length} поз., статус «В пути»`
           : `Поставка принята (демо — без записи в БД)`,
       );
       setTitle("");
-      setQuantity("");
-      setSewingCost("");
+      setItems([emptyItem(cargoCurrency)]);
       setCargoCost("");
-      setProductId("none");
+      setPartnerId("none");
       onOpenChange(false);
       router.refresh();
     } catch (e) {
@@ -311,7 +364,9 @@ function CreateSupplyDialog({
         <DialogHeader>
           <DialogTitle>Новая поставка</DialogTitle>
           <DialogDescription>
-            Карточка отгрузки с фабрики. Две стоимости: отшивка (долг фабрике) и карго.
+            Одно карго может везти несколько артикулов. Отшив указывается по каждой
+            позиции, а карго и услуги фул-фирмы делятся между ними пропорционально
+            количеству — из этого складывается себестоимость единицы.
           </DialogDescription>
         </DialogHeader>
 
@@ -337,50 +392,6 @@ function CreateSupplyDialog({
             )}
           </div>
 
-          <div className="grid grid-cols-2 gap-3 [&>div]:min-w-0">
-            <div className="grid gap-1.5">
-              <Label>Товар WB (необязательно)</Label>
-              <Select value={productId} onValueChange={(v) => v && pickProduct(v)}>
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="none">Без привязки</SelectItem>
-                  {products.map((p) => (
-                    <SelectItem key={p.id} value={p.id}>
-                      {p.title}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {products.length === 0 && (
-                <p className="text-xs text-muted-foreground">
-                  Товаров нет — добавьте на «Товарах», чтобы видеть «в пути».
-                </p>
-              )}
-            </div>
-            <div className="grid gap-1.5">
-              <Label htmlFor="sup-qty">Количество, шт</Label>
-              <Input
-                id="sup-qty"
-                type="number"
-                min={0}
-                value={quantity}
-                onChange={(e) => setQuantity(e.target.value)}
-              />
-            </div>
-          </div>
-
-          <div className="grid gap-1.5">
-            <Label htmlFor="sup-title">Наименование</Label>
-            <Input
-              id="sup-title"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              placeholder="Например, Кимоно шёлковое, айвори"
-            />
-          </div>
-
           <div className="grid gap-1.5">
             <Label htmlFor="sup-ship">Дата отгрузки</Label>
             <Input
@@ -391,20 +402,149 @@ function CreateSupplyDialog({
             />
           </div>
 
+          {/* Позиции: в одном карго обычно едет несколько артикулов. Отшив у
+              каждого свой, карго и услуги фул-фирмы делятся между ними. */}
+          <div className="space-y-2 rounded-lg border border-border/60 p-3">
+            <div className="flex items-center justify-between">
+              <Label className="text-xs text-muted-foreground">
+                Что везём · {items.length} поз. · {formatNumber(totalQty)} шт
+              </Label>
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={() => setItems((p) => [...p, emptyItem(cargoCurrency)])}
+              >
+                <Plus className="size-3.5" />
+                Позиция
+              </Button>
+            </div>
+
+            {items.map((item, idx) => {
+              const qty = Number(item.quantity) || 0;
+              const sewingPerUnit = qty > 0 ? toRub(Number(item.sewingCost) || 0, item.sewingCurrency) / qty : 0;
+              return (
+                <div key={idx} className="space-y-1.5 rounded-md bg-muted/20 p-2">
+                  <div className="flex items-center gap-2">
+                    <Select
+                      value={item.productId}
+                      onValueChange={(v) => v && pickItemProduct(idx, String(v))}
+                    >
+                      <SelectTrigger className="h-8 flex-1">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="none">Без привязки к WB</SelectItem>
+                        {products.map((p) => (
+                          <SelectItem key={p.id} value={p.id}>
+                            {p.title}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    {items.length > 1 && (
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        aria-label="Убрать позицию"
+                        onClick={() => setItems((p) => p.filter((_, n) => n !== idx))}
+                      >
+                        <X className="size-3.5" />
+                      </Button>
+                    )}
+                  </div>
+
+                  <Input
+                    value={item.title}
+                    onChange={(e) => patchItem(idx, { title: e.target.value })}
+                    placeholder="Наименование позиции"
+                    className="h-8"
+                  />
+
+                  <div className="grid grid-cols-[1fr_1.4fr] gap-2">
+                    <Input
+                      type="number"
+                      min={0}
+                      value={item.quantity}
+                      onChange={(e) => patchItem(idx, { quantity: e.target.value })}
+                      placeholder="шт"
+                      className="h-8"
+                    />
+                    <div className="flex gap-1">
+                      <Input
+                        type="number"
+                        min={0}
+                        value={item.sewingCost}
+                        onChange={(e) => patchItem(idx, { sewingCost: e.target.value })}
+                        placeholder="отшив за партию"
+                        className="h-8"
+                      />
+                      <Select
+                        value={item.sewingCurrency}
+                        onValueChange={(v) => v && patchItem(idx, { sewingCurrency: v as Currency })}
+                      >
+                        <SelectTrigger className="h-8 w-20">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="cny">¥</SelectItem>
+                          <SelectItem value="uzs">сум</SelectItem>
+                          <SelectItem value="rub">₽</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+
+                  {qty > 0 && (
+                    <div className="text-[10px] leading-tight text-muted-foreground">
+                      себестоимость ≈ {formatRub(Math.round(sewingPerUnit + perUnitShared))}/шт
+                      {perUnitShared > 0 &&
+                        ` (отшив ${formatRub(Math.round(sewingPerUnit))} + карго и ФФ ${formatRub(Math.round(perUnitShared))})`}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
           <CostRow
-            label="Отшивка (долг фабрике)"
-            cost={sewingCost}
-            onCost={setSewingCost}
-            currency={sewingCurrency}
-            onCurrency={setSewingCurrency}
-          />
-          <CostRow
-            label="Карго (перевозка)"
+            label="Карго на всю поставку"
             cost={cargoCost}
             onCost={setCargoCost}
             currency={cargoCurrency}
             onCurrency={setCargoCurrency}
           />
+
+          <div className="grid gap-1.5">
+            <Label>Фул-фирма (разбор и упаковка)</Label>
+            <Select value={partnerId} onValueChange={(v) => v && setPartnerId(String(v))}>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">Не привлекаем</SelectItem>
+                {partners.map((p) => (
+                  <SelectItem key={p.id} value={p.id}>
+                    {p.name} · {formatRub(p.ratePerUnitRub)}/шт
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {partner && totalQty > 0 && (
+              <p className="text-xs text-muted-foreground">
+                Начислим {formatRub(ffRub)} за {formatNumber(totalQty)} шт — войдёт в себестоимость.
+              </p>
+            )}
+          </div>
+
+          <div className="grid gap-1.5">
+            <Label htmlFor="sup-title">Название поставки (необязательно)</Label>
+            <Input
+              id="sup-title"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Например, Карго из Гуанчжоу, июль"
+            />
+          </div>
         </div>
 
         <DialogFooter>
@@ -534,7 +674,40 @@ function OverviewTab({ supply }: { supply: Supply }) {
         value={formatMoney(supply.sewingCost, supply.sewingCurrency)}
       />
       <Row label="Карго" value={formatMoney(supply.cargoCost, supply.cargoCurrency)} />
+      {supply.fulfillmentPartnerName && (
+        <Row
+          label={`Фул-фирма · ${supply.fulfillmentPartnerName}`}
+          value={formatRub(supply.fulfillmentRub)}
+        />
+      )}
       <Row label="В пути" value={supply.daysInTransit != null ? `${supply.daysInTransit} дн` : "—"} />
+
+      {/* Позиции с себестоимостью единицы: карго и услуги ФФ уже разнесены
+          между ними пропорционально количеству. */}
+      {supply.items.length > 0 && (
+        <div className="py-2">
+          <div className="mb-1.5 text-sm text-muted-foreground">
+            Позиции · {supply.items.length}
+          </div>
+          <div className="space-y-1.5">
+            {supply.items.map((i) => (
+              <div key={i.id} className="rounded-md bg-muted/20 px-2.5 py-1.5">
+                <div className="flex items-baseline justify-between gap-2 text-sm">
+                  <span className="truncate font-medium">{i.title}</span>
+                  <span className="shrink-0 tabular-nums">
+                    {formatNumber(i.receivedQty ?? i.quantity)} шт
+                  </span>
+                </div>
+                <div className="text-[11px] leading-tight text-muted-foreground">
+                  {formatRub(i.unitCostRub)}/шт = отшив {formatRub(i.sewingRub)} + карго{" "}
+                  {formatRub(i.cargoRub)}
+                  {i.fulfillmentRub > 0 && ` + фул-фирма ${formatRub(i.fulfillmentRub)}`}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       {supply.receivedQty != null && (
         <Row label="Принято" value={`${formatNumber(supply.receivedQty)} шт`} />
       )}
@@ -557,7 +730,7 @@ function OverviewTab({ supply }: { supply: Supply }) {
 
 function FinanceTab({ supply, canPay }: { supply: Supply; canPay: boolean }) {
   const router = useRouter();
-  const [kind, setKind] = useState<"goods" | "cargo">("goods");
+  const [kind, setKind] = useState<"goods" | "cargo" | "fulfillment">("goods");
   const [amount, setAmount] = useState("");
   const [currency, setCurrency] = useState<Currency>(supply.sewingCurrency);
   const [paidAt, setPaidAt] = useState(todayIso());
@@ -589,6 +762,9 @@ function FinanceTab({ supply, canPay }: { supply: Supply; canPay: boolean }) {
       <div className="divide-y divide-border/60">
         <Row label="Оплачено за товар" value={formatRub(supply.paidGoodsRub)} />
         <Row label="Оплачено за карго" value={formatRub(supply.paidCargoRub)} />
+        {(supply.fulfillmentRub > 0 || supply.paidFulfillmentRub > 0) && (
+          <Row label="Оплачено фул-фирме" value={formatRub(supply.paidFulfillmentRub)} />
+        )}
         <div className="flex items-center justify-between gap-2 py-1 text-sm">
           <span className="text-muted-foreground">Остаток долга</span>
           <span className={`tabular-nums font-medium ${supply.owedRub > 0 ? "text-amber-400" : "text-emerald-400"}`}>
@@ -602,7 +778,7 @@ function FinanceTab({ supply, canPay }: { supply: Supply; canPay: boolean }) {
           {supply.payments.map((p) => (
             <div key={p.id} className="flex items-center justify-between gap-2 border-b border-border/40 px-3 py-1.5 text-sm last:border-0">
               <span className="text-muted-foreground">
-                {p.kind === "goods" ? "Товар" : "Карго"} · {p.paidAt}
+                {p.kind === "goods" ? "Товар" : p.kind === "cargo" ? "Карго" : "Фул-фирма"} · {p.paidAt}
               </span>
               <span className="tabular-nums">{formatMoney(p.amount, p.currency)}</span>
             </div>
@@ -614,13 +790,14 @@ function FinanceTab({ supply, canPay }: { supply: Supply; canPay: boolean }) {
         <div className="space-y-2 rounded-lg border border-border/60 p-3">
           <div className="text-xs font-medium text-muted-foreground">Добавить оплату</div>
           <div className="flex gap-2">
-            <Select value={kind} onValueChange={(v) => setKind(v as "goods" | "cargo")}>
+            <Select value={kind} onValueChange={(v) => setKind(v as "goods" | "cargo" | "fulfillment")}>
               <SelectTrigger className="w-28">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="goods">Товар</SelectItem>
                 <SelectItem value="cargo">Карго</SelectItem>
+                <SelectItem value="fulfillment">Фул-фирма</SelectItem>
               </SelectContent>
             </Select>
             <Input

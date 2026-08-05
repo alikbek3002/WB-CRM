@@ -3,7 +3,7 @@ import { z } from "zod";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
-import { invalidateWbData } from "@/backend/data/revalidate";
+import { invalidateWbData, SUPPLY_SCOPES } from "@/backend/data/revalidate";
 
 export const runtime = "nodejs";
 
@@ -92,7 +92,7 @@ export async function POST(
     }
   }
 
-  invalidateWbData();
+  invalidateWbData(...SUPPLY_SCOPES);
   return NextResponse.json({
     ok: true,
     persisted: true,

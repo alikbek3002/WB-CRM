@@ -4,6 +4,7 @@ import { DEMO_ORG_ID } from "@/shared/constants";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
+import { invalidateWbData } from "@/backend/data/revalidate";
 import { notifyRoles, tgEsc } from "@/backend/telegram/notify";
 
 export const runtime = "nodejs";
@@ -63,5 +64,6 @@ export async function POST(request: Request) {
     `🎨 <b>Новая заявка на дизайн</b> от ${tgEsc(session.user.name)}:\n«${tgEsc(parsed.data.title)}»\n\nВзять в работу: CRM → Дизайн`,
   );
 
+  invalidateWbData("design");
   return NextResponse.json({ ok: true, persisted: true, id: data.id });
 }

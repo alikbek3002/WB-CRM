@@ -71,6 +71,6 @@ export async function PUT(request: Request) {
     return NextResponse.json({ error: "db_error" }, { status: 500 });
   }
 
-  invalidateWbData();
+  invalidateWbData("rnp");
   return NextResponse.json({ ok: true, persisted: true, plan: parsed.data });
 }

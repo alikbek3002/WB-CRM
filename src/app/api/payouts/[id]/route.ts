@@ -4,7 +4,7 @@ import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
 import { cancelPayout, decidePayout, payPayout } from "@/backend/data/payouts-core";
-import { invalidateWbData } from "@/backend/data/revalidate";
+import { invalidateWbData, MONEY_SCOPES, SUPPLY_SCOPES } from "@/backend/data/revalidate";
 
 export const runtime = "nodejs";
 
@@ -79,6 +79,6 @@ export async function PATCH(
     return NextResponse.json({ error: result.code, message: result.message }, { status });
   }
 
-  invalidateWbData();
+  invalidateWbData(...MONEY_SCOPES, ...SUPPLY_SCOPES);
   return NextResponse.json({ ok: true, message: result.message });
 }

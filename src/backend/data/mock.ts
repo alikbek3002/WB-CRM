@@ -354,9 +354,22 @@ export function getProductList(): ProductListItem[] {
       costPrice: s.cost,
       costPriceSource: "manual" as const,
       costPriceUpdatedAt: null,
+      costSewingRub: s.cost,
+      costCargoRub: 0,
+      costFulfillmentRub: 0,
       econ: null,
       logisticsCost: Math.round(70 + rnd() * 60),
       stockQty,
+      // Демо-разбивка по размерам: последний размер добирает остаток, чтобы
+      // сумма сходилась с stockQty — как в реальных данных.
+      sizes: ["S", "M", "L", "XL"].map((size, i, all) => {
+        const share = Math.round(stockQty / all.length);
+        return {
+          size,
+          onStock: i === all.length - 1 ? stockQty - share * (all.length - 1) : share,
+          inTransit: 0,
+        };
+      }),
       responsible: s.responsible,
       photoUrl: null,
       photos: [],
@@ -490,6 +503,14 @@ function seedToInput(seed: SupplySeed): SupplyInput {
   }));
   return {
     id: seed.id,
+    // Демо-режим: позиций и фул-фирмы нет — карточка старой схемы «один товар»,
+    // assembleSupply соберёт синтетическую позицию сам.
+    items: [],
+    cargoRateToRub: null,
+    fulfillmentPartnerId: null,
+    fulfillmentPartnerName: null,
+    fulfillmentRatePerUnitRub: 0,
+    fulfillmentCostRub: null,
     factoryId: factory.id,
     factoryName: factory.name,
     country: factory.country,

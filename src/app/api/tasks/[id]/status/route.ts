@@ -55,6 +55,6 @@ export async function POST(
     return NextResponse.json({ error: result.code, message: result.message }, { status });
   }
 
-  invalidateWbData();
+  invalidateWbData("tasks");
   return NextResponse.json({ ok: true, message: result.message });
 }

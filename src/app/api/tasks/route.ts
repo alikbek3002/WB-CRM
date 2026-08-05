@@ -105,6 +105,6 @@ export async function POST(request: Request) {
     );
   }
 
-  invalidateWbData();
+  invalidateWbData("tasks");
   return NextResponse.json({ ok: true, persisted: true, id: data.id });
 }

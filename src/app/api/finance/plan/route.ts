@@ -57,6 +57,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "db_error" }, { status: 500 });
   }
 
-  invalidateWbData();
+  invalidateWbData("sales-plan", "finance");
   return NextResponse.json({ ok: true, persisted: true });
 }
