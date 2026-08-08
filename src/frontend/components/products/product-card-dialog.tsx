@@ -28,14 +28,18 @@ const COST_SOURCE_LABEL: Record<CostPriceSource, string> = {
 };
 
 // Остатки по размерам — прямо в карточке, без раскрытия и догрузки.
-// Цвет подсказывает, где дырка в размерном ряду: 0 — размера нет в продаже,
-// «мало» — меньше 5% общего остатка товара (типовой признак вымывания).
+// Под остатком — «на сколько хватит» размера при темпе продаж за 30 дней.
+// Цвет подсказывает, где дырка в размерном ряду: красный — размера нет
+// (а если он при этом продавался — вымыт, сигнал к дозаказу), амбер — запаса
+// меньше двух недель. Пока данных о продажах по размерам нет (товар без
+// продаж), «мало» считается старой эвристикой: меньше 5% общего остатка.
 function SizeStocks({ sizes }: { sizes: ProductSizeStock[] }) {
   if (sizes.length === 0) return null;
 
   const total = sizes.reduce((t, s) => t + s.onStock, 0);
   const transit = sizes.reduce((t, s) => t + s.inTransit, 0);
   const out = sizes.filter((s) => s.onStock === 0).length;
+  const hasVelocity = sizes.some((s) => s.sales30d > 0);
 
   return (
     <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
@@ -51,15 +55,28 @@ function SizeStocks({ sizes }: { sizes: ProductSizeStock[] }) {
       <div className="flex flex-wrap gap-1.5">
         {sizes.map((s) => {
           const empty = s.onStock === 0;
-          const low = !empty && total > 0 && s.onStock / total < 0.05;
+          const low = hasVelocity
+            ? !empty && s.daysOfCover !== null && s.daysOfCover <= 14
+            : !empty && total > 0 && s.onStock / total < 0.05;
+          const rate = Math.round((s.sales30d / 30) * 10) / 10;
+          const hint = [
+            `${s.size}: ${formatNumber(s.onStock)} шт на складах`,
+            ...(s.inTransit > 0 ? [`${formatNumber(s.inTransit)} шт в пути`] : []),
+            s.sales30d > 0
+              ? `продажи за 30 дн: ${formatNumber(s.sales30d)} шт (${rate}/дн)`
+              : "продаж за 30 дн нет",
+            ...(s.daysOfCover !== null
+              ? [
+                  empty
+                    ? "вымыт — дозаказать"
+                    : `хватит на ~${formatNumber(s.daysOfCover)} дн`,
+                ]
+              : []),
+          ].join(" · ");
           return (
             <div
               key={s.size}
-              title={
-                s.inTransit > 0
-                  ? `${s.size}: ${formatNumber(s.onStock)} шт на складах, ${formatNumber(s.inTransit)} шт в пути`
-                  : `${s.size}: ${formatNumber(s.onStock)} шт на складах`
-              }
+              title={hint}
               className={`min-w-14 rounded-md border px-2 py-1 text-center ${
                 empty
                   ? "border-red-500/40 bg-red-500/5"
@@ -78,6 +95,19 @@ function SizeStocks({ sizes }: { sizes: ProductSizeStock[] }) {
               >
                 {formatNumber(s.onStock)}
               </div>
+              {s.daysOfCover !== null && (
+                <div
+                  className={`text-[10px] leading-tight tabular-nums ${
+                    empty
+                      ? "text-red-400"
+                      : low
+                        ? "text-amber-400"
+                        : "text-muted-foreground"
+                  }`}
+                >
+                  {s.daysOfCover > 999 ? "999+" : s.daysOfCover} дн
+                </div>
+              )}
               {s.inTransit > 0 && (
                 <div className="text-[10px] leading-tight text-muted-foreground">
                   +{formatNumber(s.inTransit)}
@@ -88,9 +118,19 @@ function SizeStocks({ sizes }: { sizes: ProductSizeStock[] }) {
         })}
       </div>
 
-      {transit > 0 && (
-        <div className="mt-2 text-[11px] text-muted-foreground">
-          Серым «+N» — в пути между складами WB, всего {formatNumber(transit)} шт
+      {(hasVelocity || transit > 0) && (
+        <div className="mt-2 space-y-0.5 text-[11px] text-muted-foreground">
+          {hasVelocity && (
+            <div>
+              «N дн» — на сколько хватит размера при темпе продаж за 30 дней;
+              «0 дн» у пустого — размер продавался и вымыт
+            </div>
+          )}
+          {transit > 0 && (
+            <div>
+              Серым «+N» — в пути между складами WB, всего {formatNumber(transit)} шт
+            </div>
+          )}
         </div>
       )}
     </div>

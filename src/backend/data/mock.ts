@@ -364,10 +364,15 @@ export function getProductList(): ProductListItem[] {
       // сумма сходилась с stockQty — как в реальных данных.
       sizes: ["S", "M", "L", "XL"].map((size, i, all) => {
         const share = Math.round(stockQty / all.length);
+        const onStock =
+          i === all.length - 1 ? stockQty - share * (all.length - 1) : share;
+        const sales30d = Math.round(salesRank30d / all.length);
         return {
           size,
-          onStock: i === all.length - 1 ? stockQty - share * (all.length - 1) : share,
+          onStock,
           inTransit: 0,
+          sales30d,
+          daysOfCover: sales30d > 0 ? Math.round(onStock / (sales30d / 30)) : null,
         };
       }),
       responsible: s.responsible,

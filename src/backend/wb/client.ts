@@ -239,6 +239,7 @@ export type WbSaleRow = {
   priceWithDisc: number;
   forPay: number;
   spp: number;
+  techSize?: string; // размер (42, S, 0 у безразмерных) — для runway по размерам
 };
 
 export function fetchSales(

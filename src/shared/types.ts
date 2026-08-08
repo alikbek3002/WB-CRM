@@ -116,11 +116,13 @@ export type ProductUnitEcon = {
   drrPct: number; // реклама / выручка
 };
 
-// Остаток одного размера товара (последний снимок складов WB)
+// Остаток одного размера товара (последний снимок складов WB) + скорость
 export type ProductSizeStock = {
   size: string;
   onStock: number; // на складах WB
   inTransit: number; // в пути между складами WB
+  sales30d: number; // продаж этого размера за 30 дней
+  daysOfCover: number | null; // на сколько хватит размера (дней); null — продаж нет
 };
 
 export type ProductListItem = {

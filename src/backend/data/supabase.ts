@@ -257,8 +257,9 @@ export async function getProductList(
   ueFrom.setDate(ueFrom.getDate() - 29);
 
   type SizeRow = { product_id: string; size: string | null; on_stock: number; in_transit: number };
+  type SaleSizeRow = { nm_id: number; size: string | null; cnt: number };
 
-  const [prodRes, stockRes, sizeRows, supplies, salesRes, ueRows] = await Promise.all([
+  const [prodRes, stockRes, sizeRows, supplies, salesRes, saleSizeRows, ueRows] = await Promise.all([
     db
       .from("products")
       .select(
@@ -280,6 +281,12 @@ export async function getProductList(
       p_store: DEMO_STORE_ID,
       p_since: since.toISOString(),
     }),
+    // Те же продажи в разрезе размеров (0038) → «на сколько хватит» каждого
+    // размера. Строк nm×размер — за тысячу, поэтому rpcAll.
+    rpcAll<SaleSizeRow>(db, "agg_sales_by_size", {
+      p_store: DEMO_STORE_ID,
+      p_since: since.toISOString(),
+    }),
     // Юнит-экономика за 30 дней (agg_unit_econ 0035). Ошибка не роняет список:
     // до применения миграции/бэкфилла колонка «Маржа» просто пустая.
     readUnitEconAgg(db, ueFrom, ueTo).catch(() => [] as UnitEconAggRow[]),
@@ -297,20 +304,31 @@ export async function getProductList(
     ]),
   );
 
-  // Размеры по товарам: группируем и сразу упорядочиваем, чтобы клиент просто
-  // рисовал готовый список. Размеры без остатка и транзита не показываем —
-  // это снятые с продажи позиции, они только зашумляют карточку.
-  const sizesByProduct = new Map<string, ProductSizeStock[]>();
+  // Размеры по товарам: остатки группируем как есть, финальный список (с
+  // фильтром шума и скоростью продаж) собирается в map(p) — там известен nm_id.
+  const normSize = (s: string | null | undefined) => s?.trim() || "б/р";
+  const sizesByProduct = new Map<
+    string,
+    { size: string; onStock: number; inTransit: number }[]
+  >();
   for (const r of sizeRows) {
-    const onStock = Number(r.on_stock ?? 0);
-    const inTransit = Number(r.in_transit ?? 0);
-    if (onStock === 0 && inTransit === 0) continue;
     const list = sizesByProduct.get(r.product_id) ?? [];
-    list.push({ size: r.size?.trim() || "б/р", onStock, inTransit });
+    list.push({
+      size: normSize(r.size),
+      onStock: Number(r.on_stock ?? 0),
+      inTransit: Number(r.in_transit ?? 0),
+    });
     sizesByProduct.set(r.product_id, list);
   }
-  for (const list of sizesByProduct.values()) {
-    list.sort((a, b) => compareSizes(a.size, b.size));
+
+  // Продажи 30 дней в разрезе размеров: nm_id → размер → шт
+  const salesBySize = new Map<number, Map<string, number>>();
+  for (const r of saleSizeRows) {
+    const nm = Number(r.nm_id);
+    const m = salesBySize.get(nm) ?? new Map<string, number>();
+    const key = normSize(r.size);
+    m.set(key, (m.get(key) ?? 0) + Number(r.cnt));
+    salesBySize.set(nm, m);
   }
 
   const inTransitByProduct = new Map<string, number>();
@@ -345,6 +363,29 @@ export async function getProductList(
     const avgDailySales = Math.round(avgExact * 10) / 10;
     const daysOfCover = avgExact > 0 ? Math.round(stockQty / avgExact) : null;
     const isWeak = salesRank30d < 120 || (daysOfCover !== null && daysOfCover > 120);
+
+    // Размерный ряд: остаток + скорость размера → «на сколько хватит».
+    // Ноль остатка и транзита БЕЗ продаж — снятый с продажи размер, шум.
+    // С продажами — вымытый размер: показываем нулём, это сигнал к дозаказу.
+    const sizeSales = salesBySize.get(nmId) ?? new Map<string, number>();
+    const seenSizes = new Set<string>();
+    const sizes: ProductSizeStock[] = [];
+    for (const s of sizesByProduct.get(p.id as string) ?? []) {
+      seenSizes.add(s.size);
+      const cnt = sizeSales.get(s.size) ?? 0;
+      if (s.onStock === 0 && s.inTransit === 0 && cnt === 0) continue;
+      sizes.push({
+        ...s,
+        sales30d: cnt,
+        daysOfCover: cnt > 0 ? Math.round(s.onStock / (cnt / 30)) : null,
+      });
+    }
+    for (const [size, cnt] of sizeSales) {
+      if (cnt > 0 && !seenSizes.has(size)) {
+        sizes.push({ size, onStock: 0, inTransit: 0, sales30d: cnt, daysOfCover: 0 });
+      }
+    }
+    sizes.sort((a, b) => compareSizes(a.size, b.size));
 
     // Экономика за 30 дней: полный водопад из фактических отчётов WB
     const cost = Number(p.cost_price ?? 0);
@@ -407,7 +448,7 @@ export async function getProductList(
       econ,
       logisticsCost: Number(p.logistics_cost ?? 0),
       stockQty,
-      sizes: sizesByProduct.get(p.id as string) ?? [],
+      sizes,
       responsible: responsible?.full_name ?? "—",
       photoUrl: (p.photo_url as string) ?? null,
       photos: Array.isArray(p.photos) ? (p.photos as string[]) : [],

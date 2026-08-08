@@ -27,6 +27,8 @@ const sizeSchema = z.object({
   size: z.string(),
   onStock: z.number(),
   inTransit: z.number(),
+  sales30d: z.number().optional(), // продажи размера за 30 дней
+  daysOfCover: z.number().nullable().optional(), // на сколько хватит размера
 });
 
 const metricsSchema = z.object({
@@ -199,14 +201,20 @@ function heuristic(m: Metrics, f: ProductFunnel | null): ProductRecommendation {
   const gone = sizes.filter((s) => s.onStock === 0);
   if (sizes.length > 0 && gone.length > 0) {
     const share = Math.round((gone.length / sizes.length) * 100);
+    // Вымытые с продажами за 30 дней — доказанный спрос, их называем отдельно
+    const selling = gone.filter((s) => (s.sales30d ?? 0) > 0);
     problems.push({
       metric: "Размеры",
-      severity: share >= 50 ? "high" : "medium",
-      reason: `Нет в наличии ${gone.length} из ${sizes.length} размеров (${gone.map((s) => s.size).join(", ")}). Спрос на них уходит конкурентам, а карточка теряет позиции.`,
+      severity: share >= 50 || selling.length > 0 ? "high" : "medium",
+      reason:
+        `Нет в наличии ${gone.length} из ${sizes.length} размеров (${gone.map((s) => s.size).join(", ")}). Спрос на них уходит конкурентам, а карточка теряет позиции.` +
+        (selling.length > 0
+          ? ` Размеры ${selling.map((s) => `${s.size} (${s.sales30d} шт/30 дн)`).join(", ")} продавались до самого нуля — спрос доказан.`
+          : ""),
     });
     recs.push({
       area: "sizes",
-      action: `Допоставить вымытые размеры: ${gone.map((s) => s.size).join(", ")}`,
+      action: `Допоставить вымытые размеры: ${(selling.length > 0 ? selling : gone).map((s) => s.size).join(", ")}`,
       impact: "Возврат потерянного спроса по ходовым размерам",
       priority: 1,
     });
@@ -308,7 +316,9 @@ const ANALYST_SYSTEM = `Ты — аналитик маркетплейса Wildb
 Если воронки нет (funnel = null) — не выдумывай её, опирайся на остальное.
 
 Что ещё учитывать: наполнение карточки (photosCount, descriptionLength), дыры в размерном
-ряду (sizes с onStock = 0 — вымытые размеры, спрос по ним уходит), запас (daysOfCover),
+ряду (sizes с onStock = 0 — вымытые размеры, спрос по ним уходит; sales30d и daysOfCover
+внутри sizes — скорость и запас КАЖДОГО размера: вымытый размер с sales30d > 0 — доказанный
+спрос, дозаказ в приоритете), запас товара целиком (daysOfCover),
 экономику (marginPct, drrPct) и сравнение с медианой каталога самого продавца (catalog).
 
 Правила:

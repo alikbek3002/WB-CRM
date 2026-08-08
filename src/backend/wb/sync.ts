@@ -447,6 +447,7 @@ export async function runWbSync(
               price_with_disc: s.priceWithDisc,
               for_pay: s.forPay,
               spp_percent: s.spp,
+              tech_size: s.techSize ?? null,
               is_return: s.saleID.startsWith("R"),
             }
           : null,
