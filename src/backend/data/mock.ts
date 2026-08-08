@@ -9,6 +9,7 @@ import type {
   FinanceRow,
   FulfillmentSummary,
   IntegrationStatus,
+  ProductGroup,
   ProductListItem,
   RnpDay,
   RnpProduct,
@@ -375,6 +376,8 @@ export function getProductList(): ProductListItem[] {
           daysOfCover: sales30d > 0 ? Math.round(onStock / (sales30d / 30)) : null,
         };
       }),
+      groupId: null,
+      groupName: null,
       responsible: s.responsible,
       photoUrl: null,
       photos: [],
@@ -540,6 +543,10 @@ function seedToInput(seed: SupplySeed): SupplyInput {
 
 export function getSupplies(): Supply[] {
   return SUPPLY_SEEDS.map((seed) => assembleSupply(seedToInput(seed)));
+}
+
+export function getProductGroups(): ProductGroup[] {
+  return [];
 }
 
 export function getFactories(): Factory[] {

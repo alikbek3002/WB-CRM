@@ -26,11 +26,15 @@ import {
 } from "@/frontend/components/products/products-filters";
 import { ProductForm } from "@/frontend/components/products/product-form";
 import {
+  GroupSelect,
+  GroupsManageDialog,
+} from "@/frontend/components/products/product-groups";
+import {
   catalogContext,
   RecoButton,
 } from "@/frontend/components/products/reco-button";
 import { formatNumber, formatRub } from "@/shared/format";
-import type { ProductListItem } from "@/shared/types";
+import type { ProductGroup, ProductListItem } from "@/shared/types";
 
 type ViewMode = "cards" | "table";
 const VIEW_KEY = "wbcrm-products-view";
@@ -51,10 +55,14 @@ function GridCard({
   product,
   canEdit,
   catalog,
+  groups,
+  canGroups,
 }: {
   product: ProductListItem;
   canEdit: boolean;
   catalog?: ReturnType<typeof catalogContext>;
+  groups: ProductGroup[];
+  canGroups: boolean;
 }) {
   const [open, setOpen] = useState(false);
 
@@ -143,6 +151,8 @@ function GridCard({
         open={open}
         onOpenChange={setOpen}
         catalog={catalog}
+        groups={groups}
+        canGroups={canGroups}
       />
     </>
   );
@@ -154,11 +164,18 @@ function ProductsTable({
   products,
   canEdit,
   catalog,
+  groups,
+  canGroups,
 }: {
   products: ProductListItem[];
   canEdit: boolean;
   catalog?: ReturnType<typeof catalogContext>;
+  groups: ProductGroup[];
+  canGroups: boolean;
 }) {
+  // Колонка «Группа» появляется, когда группы заведены: право назначать даёт
+  // селект, остальным — просто название группы товара
+  const showGroups = groups.length > 0 || products.some((p) => p.groupId !== null);
   return (
     <Card className="py-0">
       <CardContent className="px-0">
@@ -168,6 +185,7 @@ function ProductsTable({
               <TableHead>Товар</TableHead>
               <TableHead>Категория</TableHead>
               <TableHead>Статус</TableHead>
+              {showGroups && <TableHead>Группа</TableHead>}
               <TableHead className="text-right">Цена WB</TableHead>
               <TableHead className="text-right">Себест.</TableHead>
               <TableHead className="text-right">Маржа</TableHead>
@@ -183,7 +201,12 @@ function ProductsTable({
               <TableRow key={p.id}>
                 <TableCell>
                   <div className="flex items-center gap-2">
-                    <ProductCell product={p} catalog={catalog} />
+                    <ProductCell
+                      product={p}
+                      catalog={catalog}
+                      groups={groups}
+                      canGroups={canGroups}
+                    />
                     {p.isWeak && (
                       <Badge
                         variant="outline"
@@ -200,6 +223,22 @@ function ProductsTable({
                     {p.status}
                   </Badge>
                 </TableCell>
+                {showGroups && (
+                  <TableCell>
+                    {canGroups ? (
+                      <GroupSelect
+                        productId={p.id}
+                        value={p.groupId}
+                        groups={groups}
+                        className="h-7 w-36 text-xs"
+                      />
+                    ) : (
+                      <span className="text-muted-foreground">
+                        {p.groupName ?? "—"}
+                      </span>
+                    )}
+                  </TableCell>
+                )}
                 <TableCell className="text-right tabular-nums">
                   {p.priceDiscountedWb !== null ? formatRub(p.priceDiscountedWb) : "—"}
                 </TableCell>
@@ -261,10 +300,14 @@ function ProductsTable({
 
 export function ProductsView({
   products,
+  groups,
   canEdit,
+  canGroups,
 }: {
   products: ProductListItem[];
+  groups: ProductGroup[];
   canEdit: boolean;
+  canGroups: boolean;
 }) {
   const [view, setView] = useState<ViewMode>("cards");
   const [filters, setFilters] = useState<ProductFilters>(EMPTY_FILTERS);
@@ -306,11 +349,15 @@ export function ProductsView({
     <div className="space-y-3">
       <ProductsFilters
         products={products}
+        groups={groups}
         shown={visible.length}
         filters={filters}
         onChange={setFilters}
         right={
           <>
+            {canGroups && (
+              <GroupsManageDialog groups={groups} products={products} />
+            )}
             {canEdit && <CostImportDialog />}
             <div className="flex gap-1 rounded-lg border border-border/60 p-0.5">
               <Button
@@ -349,11 +396,24 @@ export function ProductsView({
       ) : view === "cards" ? (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
           {visible.map((p) => (
-            <GridCard key={p.id} product={p} canEdit={canEdit} catalog={catalog} />
+            <GridCard
+              key={p.id}
+              product={p}
+              canEdit={canEdit}
+              catalog={catalog}
+              groups={groups}
+              canGroups={canGroups}
+            />
           ))}
         </div>
       ) : (
-        <ProductsTable products={visible} canEdit={canEdit} catalog={catalog} />
+        <ProductsTable
+          products={visible}
+          canEdit={canEdit}
+          catalog={catalog}
+          groups={groups}
+          canGroups={canGroups}
+        />
       )}
     </div>
   );

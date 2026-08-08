@@ -31,7 +31,8 @@ export type Permission =
   | "rnp:view"
   | "rnp:edit" // редактирование планов
   | "products:view"
-  | "products:edit" // себестоимость, статусы, группы
+  | "products:edit" // себестоимость, статусы, карточки
+  | "products:groups" // создать/удалить группы товаров и раскидать по ним товары
   | "finance:view"
   | "finance:plan" // задать план продаж WB на период
   | "finance:cash" // касса: остатки по счетам, движение денег, ОПиУ
@@ -67,6 +68,7 @@ const ALL: Permission[] = [
   "rnp:edit",
   "products:view",
   "products:edit",
+  "products:groups",
   "finance:view",
   "finance:plan",
   "finance:cash",
@@ -103,6 +105,7 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
     "rnp:edit",
     "products:view",
     "products:edit",
+    "products:groups", // директор и ст. менеджер делят товары по группам
     "finance:view",
     "finance:plan",
     "finance:cash",

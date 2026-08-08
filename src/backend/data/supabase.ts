@@ -18,6 +18,7 @@ import type {
   IntegrationStatus,
   PlanFactDay,
   CostPriceSource,
+  ProductGroup,
   ProductListItem,
   ProductSizeStock,
   ProductStockRow,
@@ -263,7 +264,7 @@ export async function getProductList(
     db
       .from("products")
       .select(
-        "id, nm_id, vendor_code, title, brand, category, status, cost_price, cost_price_source, cost_price_updated_at, cost_sewing_rub, cost_cargo_rub, cost_fulfillment_rub, logistics_cost, photo_url, photos, description, price_wb, price_discounted_wb, responsible:profiles(full_name)",
+        "id, nm_id, vendor_code, title, brand, category, status, cost_price, cost_price_source, cost_price_updated_at, cost_sewing_rub, cost_cargo_rub, cost_fulfillment_rub, logistics_cost, photo_url, photos, description, price_wb, price_discounted_wb, group_id, group:product_groups(name), responsible:profiles(full_name)",
       )
       .eq("store_id", DEMO_STORE_ID)
       .order("nm_id"),
@@ -355,6 +356,7 @@ export async function getProductList(
 
   return prods.map((p) => {
     const responsible = p.responsible as { full_name?: string } | null;
+    const group = p.group as { name?: string } | null;
     const nmId = Number(p.nm_id);
     const stockQty = stockByProduct.get(p.id as string) ?? 0;
     const salesRank30d = salesByNm.get(nmId) ?? 0;
@@ -449,6 +451,8 @@ export async function getProductList(
       logisticsCost: Number(p.logistics_cost ?? 0),
       stockQty,
       sizes,
+      groupId: (p.group_id as string) ?? null,
+      groupName: group?.name ?? null,
       responsible: responsible?.full_name ?? "—",
       photoUrl: (p.photo_url as string) ?? null,
       photos: Array.isArray(p.photos) ? (p.photos as string[]) : [],
@@ -889,6 +893,23 @@ async function readSupplies(db: SupabaseClient): Promise<Supply[]> {
 
 export async function getSupplies(db: SupabaseClient): Promise<Supply[]> {
   return readSupplies(db);
+}
+
+// Группы товаров (0039): справочник для селектов и фильтра. Счётчики товаров
+// в группе клиент считает сам из списка товаров — лишний запрос не нужен.
+export async function getProductGroups(
+  db: SupabaseClient,
+): Promise<ProductGroup[]> {
+  const { data, error } = await db
+    .from("product_groups")
+    .select("id, name")
+    .eq("org_id", DEMO_ORG_ID)
+    .order("name");
+  if (error) throw error;
+  return (data ?? []).map((g) => ({
+    id: g.id as string,
+    name: g.name as string,
+  }));
 }
 
 export async function getFactories(db: SupabaseClient): Promise<Factory[]> {

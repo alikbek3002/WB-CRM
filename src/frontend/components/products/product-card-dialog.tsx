@@ -10,6 +10,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/frontend/components/ui/dialog";
+import { GroupSelect } from "@/frontend/components/products/product-groups";
 import {
   catalogContext,
   RecoButton,
@@ -17,6 +18,7 @@ import {
 import { formatNumber, formatRub } from "@/shared/format";
 import type {
   CostPriceSource,
+  ProductGroup,
   ProductListItem,
   ProductSizeStock,
 } from "@/shared/types";
@@ -172,11 +174,15 @@ export function ProductDialog({
   open,
   onOpenChange,
   catalog,
+  groups = [],
+  canGroups = false,
 }: {
   product: ProductListItem;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   catalog?: ReturnType<typeof catalogContext>;
+  groups?: ProductGroup[];
+  canGroups?: boolean;
 }) {
   const [photo, setPhoto] = useState(0);
   const gallery = product.photos.length
@@ -324,6 +330,23 @@ export function ProductDialog({
                 </span>
                 <span className="text-muted-foreground">Ответственный</span>
                 <span className="truncate text-right">{product.responsible}</span>
+                {/* Группа: директор/ст. менеджер назначают прямо из карточки,
+                    остальные видят название */}
+                {(canGroups && groups.length > 0) || product.groupName ? (
+                  <>
+                    <span className="self-center text-muted-foreground">Группа</span>
+                    {canGroups && groups.length > 0 ? (
+                      <GroupSelect
+                        productId={product.id}
+                        value={product.groupId}
+                        groups={groups}
+                        className="h-8 w-44 justify-self-end text-xs"
+                      />
+                    ) : (
+                      <span className="truncate text-right">{product.groupName}</span>
+                    )}
+                  </>
+                ) : null}
               </div>
 
               <SizeStocks sizes={product.sizes} />
@@ -415,9 +438,13 @@ export function ProductDialog({
 export function ProductCell({
   product,
   catalog,
+  groups,
+  canGroups,
 }: {
   product: ProductListItem;
   catalog?: ReturnType<typeof catalogContext>;
+  groups?: ProductGroup[];
+  canGroups?: boolean;
 }) {
   const [open, setOpen] = useState(false);
 
@@ -453,6 +480,8 @@ export function ProductCell({
         open={open}
         onOpenChange={setOpen}
         catalog={catalog}
+        groups={groups}
+        canGroups={canGroups}
       />
     </>
   );

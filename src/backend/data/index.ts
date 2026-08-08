@@ -36,6 +36,7 @@ export const SESSION_TAG = "wb-session";
 export type WbScope =
   | "dashboard"
   | "products"
+  | "product-groups"
   | "finance"
   | "sales-plan"
   | "cash"
@@ -98,6 +99,12 @@ export const getProductList = cachedRead(
   "products",
   db.getProductList,
   mock.getProductList,
+);
+
+export const getProductGroups = cachedRead(
+  "product-groups",
+  db.getProductGroups,
+  mock.getProductGroups,
 );
 
 export const getFinanceRows = cachedRead(
@@ -387,6 +394,7 @@ export async function warmReadCache(): Promise<{ ms: number; failed: number }> {
     getDashboardData,
     getRnpProducts,
     getProductList,
+    getProductGroups,
     getStocksOverview,
     getFinanceRows,
     getSalesPlanView,

@@ -116,6 +116,13 @@ export type ProductUnitEcon = {
   drrPct: number; // реклама / выручка
 };
 
+// Группа товаров («группа Алик», «группа Тимур») — деление каталога между
+// ответственными. Создают и раскидывают директор/ст. менеджер (products:groups).
+export type ProductGroup = {
+  id: string;
+  name: string;
+};
+
 // Остаток одного размера товара (последний снимок складов WB) + скорость
 export type ProductSizeStock = {
   size: string;
@@ -144,6 +151,8 @@ export type ProductListItem = {
   logisticsCost: number;
   stockQty: number;
   sizes: ProductSizeStock[]; // разбивка остатка по размерам (сумма = stockQty)
+  groupId: string | null; // группа товаров (null — без группы)
+  groupName: string | null;
   responsible: string;
   econ: ProductUnitEcon | null; // юнит-экономика за 30 дней (null — продаж не было)
   // Контент WB (фото/описание/цены — из синхронизации кабинета)

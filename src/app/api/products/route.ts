@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { DEMO_STORE_ID } from "@/shared/constants";
+import { DEMO_ORG_ID, DEMO_STORE_ID } from "@/shared/constants";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
@@ -104,14 +104,11 @@ const patchSchema = z.object({
   status: z.string().trim().max(50).optional().nullable(),
   costPrice: z.number().min(0).optional(),
   logisticsCost: z.number().min(0).optional(),
+  groupId: z.string().regex(UUID).nullable().optional(), // null — убрать из группы
 });
 
 export async function PATCH(request: Request) {
   const session = await getSession();
-  if (!can(session.role, "products:edit")) {
-    return NextResponse.json({ error: "forbidden" }, { status: 403 });
-  }
-
   const body = await request.json().catch(() => null);
   const parsed = patchSchema.safeParse(body);
   if (!parsed.success) {
@@ -120,6 +117,16 @@ export async function PATCH(request: Request) {
       { status: 400 },
     );
   }
+  // Раскидывать товары по группам могут только директор/админ/ст. менеджер;
+  // patch ТОЛЬКО группы разрешаем им даже без products:edit (право уже, а не шире).
+  const wantsGroup = parsed.data.groupId !== undefined;
+  const onlyGroup = wantsGroup && Object.keys(parsed.data).length === 2; // id + groupId
+  if (wantsGroup && !can(session.role, "products:groups")) {
+    return NextResponse.json({ error: "forbidden" }, { status: 403 });
+  }
+  if (!onlyGroup && !can(session.role, "products:edit")) {
+    return NextResponse.json({ error: "forbidden" }, { status: 403 });
+  }
 
   const admin = getSupabaseAdmin();
   if (!admin) {
@@ -127,7 +134,22 @@ export async function PATCH(request: Request) {
   }
 
   const p = parsed.data;
+
+  // Группа должна существовать и принадлежать этой организации
+  if (p.groupId != null) {
+    const { data: grp } = await admin
+      .from("product_groups")
+      .select("id")
+      .eq("id", p.groupId)
+      .eq("org_id", DEMO_ORG_ID)
+      .maybeSingle();
+    if (!grp) {
+      return NextResponse.json({ error: "invalid_group" }, { status: 400 });
+    }
+  }
+
   const patch: Record<string, unknown> = {};
+  if (p.groupId !== undefined) patch.group_id = p.groupId;
   if (p.title !== undefined) patch.title = p.title;
   if (p.vendorCode !== undefined) patch.vendor_code = p.vendorCode || null;
   if (p.brand !== undefined) patch.brand = p.brand || null;
@@ -167,6 +189,8 @@ export async function PATCH(request: Request) {
     });
   }
 
-  invalidateWbData(...PRODUCT_SCOPES);
+  // Смена одной лишь группы экономику/РНП не трогает — не выбрасываем их кэш:
+  // директор раскидывает сотни товаров подряд, каждый холодный пересчёт дорог.
+  invalidateWbData(...(onlyGroup ? (["products"] as const) : PRODUCT_SCOPES));
   return NextResponse.json({ ok: true, persisted: true });
 }

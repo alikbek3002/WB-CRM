@@ -3,7 +3,7 @@ import { ProductForm } from "@/frontend/components/products/product-form";
 import { ProductsView } from "@/frontend/components/products/products-view";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
-import { getProductList } from "@/backend/data";
+import { getProductGroups, getProductList } from "@/backend/data";
 
 export default async function ProductsPage() {
   const session = await getSession();
@@ -11,8 +11,12 @@ export default async function ProductsPage() {
     return <NoAccess roleLabel={session.roleLabel} />;
   }
 
-  const products = await getProductList();
+  const [products, groups] = await Promise.all([
+    getProductList(),
+    getProductGroups(),
+  ]);
   const canEdit = can(session.role, "products:edit");
+  const canGroups = can(session.role, "products:groups");
 
   return (
     <div className="space-y-4">
@@ -27,7 +31,12 @@ export default async function ProductsPage() {
         {canEdit && <ProductForm />}
       </div>
 
-      <ProductsView products={products} canEdit={canEdit} />
+      <ProductsView
+        products={products}
+        groups={groups}
+        canEdit={canEdit}
+        canGroups={canGroups}
+      />
     </div>
   );
 }

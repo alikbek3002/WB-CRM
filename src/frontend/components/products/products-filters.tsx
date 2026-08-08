@@ -14,7 +14,7 @@ import {
   SelectValue,
 } from "@/frontend/components/ui/select";
 import { formatNumber } from "@/shared/format";
-import type { ProductListItem } from "@/shared/types";
+import type { ProductGroup, ProductListItem } from "@/shared/types";
 
 // Как сортировать список. Значения совпадают с ключами SORT_LABELS ниже.
 export type SortKey =
@@ -38,6 +38,7 @@ export type ProductFilters = {
   query: string;
   category: string; // "all" | вид товара
   brand: string; // "all" | бренд
+  group: string; // "all" | "none" (без группы) | id группы
   sort: SortKey;
   weakOnly: boolean;
 };
@@ -46,9 +47,17 @@ export const EMPTY_FILTERS: ProductFilters = {
   query: "",
   category: "all",
   brand: "all",
+  group: "all",
   sort: "sales",
   weakOnly: false,
 };
+
+// Товар попадает под фильтр группы («none» — товары вне групп)
+function matchesGroup(p: ProductListItem, group: string): boolean {
+  if (group === "all") return true;
+  if (group === "none") return p.groupId === null;
+  return p.groupId === group;
+}
 
 // Товар подходит под строку поиска: название, артикул продавца или номенклатура
 // WB. Ищем по всем трём сразу — менеджеры одинаково часто ищут и по названию,
@@ -75,6 +84,7 @@ export function applyFilters(
       matchesQuery(p, q) &&
       (f.category === "all" || p.category === f.category) &&
       (f.brand === "all" || p.brand === f.brand) &&
+      matchesGroup(p, f.group) &&
       (!f.weakOnly || p.isWeak),
   );
 
@@ -105,12 +115,14 @@ export function applyFilters(
 
 export function ProductsFilters({
   products,
+  groups,
   shown,
   filters,
   onChange,
   right,
 }: {
   products: ProductListItem[];
+  groups: ProductGroup[];
   shown: number;
   filters: ProductFilters;
   onChange: (next: ProductFilters) => void;
@@ -129,6 +141,7 @@ export function ProductsFilters({
       const fits =
         matchesQuery(p, q) &&
         (filters.brand === "all" || p.brand === filters.brand) &&
+        matchesGroup(p, filters.group) &&
         (!filters.weakOnly || p.isWeak);
       if (!map.has(p.category)) map.set(p.category, 0);
       if (fits) map.set(p.category, (map.get(p.category) ?? 0) + 1);
@@ -139,7 +152,7 @@ export function ProductsFilters({
     return [...map.entries()]
       .filter(([c, n]) => n > 0 || c === filters.category)
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "ru"));
-  }, [products, q, filters.brand, filters.weakOnly, filters.category]);
+  }, [products, q, filters.brand, filters.group, filters.weakOnly, filters.category]);
 
   const brands = useMemo(() => {
     const map = new Map<string, number>();
@@ -148,6 +161,7 @@ export function ProductsFilters({
       const fits =
         matchesQuery(p, q) &&
         (filters.category === "all" || p.category === filters.category) &&
+        matchesGroup(p, filters.group) &&
         (!filters.weakOnly || p.isWeak);
       if (!map.has(p.brand)) map.set(p.brand, 0);
       if (fits) map.set(p.brand, (map.get(p.brand) ?? 0) + 1);
@@ -155,7 +169,25 @@ export function ProductsFilters({
     return [...map.entries()]
       .filter(([b, n]) => n > 0 || b === filters.brand)
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "ru"));
-  }, [products, q, filters.category, filters.weakOnly, filters.brand]);
+  }, [products, q, filters.category, filters.group, filters.weakOnly, filters.brand]);
+
+  // Счётчики групп — с учётом остальных фильтров (кроме своего), как виды/бренды.
+  // «Без группы» считаем отдельно: удобно видеть, сколько ещё не раскидано.
+  const groupCounts = useMemo(() => {
+    const map = new Map<string, number>();
+    let none = 0;
+    for (const p of products) {
+      const fits =
+        matchesQuery(p, q) &&
+        (filters.category === "all" || p.category === filters.category) &&
+        (filters.brand === "all" || p.brand === filters.brand) &&
+        (!filters.weakOnly || p.isWeak);
+      if (!fits) continue;
+      if (p.groupId) map.set(p.groupId, (map.get(p.groupId) ?? 0) + 1);
+      else none += 1;
+    }
+    return { map, none };
+  }, [products, q, filters.category, filters.brand, filters.weakOnly]);
 
   // «Слабые» — сколько их среди подходящих под остальные фильтры
   const weakCount = useMemo(
@@ -165,15 +197,17 @@ export function ProductsFilters({
           p.isWeak &&
           matchesQuery(p, q) &&
           (filters.category === "all" || p.category === filters.category) &&
-          (filters.brand === "all" || p.brand === filters.brand),
+          (filters.brand === "all" || p.brand === filters.brand) &&
+          matchesGroup(p, filters.group),
       ).length,
-    [products, q, filters.category, filters.brand],
+    [products, q, filters.category, filters.brand, filters.group],
   );
 
   const dirty =
     filters.query !== "" ||
     filters.category !== "all" ||
     filters.brand !== "all" ||
+    filters.group !== "all" ||
     filters.weakOnly ||
     filters.sort !== EMPTY_FILTERS.sort;
 
@@ -237,6 +271,30 @@ export function ProductsFilters({
             </SelectContent>
           </Select>
         </div>
+
+        {/* Фильтр по группам появляется, как только группы созданы */}
+        {(groups.length > 0 || filters.group !== "all") && (
+          <div className="grid w-44 gap-1.5">
+            <Label className="text-xs text-muted-foreground">Группа</Label>
+            <Select
+              value={filters.group}
+              onValueChange={(v) => v && set({ group: String(v) })}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">Все группы</SelectItem>
+                {groups.map((g) => (
+                  <SelectItem key={g.id} value={g.id}>
+                    {g.name} · {groupCounts.map.get(g.id) ?? 0}
+                  </SelectItem>
+                ))}
+                <SelectItem value="none">Без группы · {groupCounts.none}</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        )}
 
         <div className="grid w-48 gap-1.5">
           <Label className="text-xs text-muted-foreground">Сортировка</Label>
@@ -314,6 +372,21 @@ export function ProductsFilters({
               aria-label="Убрать фильтр по бренду"
               onClick={() => set({ brand: "all" })}
               onKeyDown={(e) => e.key === "Enter" && set({ brand: "all" })}
+              className="size-3 cursor-pointer"
+            />
+          </Badge>
+        )}
+        {filters.group !== "all" && (
+          <Badge variant="secondary" className="gap-1 text-[10px]">
+            {filters.group === "none"
+              ? "Без группы"
+              : groups.find((g) => g.id === filters.group)?.name ?? "Группа"}
+            <X
+              role="button"
+              tabIndex={0}
+              aria-label="Убрать фильтр по группе"
+              onClick={() => set({ group: "all" })}
+              onKeyDown={(e) => e.key === "Enter" && set({ group: "all" })}
               className="size-3 cursor-pointer"
             />
           </Badge>
