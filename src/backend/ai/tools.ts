@@ -2028,6 +2028,14 @@ async function execCashBalance(ctx: ToolCtx): Promise<string> {
     `За текущий месяц: пришло ${num(view.monthInRub)} ₽, ушло ${num(view.monthOutRub)} ₽, ` +
       `итог ${num(view.monthInRub - view.monthOutRub)} ₽.`,
   ];
+  if (view.wbProcessing.length) {
+    const sum = view.wbProcessing.reduce((t, x) => t + x.amountRub, 0);
+    lines.push(
+      `ВЫПЛАТЫ WB В ОБРАБОТКЕ (отправлены, но ещё НЕ на счёте — в кассе не учтены): ≈ ${num(sum)} ₽.`,
+      ...view.wbProcessing.map((t) => `- ${t.note ?? t.occurredOn}: ${money(t.amount, t.currency)}`),
+      "Когда деньги придут на счёт, поступление подтверждают в CRM → Финансы → Касса → «Поступили на счёт».",
+    );
+  }
   if (view.recent.length) {
     lines.push("Последние операции:");
     for (const t of view.recent.slice(0, 5)) {

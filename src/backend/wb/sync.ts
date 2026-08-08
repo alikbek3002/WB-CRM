@@ -459,8 +459,10 @@ export async function runWbSync(
   // ── Финансовый отчёт о реализации → raw_finance_report ───────────────────
   // Единственный источник фактических удержаний WB (комиссия, эквайринг,
   // логистика, хранение, штрафы, приёмка) — на нём стоит ОПиУ.
+  // С 07.2026 — новый finance-api /sales-reports/detailed (v5 WB отключил):
+  // поля camelCase, суммы строками — приводим числом при маппинге.
   // Тянем по дате расчёта: с последней имеющейся rr_dt минус неделя (WB
-  // досчитывает свежие отчёты) до сегодня, страницами по курсору rrdid.
+  // досчитывает свежие отчёты) до сегодня, страницами по курсору rrdId.
   if (want.has("finance")) await runSource(db, "finance", null, async () => {
     const { data: last } = await db
       .from("raw_finance_report")
@@ -496,41 +498,46 @@ export async function runWbSync(
       );
       if (!rows.length) break;
 
+      // finance-api отдаёт денежные поля строками — в БД пишем числом
+      const money = (v: number | string | null | undefined): number => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : 0;
+      };
       const mapped = rows
-        .filter((r) => r.rrd_id != null)
+        .filter((r) => r.rrdId != null)
         .map((r) => ({
           store_id: DEMO_STORE_ID,
-          rrd_id: r.rrd_id,
-          realizationreport_id: r.realizationreport_id ?? null,
-          nm_id: r.nm_id ?? null,
-          doc_type: r.doc_type_name ?? null,
-          oper_name: r.supplier_oper_name ?? null,
-          currency_name: r.currency_name ?? null,
+          rrd_id: r.rrdId,
+          realizationreport_id: r.reportId ?? null,
+          nm_id: r.nmId ?? null,
+          doc_type: r.docTypeName ?? null,
+          oper_name: r.sellerOperName ?? null,
+          currency_name: r.currency ?? null,
           quantity: r.quantity ?? 0,
           // amount — сумма реализации строки (для возвратов WB отдаёт её же,
           // знак задаёт doc_type; так считает и кабинет)
-          amount: r.retail_amount ?? r.retail_price_withdisc_rub ?? 0,
-          retail_price: r.retail_price ?? null,
-          commission: r.ppvz_sales_commission ?? 0,
-          for_pay: r.ppvz_for_pay ?? 0,
-          acquiring_fee: r.acquiring_fee ?? 0,
-          logistics: r.delivery_rub ?? 0,
-          rebill_logistic: r.rebill_logistic_cost ?? 0,
-          storage_fee: r.storage_fee ?? 0,
-          penalty: r.penalty ?? 0,
-          acceptance: r.acceptance ?? 0,
-          deduction: r.deduction ?? 0,
-          period_start: r.date_from || null,
-          period_end: r.date_to || null,
-          rr_dt: r.rr_dt || null,
-          sale_dt: r.sale_dt || null,
+          amount: money(r.retailAmount ?? r.retailPriceWithDisc),
+          retail_price: r.retailPrice != null ? money(r.retailPrice) : null,
+          commission: money(r.ppvzSalesCommission),
+          for_pay: money(r.forPay),
+          acquiring_fee: money(r.acquiringFee),
+          logistics: money(r.deliveryService),
+          rebill_logistic: money(r.rebillLogisticCost),
+          storage_fee: money(r.paidStorage),
+          penalty: money(r.penalty),
+          acceptance: money(r.paidAcceptance),
+          deduction: money(r.deduction),
+          period_start: r.dateFrom || null,
+          period_end: r.dateTo || null,
+          rr_dt: r.rrDate || null,
+          sale_dt: r.saleDt || null,
         }));
       // Строк в отчёте сотни тысяч — пишем крупными партиями, иначе один
       // прогон превращается в сотни round-trip'ов к Supabase
       total += await chunkedUpsert(db, "raw_finance_report", mapped, "store_id,rrd_id", 2000);
 
       if (rows.length < FINANCE_PAGE) break; // хвост забрали
-      rrdid = rows[rows.length - 1].rrd_id;
+      rrdid = rows[rows.length - 1].rrdId;
       if (page === FINANCE_MAX_PAGES - 1) {
         errors.push("finance: отчёт длиннее лимита страниц — продолжится следующим запуском");
       }

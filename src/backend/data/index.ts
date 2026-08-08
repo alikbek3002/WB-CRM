@@ -148,6 +148,7 @@ export const getCashOverview = cachedRead("cash", db.getCashOverview, () => ({
   monthOutRub: 0,
   flow: [],
   recent: [],
+  wbProcessing: [],
 }));
 
 export const getFinanceRefs = cachedRead("finance-refs", db.getFinanceRefs, () => ({

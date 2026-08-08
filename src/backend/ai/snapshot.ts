@@ -175,6 +175,13 @@ export async function buildSnapshot(
       } else {
         lines.push("КАССА: счета не заведены (CRM → Финансы → Касса).");
       }
+      if (cash.wbProcessing.length) {
+        const sum = cash.wbProcessing.reduce((t, x) => t + x.amountRub, 0);
+        lines.push(
+          `- Выплаты WB в обработке (отправлены, но ещё НЕ на счёте, в кассе не учтены): ≈ ${rub(sum)}, ` +
+            `${cash.wbProcessing.length} шт. Поступление подтверждают кнопкой в Финансы → Касса.`,
+        );
+      }
 
       if (expenses.items.length) {
         const top = expenses.categories

@@ -1148,10 +1148,15 @@ async function renderCash(): Promise<string> {
   }
 
   const net = view.monthInRub - view.monthOutRub;
+  const processingRub = view.wbProcessing.reduce((t, x) => t + x.amountRub, 0);
   const lines = [
     "👛 <b>Касса</b>",
     "",
     `💰 Всего денег — <b>${rub(view.totalRub)}</b>`,
+    // Деньги отправлены WB, но до счёта ещё не дошли — держим на виду
+    ...(processingRub > 0
+      ? [`⏳ От WB в обработке — ${rub(processingRub)} <i>(ещё не на счёте)</i>`]
+      : []),
     "",
     RULE,
     "",
@@ -1182,7 +1187,8 @@ async function renderCash(): Promise<string> {
         t.kind === "transfer"
           ? `перевод → ${esc(t.toAccountName ?? "—")}`
           : esc(t.categoryName ?? (t.kind === "in" ? "поступление" : "расход"));
-      lines.push("", `${icon} ${what} — <b>${rub(t.amountRub)}</b>`, `     ${esc(humanDate(t.occurredOn))} · ${esc(t.accountName)}`);
+      const wait = t.status === "processing" ? " · ⏳ в обработке" : "";
+      lines.push("", `${icon} ${what} — <b>${rub(t.amountRub)}</b>${wait}`, `     ${esc(humanDate(t.occurredOn))} · ${esc(t.accountName)}`);
     }
   }
   return lines.join("\n");

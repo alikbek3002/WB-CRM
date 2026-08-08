@@ -256,6 +256,9 @@ export type CashTx = {
   personId: string | null; // кому эти деньги (сотрудник)
   personName: string | null;
   source: "manual" | "bot" | "ai" | "supply_payment" | "wb_payout" | "payout";
+  // processing — WB отправил выплату, но деньги ещё не дошли до счёта:
+  // в остатках и ДДС не участвует, ждёт подтверждения кнопкой
+  status: "processing" | "received";
 };
 
 export type CashFlowMonth = {
@@ -270,11 +273,14 @@ export type CashOverview = {
   // Деньги, которые WB ещё не перечислил: они есть у компании, но не в кассе.
   // Показываем отдельно, чтобы «всего денег» не смешивало наличные и дебиторку.
   wbBalance: { currency: string; current: number; forWithdraw: number; checkedAt: string } | null;
-  totalRub: number; // всего денег в кассе, ₽
+  totalRub: number; // всего денег в кассе, ₽ (без выплат «в обработке»)
   monthInRub: number; // приход за текущий месяц
   monthOutRub: number; // расход за текущий месяц
   flow: CashFlowMonth[]; // помесячно за последние 6 мес
   recent: CashTx[]; // лента последних операций
+  // Выплаты WB «в обработке»: отчёт сформирован, деньги ещё не на счёте.
+  // Подтверждаются кнопкой «Поступили на счёт» — тогда попадают в остатки.
+  wbProcessing: CashTx[];
 };
 
 export type ExpenseCategorySlice = {

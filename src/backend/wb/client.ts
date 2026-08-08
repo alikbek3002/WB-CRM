@@ -58,6 +58,8 @@ async function wbFetch<T>(
           url,
         );
       }
+      // 204 — данных нет (finance-api так завершает пагинацию отчёта)
+      if (res.status === 204) return null as T;
       return (await res.json()) as T;
     } finally {
       clearTimeout(timer);
@@ -256,49 +258,62 @@ export function fetchSales(
 }
 
 // ─── Финансы: отчёт о реализации (детализация к оплате) ──────────────────────
-// v5/reportDetailByPeriod — единственный источник фактических удержаний WB:
-// комиссия, эквайринг, логистика, хранение, штрафы, приёмка. Пагинация курсором
-// rrdid: следующий запрос начинается с rrd_id последней полученной строки.
-// Лимит statistics — 1 запрос/мин, поэтому тянем партиями с паузой.
+// POST finance-api /sales-reports/detailed — единственный источник фактических
+// удержаний WB: комиссия, эквайринг, логистика, хранение, штрафы, приёмка.
+// Прежний GET v5/supplier/reportDetailByPeriod WB отключает с 15.07.2026 —
+// поля переехали в camelCase, суммы приходят СТРОКАМИ («761.02»).
+// Пагинация курсором rrdId: следующий запрос начинается с rrdId последней
+// полученной строки, конец данных — ответ 204.
+// Лимит finance-api — 1 запрос/мин, поэтому тянем партиями с паузой.
 
 export type WbFinanceRow = {
-  realizationreport_id: number;
-  date_from: string;
-  date_to: string;
-  currency_name?: string;
-  rrd_id: number;
-  nm_id: number;
-  doc_type_name: string; // «Продажа» | «Возврат»
-  supplier_oper_name?: string; // «Продажа», «Логистика», «Хранение», «Штраф»…
-  quantity: number;
-  retail_price?: number;
-  retail_amount?: number; // сумма продажи
-  retail_price_withdisc_rub?: number;
-  ppvz_sales_commission?: number; // комиссия WB
-  ppvz_for_pay?: number; // к перечислению продавцу
-  acquiring_fee?: number; // эквайринг
-  delivery_rub?: number; // логистика
-  rebill_logistic_cost?: number; // возмещение логистики
-  storage_fee?: number;
-  penalty?: number;
-  acceptance?: number; // платная приёмка
-  deduction?: number; // прочие удержания
-  sale_dt?: string;
-  rr_dt?: string; // дата расчёта — по ней отчёт разбит на периоды
+  reportId: number; // номер еженедельного отчёта (бывш. realizationreport_id)
+  dateFrom: string; // период отчёта
+  dateTo: string;
+  currency?: string;
+  rrdId: number;
+  nmId?: number;
+  docTypeName?: string; // «Продажа» | «Возврат»
+  sellerOperName?: string; // «Продажа», «Логистика», «Хранение», «Штраф»…
+  quantity?: number;
+  retailPrice?: number | string;
+  retailAmount?: number | string; // сумма продажи
+  retailPriceWithDisc?: number | string;
+  ppvzSalesCommission?: number | string; // комиссия WB
+  forPay?: number | string; // к перечислению продавцу (бывш. ppvz_for_pay)
+  acquiringFee?: number | string; // эквайринг
+  deliveryService?: number | string; // логистика в деньгах (deliveryAmount — штуки)
+  rebillLogisticCost?: number | string; // возмещение логистики
+  paidStorage?: number | string; // хранение (бывш. storage_fee)
+  penalty?: number | string;
+  paidAcceptance?: number | string; // платная приёмка (бывш. acceptance)
+  deduction?: number | string; // прочие удержания
+  saleDt?: string;
+  rrDate?: string; // дата расчёта — по ней отчёт разбит на периоды (бывш. rr_dt)
 };
 
 export function fetchFinanceReport(
   token: string,
   dateFrom: string,
   dateTo: string,
-  rrdid = 0,
+  rrdId = 0,
   limit = 100_000,
   timeoutMs = 180_000,
 ): Promise<WbFinanceRow[]> {
-  const url =
-    "https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod" +
-    `?dateFrom=${dateFrom}&dateTo=${dateTo}&limit=${limit}&rrdid=${rrdid}`;
-  return wbFetch<WbFinanceRow[]>(url, token, undefined, timeoutMs).then((r) => r ?? []);
+  return wbFetch<WbFinanceRow[] | null>(
+    "https://finance-api.wildberries.ru/api/finance/v1/sales-reports/detailed",
+    token,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        dateFrom: `${dateFrom}T00:00:00Z`,
+        dateTo: `${dateTo}T23:59:59Z`,
+        rrdId,
+        limit,
+      }),
+    },
+    timeoutMs,
+  ).then((r) => r ?? []);
 }
 
 // Баланс кабинета: сколько WB ещё должен продавцу (и сколько можно вывести).

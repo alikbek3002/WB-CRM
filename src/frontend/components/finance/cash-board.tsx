@@ -8,6 +8,7 @@ import {
   ArrowUpRight,
   Banknote,
   CreditCard,
+  Hourglass,
   Landmark,
   Repeat,
   Wallet,
@@ -61,6 +62,7 @@ import { cn } from "@/shared/utils";
 import type {
   CashAccountKind,
   CashOverview,
+  CashTx,
   CashTxKind,
   Currency,
   ExpenseCategory,
@@ -96,6 +98,12 @@ const compactRub = (v: number) =>
       : String(v);
 
 const dmy = (iso: string) => iso.split("-").reverse().join(".");
+
+const todayIso = () => {
+  const d = new Date();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  return `${d.getFullYear()}-${m}-${String(d.getDate()).padStart(2, "0")}`;
+};
 
 function FlowTooltip({
   active,
@@ -236,6 +244,128 @@ function AccountDialog({
   );
 }
 
+// Выплаты WB «в обработке»: WB сформировал отчёт и отправил деньги, но до
+// расчётного счёта они ещё не дошли (до недели-двух). API момент зачисления
+// не отдаёт — поступление подтверждают кнопкой, с датой фактического прихода.
+// До подтверждения сумма не входит в остатки и ДДС.
+function WbProcessingCard({ items, canEdit }: { items: CashTx[]; canEdit: boolean }) {
+  const router = useRouter();
+  const [confirming, setConfirming] = useState<CashTx | null>(null);
+  const [receivedOn, setReceivedOn] = useState(todayIso());
+  const [saving, setSaving] = useState(false);
+
+  if (!items.length) return null;
+
+  async function submit() {
+    if (!confirming) return;
+    setSaving(true);
+    try {
+      const res = await fetch("/api/finance/cash/tx", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          action: "confirm_received",
+          id: confirming.id,
+          receivedOn: receivedOn || null,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.message ?? "Ошибка");
+      toast.success(data?.message ?? "Поступление подтверждено");
+      setConfirming(null);
+      router.refresh();
+    } catch (e) {
+      toast.error(`Не удалось подтвердить: ${(e as Error).message}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card className="border-amber-500/30">
+      <CardHeader className="pb-2">
+        <CardTitle className="flex flex-wrap items-center gap-2 text-sm">
+          <Hourglass className="size-4 text-amber-400" />
+          Выплаты WB в обработке
+          <span className="font-normal text-muted-foreground">
+            WB отправил, на счёт ещё не поступили — в остатках не учтены
+          </span>
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        {items.map((t) => (
+          <div
+            key={t.id}
+            className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/60 px-3 py-2"
+          >
+            <div>
+              <div className="text-sm font-medium tabular-nums">
+                {formatMoney(t.amount, t.currency)}
+                {t.currency !== "rub" && (
+                  <span className="ml-1.5 font-normal text-[11px] text-muted-foreground">
+                    ≈ {formatRub(t.amountRub)}
+                  </span>
+                )}
+              </div>
+              <div className="text-[11px] text-muted-foreground">
+                {t.note ?? `выплата от ${dmy(t.occurredOn)}`}
+              </div>
+            </div>
+            {canEdit ? (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setConfirming(t);
+                  setReceivedOn(todayIso());
+                }}
+              >
+                Поступили на счёт
+              </Button>
+            ) : (
+              <span className="rounded-full border border-amber-500/40 px-2 py-0.5 text-[11px] text-amber-400">
+                в обработке
+              </span>
+            )}
+          </div>
+        ))}
+      </CardContent>
+
+      <Dialog open={!!confirming} onOpenChange={(o) => !o && !saving && setConfirming(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Деньги поступили на счёт</DialogTitle>
+            <DialogDescription>
+              {confirming
+                ? `${formatMoney(confirming.amount, confirming.currency)} — ${confirming.note ?? "выплата WB"}. `
+                : ""}
+              Укажите дату зачисления по банковской выписке — приход встанет в кассу этим днём.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-1.5">
+            <Label htmlFor="received-on">Дата поступления</Label>
+            <Input
+              id="received-on"
+              type="date"
+              value={receivedOn}
+              max={todayIso()}
+              onChange={(e) => setReceivedOn(e.target.value)}
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirming(null)} disabled={saving}>
+              Отмена
+            </Button>
+            <Button onClick={submit} disabled={saving || !receivedOn}>
+              {saving ? "Сохранение…" : "Подтвердить поступление"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </Card>
+  );
+}
+
 export function CashBoard({
   overview,
   categories,
@@ -255,6 +385,9 @@ export function CashBoard({
   }));
   const points = overview.flow.map((f) => ({ label: f.label, in: f.inRub, out: f.outRub }));
   const monthNet = overview.monthInRub - overview.monthOutRub;
+  const processing = overview.wbProcessing;
+  const processingSum = processing.reduce((t, x) => t + x.amount, 0);
+  const processingCur = processing[0]?.currency ?? "rub";
 
   return (
     <div className="space-y-3">
@@ -318,6 +451,16 @@ export function CashBoard({
             tone: monthNet >= 0 ? "good" : "bad",
             hint: "приход минус расход",
           },
+          ...(processing.length
+            ? [
+                {
+                  label: "Выплаты WB в обработке",
+                  value: formatMoney(processingSum, processingCur),
+                  hint: "отправлены, но ещё не на счёте",
+                  tone: "muted" as const,
+                },
+              ]
+            : []),
           ...(overview.wbBalance
             ? [
                 {
@@ -330,6 +473,8 @@ export function CashBoard({
             : []),
         ]}
       />
+
+      <WbProcessingCard items={processing} canEdit={canEdit} />
 
       <div className="grid gap-3 lg:grid-cols-2">
         <Card>
@@ -480,6 +625,11 @@ export function CashBoard({
                         {t.kind === "transfer"
                           ? `Перевод → ${t.toAccountName ?? "—"}`
                           : `${t.categoryEmoji ? `${t.categoryEmoji} ` : ""}${t.categoryName ?? (t.kind === "in" ? "Поступление" : "Расход")}`}
+                        {t.status === "processing" && (
+                          <span className="rounded-full border border-amber-500/40 px-1.5 py-0.5 text-[10px] whitespace-nowrap text-amber-400">
+                            в обработке
+                          </span>
+                        )}
                       </span>
                     </TableCell>
                     <TableCell className="whitespace-nowrap text-muted-foreground">
@@ -493,6 +643,7 @@ export function CashBoard({
                         "text-right font-medium whitespace-nowrap tabular-nums",
                         t.kind === "in" && "text-emerald-400",
                         t.kind === "out" && "text-red-400",
+                        t.status === "processing" && "text-muted-foreground",
                       )}
                     >
                       {t.kind === "in" ? "+" : t.kind === "out" ? "−" : ""}

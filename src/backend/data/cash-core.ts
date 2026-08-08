@@ -79,6 +79,7 @@ type CashTxRow = {
   occurred_on: string;
   note: string | null;
   source: CashTx["source"];
+  status: CashTx["status"];
   account_id: string;
   category_id: string | null;
   person_id: string | null;
@@ -93,7 +94,7 @@ type CashTxRow = {
 // У cash_tx ДВА FK на profiles (автор и адресат) — имена связей обязательны,
 // иначе PostgREST не поймёт, какую именно подтянуть (грабли embed).
 const CASH_TX_SELECT =
-  "id, kind, amount, amount_rub, currency, occurred_on, note, source, account_id, category_id, person_id, " +
+  "id, kind, amount, amount_rub, currency, occurred_on, note, source, status, account_id, category_id, person_id, " +
   "account:cash_accounts!cash_tx_account_id_fkey(name), " +
   "to_account:cash_accounts!cash_tx_to_account_id_fkey(name), " +
   "category:expense_categories(name, emoji), " +
@@ -120,6 +121,7 @@ function mapTx(r: CashTxRow): CashTx {
     personId: r.person_id ? String(r.person_id) : null,
     personName: first(r.person)?.full_name ?? null,
     source: r.source,
+    status: r.status ?? "received",
   };
 }
 
@@ -169,7 +171,7 @@ export async function getCashOverview(db: SupabaseClient): Promise<CashOverview>
   const flowSince = isoDay(monthStart(5)); // текущий месяц + 5 предыдущих
   const thisMonth = isoDay(monthStart(0));
 
-  const [balRes, flowRes, txRes, wbRes] = await Promise.all([
+  const [balRes, flowRes, txRes, wbRes, procRes] = await Promise.all([
     db.rpc("agg_cash_balances", { p_org: DEMO_ORG_ID }),
     db.rpc("agg_cash_flow_monthly", { p_org: DEMO_ORG_ID, p_since: flowSince }),
     db
@@ -184,10 +186,19 @@ export async function getCashOverview(db: SupabaseClient): Promise<CashOverview>
       .select("currency, current_amount, for_withdraw, checked_at")
       .eq("store_id", DEMO_STORE_ID)
       .maybeSingle(),
+    // Выплаты WB «в обработке» — их немного (1–3 недельных отчёта в пути)
+    db
+      .from("cash_tx")
+      .select(CASH_TX_SELECT)
+      .eq("org_id", DEMO_ORG_ID)
+      .eq("status", "processing")
+      .order("occurred_on", { ascending: true })
+      .limit(50),
   ]);
   if (balRes.error) throw balRes.error;
   if (flowRes.error) throw flowRes.error;
   if (txRes.error) throw txRes.error;
+  if (procRes.error) throw procRes.error;
 
   type BalRow = {
     account_id: string;
@@ -240,6 +251,7 @@ export async function getCashOverview(db: SupabaseClient): Promise<CashOverview>
     monthOutRub: current?.outRub ?? 0,
     flow,
     recent: ((txRes.data ?? []) as unknown as CashTxRow[]).map(mapTx),
+    wbProcessing: ((procRes.data ?? []) as unknown as CashTxRow[]).map(mapTx),
   };
 }
 
@@ -1115,6 +1127,10 @@ export async function mirrorSupplyPaymentToCash(
 // WB перечисляет деньги за отчётный период; сумму периода мы уже умеем считать
 // (agg_wb_payouts). Заводим её приходом в кассу, чтобы «сколько денег» не
 // требовало ручного ввода после каждой выплаты маркетплейса.
+// ВАЖНО: выплата рождается «в обработке» (status = processing) — от отчёта до
+// фактического зачисления на р/с проходит до недели-двух, и всё это время
+// денег на счёте нет. В остатки она попадёт после подтверждения кнопкой
+// (confirmWbPayoutReceived) — момент зачисления WB API не отдаёт.
 // Защита от дублей — уникальный (source, source_ref) по номеру отчёта.
 // Счёт: первый в валюте кабинета; если такого нет — создаём «Счёт WB».
 export async function syncWbPayoutsToCash(
@@ -1195,6 +1211,7 @@ export async function syncWbPayoutsToCash(
       note: `Выплата WB за период ${r.period_start} — ${r.period_end} (отчёт ${ref})`,
       source: "wb_payout",
       source_ref: ref,
+      status: "processing",
       created_by: authorId(actor),
     });
     // 23505 — отчёт уже заводили параллельным прогоном, это не ошибка
@@ -1207,6 +1224,55 @@ export async function syncWbPayoutsToCash(
     else created += 1;
   }
   return { created, skipped };
+}
+
+// Подтвердить фактическое поступление выплаты WB на расчётный счёт.
+// WB API момент зачисления не отдаёт, поэтому подтверждает человек: выплата
+// создаётся «в обработке» (см. syncWbPayoutsToCash) и до подтверждения не
+// участвует в остатках и ДДС. Датой операции становится дата поступления —
+// приход встаёт в тот месяц, когда деньги реально пришли.
+export async function confirmWbPayoutReceived(
+  db: SupabaseClient,
+  actor: CashActor,
+  txId: string,
+  receivedOn?: string | null,
+): Promise<CashResult> {
+  if (!can(actor.role, "finance:expense")) {
+    return { ok: false, code: "forbidden", message: "Нет права вести кассу и расходы." };
+  }
+  const { data: tx, error: readErr } = await db
+    .from("cash_tx")
+    .select("id, amount, amount_rub, currency, source, status")
+    .eq("id", txId)
+    .eq("org_id", DEMO_ORG_ID)
+    .maybeSingle();
+  if (readErr) return { ok: false, code: "db_error", message: readErr.message };
+  if (!tx) return { ok: false, code: "not_found", message: "Операция не найдена." };
+  if (tx.source !== "wb_payout") {
+    return { ok: false, code: "invalid", message: "Это не выплата WB — подтверждать нечего." };
+  }
+  if (tx.status !== "processing") {
+    return { ok: false, code: "invalid", message: "Эта выплата уже отмечена поступившей." };
+  }
+
+  const when = receivedOn ?? isoDay(new Date());
+  const { error } = await db
+    .from("cash_tx")
+    .update({
+      status: "received",
+      occurred_on: when,
+      received_at: new Date().toISOString(),
+      received_by: authorId(actor),
+    })
+    .eq("id", txId)
+    .eq("status", "processing"); // защита от двойного клика
+  if (error) return { ok: false, code: "db_error", message: error.message };
+  return {
+    ok: true,
+    id: String(txId),
+    amountRub: Math.round(Number(tx.amount_rub ?? 0)),
+    message: `Поступление подтверждено, дата зачисления — ${when}.`,
+  };
 }
 
 // Удалить ошибочную операцию (только руководители — право finance:expense)
