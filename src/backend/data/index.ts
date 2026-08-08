@@ -57,6 +57,7 @@ export type WbScope =
   | "fulfillment"
   | "fulfillment-partners"
   | "stocks-overview"
+  | "fbs-stocks"
   | "duty-stats"
   | "design";
 
@@ -339,6 +340,12 @@ export const getStocksOverview = cachedRead(
   () => ({ warehouses: [], totalQty: 0, inTransitQty: 0, productsWithStock: 0 }),
 );
 
+export const getFbsStocks = cachedRead(
+  "fbs-stocks",
+  db.getFbsStocks,
+  () => ({ snapshotDate: null, totalQty: 0, warehouses: [], products: [] }),
+);
+
 // Параметризованы товаром — без кэша (строк мало, чтение быстрое)
 export const getProductStocks = (productId: string) =>
   fromDb((client) => db.getProductStocks(client, productId), () => []);
@@ -397,6 +404,7 @@ export async function warmReadCache(): Promise<{ ms: number; failed: number }> {
     getProductList,
     getProductGroups,
     getStocksOverview,
+    getFbsStocks,
     getFinanceRows,
     getSalesPlanView,
     getCashOverview,

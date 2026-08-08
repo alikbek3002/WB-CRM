@@ -15,6 +15,8 @@ import {
   fetchAllCards,
   fetchBoxTariffs,
   fetchCommissionTariffs,
+  fetchFbsStocks,
+  fetchFbsWarehouses,
   fetchFinanceReport,
   fetchSalesFunnelHistory,
   fetchOrders,
@@ -69,6 +71,10 @@ const ACCEPTANCE_WINDOW_DAYS = 31;
 // поэтому за прогон обрабатываем ограниченную пачку — хвост доедет следующим.
 const INCOMES_DETAIL_CAP = 30;
 const INCOMES_PAUSE_MS = 1_500;
+
+// Остатки FBS: ≤1000 chrtId на запрос, лимит marketplace 300/мин (всплеск 20)
+const FBS_CHRT_BATCH = 1_000;
+const FBS_PAUSE_MS = 150;
 const WB_SUPPLY_STATUS: Record<number, string> = {
   1: "Не запланировано",
   2: "Запланировано",
@@ -155,6 +161,7 @@ export const WB_SYNC_SOURCES = [
   "stocks",
   "orders",
   "sales",
+  "fbs", // остатки на личных складах продавца (marketplace-api)
   "finance", // отчёт о реализации: фактические удержания WB (для ОПиУ)
   "advert", // расход на внутреннюю рекламу по дням
   "incomes", // поставки FBW: приёмки на склады WB
@@ -173,6 +180,7 @@ export const WB_DEFAULT_SOURCES: readonly WbSyncSource[] = [
   "stocks",
   "orders",
   "sales",
+  "fbs",
   "finance",
   "advert",
   "incomes",
@@ -299,7 +307,39 @@ export async function runWbSync(
         responsible_user_id: prev?.responsible_user_id ?? null,
       };
     });
-    return chunkedUpsert(db, "products", rows, "store_id,nm_id");
+    const nProducts = await chunkedUpsert(db, "products", rows, "store_id,nm_id");
+
+    // Размеры карточек → product_sizes: chrtID — ключ Marketplace API (остатки
+    // FBS, 0041). Карту id строим ПОСЛЕ upsert товаров — видит и новые карточки.
+    // Дедуп по chrt_id обязателен: дубль в одном INSERT роняет Postgres.
+    const { data: fresh, error: freshErr } = await db
+      .from("products")
+      .select("id, nm_id")
+      .eq("store_id", DEMO_STORE_ID);
+    if (freshErr) throw new Error(freshErr.message);
+    const idOf = new Map((fresh ?? []).map((p) => [Number(p.nm_id), p.id as string]));
+    const sizeByChrt = new Map<number, Record<string, unknown>>();
+    for (const c of cards) {
+      const pid = idOf.get(c.nmID);
+      if (!pid) continue;
+      for (const s of c.sizes ?? []) {
+        if (!s.chrtID) continue;
+        sizeByChrt.set(s.chrtID, {
+          product_id: pid,
+          chrt_id: s.chrtID,
+          tech_size: s.techSize ?? null,
+          barcode: s.skus?.[0] ?? null,
+          synced_at: new Date().toISOString(),
+        });
+      }
+    }
+    const nSizes = await chunkedUpsert(
+      db,
+      "product_sizes",
+      [...sizeByChrt.values()],
+      "chrt_id",
+    );
+    return nProducts + nSizes;
   }, counts, errors);
 
   // Карта nm_id → product_id — нужна только остаткам (заказы/продажи пишут nm_id напрямую)
@@ -352,6 +392,96 @@ export async function runWbSync(
       }
     }
     return chunkedUpsert(db, "stock_snapshots", rows, "product_id,warehouse,size,snapshot_date");
+  }, counts, errors);
+
+  // ── Остатки FBS (личные склады продавца) → fbs_stock_snapshots ──────────
+  // Marketplace API: склады продавца + остатки по chrtID из product_sizes
+  // (наполняет источник cards). Бюджет: 1 запрос складов + склады × чанки
+  // по 1000 chrtId ≈ 15 запросов; лимит 300/мин — с большим запасом.
+  if (want.has("fbs")) await runSource(db, "fbs", isoDate(new Date()), async () => {
+    const warehouses = await fetchFbsWarehouses(token);
+    if (warehouses.length > 0) {
+      await chunkedUpsert(
+        db,
+        "fbs_warehouses",
+        warehouses.map((w) => ({
+          store_id: DEMO_STORE_ID,
+          warehouse_id: w.id,
+          name: w.name,
+          office_id: w.officeId ?? null,
+          cargo_type: w.cargoType ?? null,
+          delivery_type: w.deliveryType ?? null,
+          is_deleting: Boolean(w.isDeleting),
+          synced_at: new Date().toISOString(),
+        })),
+        "store_id,warehouse_id",
+      );
+    }
+
+    // Справочник размеров — страницами: PostgREST режет ЛЮБОЙ select до 1000
+    type SizeRef = { productId: string; chrtId: number; techSize: string | null };
+    const byChrt = new Map<number, SizeRef>();
+    const byBarcode = new Map<string, number>();
+    const PAGE = 1000;
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await db
+        .from("product_sizes")
+        .select("product_id, chrt_id, tech_size, barcode")
+        .range(from, from + PAGE - 1);
+      if (error) throw new Error(error.message);
+      for (const r of data ?? []) {
+        const chrt = Number(r.chrt_id);
+        byChrt.set(chrt, {
+          productId: r.product_id as string,
+          chrtId: chrt,
+          techSize: (r.tech_size as string) ?? null,
+        });
+        if (r.barcode) byBarcode.set(r.barcode as string, chrt);
+      }
+      if (!data || data.length < PAGE) break;
+    }
+    if (byChrt.size === 0) {
+      throw new Error("нет product_sizes — сначала прогоните источник cards");
+    }
+
+    const chrtIds = [...byChrt.keys()];
+    const today = isoDate(new Date());
+    // Пред-агрегация по (товар, склад, размер): два chrtId с одним techSize
+    // дали бы дубль ключа — upsert упал бы «cannot affect row a second time».
+    const agg = new Map<string, { row: Record<string, unknown>; amount: number }>();
+    for (const w of warehouses) {
+      if (w.isDeleting) continue;
+      for (let i = 0; i < chrtIds.length; i += FBS_CHRT_BATCH) {
+        await new Promise((r) => setTimeout(r, FBS_PAUSE_MS));
+        const stocks = await fetchFbsStocks(token, w.id, chrtIds.slice(i, i + FBS_CHRT_BATCH));
+        for (const s of stocks) {
+          const amount = Number(s.amount ?? 0);
+          if (amount <= 0) continue;
+          // Матчинг: chrtId из ответа, иначе sku→barcode (страховка контракта)
+          const chrt = s.chrtId ?? byBarcode.get(s.sku);
+          const ref = chrt != null ? byChrt.get(Number(chrt)) : undefined;
+          if (!ref) continue;
+          const size = (ref.techSize ?? "").trim();
+          const key = `${ref.productId}|${w.id}|${size}`;
+          const prev = agg.get(key);
+          if (prev) prev.amount += amount;
+          else
+            agg.set(key, {
+              amount,
+              row: {
+                product_id: ref.productId,
+                warehouse_id: w.id,
+                warehouse_name: w.name,
+                size,
+                chrt_id: ref.chrtId,
+                snapshot_date: today,
+              },
+            });
+        }
+      }
+    }
+    const rows = [...agg.values()].map((a) => ({ ...a.row, amount: a.amount }));
+    return chunkedUpsert(db, "fbs_stock_snapshots", rows, "product_id,warehouse_id,size,snapshot_date");
   }, counts, errors);
 
   // ── Заказы / продажи → raw_orders / raw_sales ────────────────────────────

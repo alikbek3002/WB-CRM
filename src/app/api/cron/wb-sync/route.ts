@@ -39,12 +39,12 @@ export async function GET(request: Request) {
   const mode = new URL(request.url).searchParams.get("mode");
   const sources: WbSyncSource[] | undefined =
     mode === "live"
-      ? ["stocks", "orders", "sales"]
+      ? ["stocks", "orders", "sales", "fbs"]
       : mode === "finance"
         ? ["finance", "advert"]
         : mode === "analytics"
           ? ["storage", "acceptance", "funnel"]
-          : ["cards", "stocks", "orders", "sales", "incomes", "tariffs"];
+          : ["cards", "stocks", "orders", "sales", "fbs", "incomes", "tariffs"];
 
   // Финансам и аналитике нужно окно шире: отчёты WB приходят неделями
   const days = mode === "finance" || mode === "analytics" ? 60 : 2;

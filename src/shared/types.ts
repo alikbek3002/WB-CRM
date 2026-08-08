@@ -746,6 +746,32 @@ export type ProductStockRow = {
   inTransit: number;
 };
 
+// ─── Остатки FBS — личные склады продавца (marketplace-api, 0041) ────────────
+
+export type FbsWarehouseRow = {
+  warehouseId: number;
+  name: string;
+  qty: number; // остаток на складе (последний срез)
+  productsCount: number; // товаров с остатком на складе
+};
+
+export type FbsProductRow = {
+  productId: string;
+  nmId: number;
+  title: string;
+  photoUrl: string | null;
+  totalQty: number;
+  warehouses: { warehouseId: number; name: string; qty: number }[];
+  sizes: { size: string; qty: number }[];
+};
+
+export type FbsStocksView = {
+  snapshotDate: string | null; // дата последнего среза; null — синка ещё не было
+  totalQty: number;
+  warehouses: FbsWarehouseRow[]; // ВСЕ склады продавца (и пустые), по убыванию qty
+  products: FbsProductRow[]; // по убыванию totalQty
+};
+
 // ─── Дизайн карточек (заявки менеджеров → дизайнер → утверждение) ───────────
 
 export type DesignStatus = "new" | "in_progress" | "review" | "done" | "rejected";

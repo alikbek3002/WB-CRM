@@ -15,6 +15,9 @@ import type {
   FinanceRow,
   FulfillmentPartner,
   FulfillmentSummary,
+  FbsProductRow,
+  FbsStocksView,
+  FbsWarehouseRow,
   IntegrationStatus,
   PlanFactDay,
   CostPriceSource,
@@ -1395,6 +1398,107 @@ export async function getProductWarehouseOrders(
       Number(r.cnt),
     ]),
   );
+}
+
+// ─── Остатки FBS — личные склады продавца (0041) ─────────────────────────────
+
+export async function getFbsStocks(db: SupabaseClient): Promise<FbsStocksView> {
+  type AggRow = {
+    product_id: string;
+    warehouse_id: number;
+    warehouse_name: string;
+    size: string;
+    qty: number;
+    snapshot_date: string;
+  };
+  // Агрегат может отдать больше 1000 строк (товар×склад×размер) — только rpcAll
+  const [aggRows, whRes, prodRes] = await Promise.all([
+    rpcAll<AggRow>(db, "agg_fbs_stock_latest", { p_store: DEMO_STORE_ID }),
+    db
+      .from("fbs_warehouses")
+      .select("warehouse_id, name, is_deleting")
+      .eq("store_id", DEMO_STORE_ID),
+    db
+      .from("products")
+      .select("id, nm_id, title, photo_url")
+      .eq("store_id", DEMO_STORE_ID),
+  ]);
+  if (whRes.error) throw whRes.error;
+  if (prodRes.error) throw prodRes.error;
+
+  const prodById = new Map(
+    (prodRes.data ?? []).map((p) => [
+      p.id as string,
+      {
+        nmId: Number(p.nm_id),
+        title: (p.title as string) ?? "—",
+        photoUrl: (p.photo_url as string) ?? null,
+      },
+    ]),
+  );
+
+  const qtyByWh = new Map<number, number>();
+  const prodsByWh = new Map<number, Set<string>>();
+  const byProduct = new Map<string, FbsProductRow>();
+  let snapshotDate: string | null = null;
+
+  for (const r of aggRows) {
+    const wid = Number(r.warehouse_id);
+    const qty = Number(r.qty);
+    snapshotDate = r.snapshot_date ?? snapshotDate;
+    qtyByWh.set(wid, (qtyByWh.get(wid) ?? 0) + qty);
+    const set = prodsByWh.get(wid) ?? new Set<string>();
+    set.add(r.product_id);
+    prodsByWh.set(wid, set);
+
+    const info = prodById.get(r.product_id);
+    let row = byProduct.get(r.product_id);
+    if (!row) {
+      row = {
+        productId: r.product_id,
+        nmId: info?.nmId ?? 0,
+        title: info?.title ?? "—",
+        photoUrl: info?.photoUrl ?? null,
+        totalQty: 0,
+        warehouses: [],
+        sizes: [],
+      };
+      byProduct.set(r.product_id, row);
+    }
+    row.totalQty += qty;
+    const wh = row.warehouses.find((w) => w.warehouseId === wid);
+    if (wh) wh.qty += qty;
+    else row.warehouses.push({ warehouseId: wid, name: r.warehouse_name, qty });
+    const sizeKey = r.size?.trim() || "б/р";
+    const sz = row.sizes.find((s) => s.size === sizeKey);
+    if (sz) sz.qty += qty;
+    else row.sizes.push({ size: sizeKey, qty });
+  }
+
+  // Склады из справочника: и пустые тоже — их видно приглушёнными
+  const warehouses: FbsWarehouseRow[] = (whRes.data ?? [])
+    .filter((w) => !w.is_deleting)
+    .map((w) => ({
+      warehouseId: Number(w.warehouse_id),
+      name: (w.name as string) ?? "—",
+      qty: qtyByWh.get(Number(w.warehouse_id)) ?? 0,
+      productsCount: prodsByWh.get(Number(w.warehouse_id))?.size ?? 0,
+    }))
+    .sort((a, b) => b.qty - a.qty || a.name.localeCompare(b.name, "ru"));
+
+  const products = [...byProduct.values()];
+  for (const p of products) {
+    p.warehouses.sort((a, b) => b.qty - a.qty);
+    p.sizes.sort((a, b) => compareSizes(a.size, b.size));
+  }
+  products.sort((a, b) => b.totalQty - a.totalQty);
+
+  return {
+    snapshotDate,
+    totalQty: products.reduce((t, p) => t + p.totalQty, 0),
+    warehouses,
+    products,
+  };
 }
 
 // ─── Дизайн карточек (заявки) ────────────────────────────────────────────────

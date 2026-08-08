@@ -474,6 +474,50 @@ export function fetchWbSupplyGoods(token: string, supplyId: number): Promise<WbS
   ).then((r) => r ?? []);
 }
 
+// ─── Marketplace API: личные склады продавца и остатки FBS ───────────────────
+// Токен категории «Маркетплейс». Лимит 300 запросов/мин (всплеск 20) на все
+// методы складов/остатков — паузы между складами делает синк.
+
+const MARKETPLACE = "https://marketplace-api.wildberries.ru";
+
+export type WbFbsWarehouse = {
+  id: number;
+  name: string;
+  officeId?: number;
+  cargoType?: number;
+  deliveryType?: number;
+  isDeleting?: boolean;
+  isProcessing?: boolean;
+};
+
+export function fetchFbsWarehouses(token: string): Promise<WbFbsWarehouse[]> {
+  return wbFetch<WbFbsWarehouse[]>(
+    `${MARKETPLACE}/api/v3/warehouses`,
+    token,
+    undefined,
+    30_000,
+  ).then((r) => r ?? []);
+}
+
+// Остатки склада по chrtID размеров (≤1000 за запрос — чанкует вызывающая
+// сторона). Контракт body {chrtIds} и ответа {stocks:[{sku, chrtId, amount}]}
+// проверен вживую 2026-08-08 (в старых доках описан body {skus} — на случай
+// отката WB синк матчит и по chrtId, и по sku→product_sizes.barcode).
+export type WbFbsStockRow = { sku: string; chrtId?: number; amount: number };
+
+export function fetchFbsStocks(
+  token: string,
+  warehouseId: number,
+  chrtIds: number[],
+): Promise<WbFbsStockRow[]> {
+  return wbFetch<{ stocks: WbFbsStockRow[] }>(
+    `${MARKETPLACE}/api/v3/stocks/${warehouseId}`,
+    token,
+    { method: "POST", body: JSON.stringify({ chrtIds }) },
+    30_000,
+  ).then((r) => r?.stocks ?? []);
+}
+
 // ─── Seller Analytics: async-отчёты (платное хранение, платная приёмка) ─────
 // Одинаковый каркас с warehouse_remains: создать задачу → поллинг → скачать.
 // Лимит: ~1 создание задачи в минуту на отчёт — паузы делает вызывающая сторона.
