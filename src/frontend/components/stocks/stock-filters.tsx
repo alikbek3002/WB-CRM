@@ -24,17 +24,20 @@ export type FilterProduct = {
 
 // Каскад фильтров остатков: вид товара (категория WB) → бренд → конкретный
 // товар. Выбор пишется в URL — страница показывает список товаров вида или
-// матрицу выбранного товара.
+// матрицу выбранного товара. На вкладке FBS в URL держится и tab=fbs,
+// иначе выбор фильтра возвращал бы на FBO.
 export function StockFilters({
   products,
   category,
   brand,
   productId,
+  tab = null,
 }: {
   products: FilterProduct[];
   category: string; // "all" | категория
   brand: string; // "all" | бренд
   productId: string | null;
+  tab?: "fbs" | null; // null — вкладка FBO, tab в URL не пишем
 }) {
   const router = useRouter();
 
@@ -73,6 +76,7 @@ export function StockFilters({
     const b = next.brand ?? brand;
     const p = next.product === undefined ? productId : next.product;
     const params = new URLSearchParams();
+    if (tab) params.set("tab", tab);
     if (c !== "all") params.set("category", c);
     if (b !== "all") params.set("brand", b);
     if (p) params.set("product", p);
@@ -170,7 +174,11 @@ export function StockFilters({
       </div>
 
       {hasFilters && (
-        <Button size="sm" variant="outline" onClick={() => router.push("/stocks")}>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => router.push(tab ? `/stocks?tab=${tab}` : "/stocks")}
+        >
           <X className="size-3.5" />
           Сбросить
         </Button>

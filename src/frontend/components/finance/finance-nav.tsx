@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BarChart3, Receipt, Target, Users, Wallet } from "lucide-react";
+import { BarChart3, Coins, Receipt, Target, Users, Wallet } from "lucide-react";
 import { cn } from "@/shared/utils";
 
 // Вкладки раздела «Финансы». Ссылки, а не клиентские табы: каждая вкладка —
@@ -13,6 +13,8 @@ const TABS = [
   { href: "/finance/expenses", label: "Расходы", icon: Receipt, cashOnly: true },
   { href: "/finance/payroll", label: "Выплаты команде", icon: Users, cashOnly: true },
   { href: "/finance/cash", label: "Касса", icon: Wallet, cashOnly: true },
+  // Курсы валют к сому: базовая валюта одна, а платят фабрикам в юанях и долларах
+  { href: "/finance/currencies", label: "Валюты", icon: Coins, cashOnly: true },
 ];
 
 export function FinanceNav({ canCash }: { canCash: boolean }) {

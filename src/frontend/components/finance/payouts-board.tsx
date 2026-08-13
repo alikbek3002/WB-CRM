@@ -25,7 +25,13 @@ import {
   SelectValue,
 } from "@/frontend/components/ui/select";
 import { StatRow } from "@/frontend/components/finance/stat-row";
-import { formatMoney, formatRub } from "@/shared/format";
+import {
+  BASE_CURRENCY,
+  CURRENCY_CODES,
+  CURRENCY_LABEL,
+  CURRENCY_SIGN,
+} from "@/shared/currency";
+import { formatMoney, formatSom } from "@/shared/format";
 import { cn } from "@/shared/utils";
 import type {
   Currency,
@@ -92,7 +98,7 @@ function RequestDialog({
   const [kind, setKind] = useState<PayoutKind>("contractor");
   const [title, setTitle] = useState("");
   const [amount, setAmount] = useState("");
-  const [currency, setCurrency] = useState<Currency>("rub");
+  const [currency, setCurrency] = useState<Currency>(BASE_CURRENCY);
   const [payeeUserId, setPayeeUserId] = useState(PAYEE_SELF);
   const [payee, setPayee] = useState("");
   const [dueDate, setDueDate] = useState("");
@@ -191,10 +197,11 @@ function RequestDialog({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="rub">₽</SelectItem>
-                  <SelectItem value="kgs">сом</SelectItem>
-                  <SelectItem value="cny">¥</SelectItem>
-                  <SelectItem value="uzs">сум</SelectItem>
+                  {CURRENCY_CODES.map((c) => (
+                    <SelectItem key={c} value={c}>
+                      {CURRENCY_LABEL[c]}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             </div>
@@ -388,7 +395,7 @@ function PayDialog({
               <SelectContent>
                 {(matching.length ? matching : accounts).map((a) => (
                   <SelectItem key={a.id} value={a.id}>
-                    {a.name} · {a.currency === "rub" ? "₽" : a.currency === "cny" ? "¥" : a.currency === "kgs" ? "сом" : "сум"}
+                    {a.name} · {CURRENCY_SIGN[a.currency]}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -489,17 +496,17 @@ export function PayoutsBoard({
           {
             label: "Ждут решения",
             value: String(view.pendingCount),
-            hint: view.pendingRub > 0 ? `на ${formatRub(view.pendingRub)}` : undefined,
+            hint: view.pendingRub > 0 ? `на ${formatSom(view.pendingRub)}` : undefined,
             tone: view.pendingCount > 0 ? "bad" : "default",
           },
           {
             label: "Согласовано к оплате",
-            value: formatRub(view.approvedRub),
+            value: formatSom(view.approvedRub),
             hint: "ещё не выплачено",
           },
           {
             label: "Выплачено за месяц",
-            value: formatRub(view.paidMonthRub),
+            value: formatSom(view.paidMonthRub),
           },
           {
             label: "Всего заявок",
@@ -549,8 +556,8 @@ export function PayoutsBoard({
                 <div className="font-semibold tabular-nums">
                   {formatMoney(p.amount, p.currency)}
                 </div>
-                {p.currency !== "rub" && (
-                  <div className="text-[11px] text-muted-foreground">≈ {formatRub(p.amountRub)}</div>
+                {p.currency !== BASE_CURRENCY && (
+                  <div className="text-[11px] text-muted-foreground">≈ {formatSom(p.amountRub)}</div>
                 )}
               </div>
               <div className="flex flex-wrap gap-1.5">

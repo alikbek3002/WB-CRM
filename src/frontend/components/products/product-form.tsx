@@ -208,7 +208,7 @@ export function ProductForm({ product }: { product?: ProductListItem }) {
               />
             </div>
             <div className="grid gap-1.5">
-              <Label htmlFor="prod-cost">Себестоимость, ₽</Label>
+              <Label htmlFor="prod-cost">Себестоимость, сом</Label>
               <Input
                 id="prod-cost"
                 inputMode="decimal"
@@ -218,7 +218,7 @@ export function ProductForm({ product }: { product?: ProductListItem }) {
               />
             </div>
             <div className="grid gap-1.5">
-              <Label htmlFor="prod-logistics">Логистика, ₽/шт</Label>
+              <Label htmlFor="prod-logistics">Логистика, сом/шт</Label>
               <Input
                 id="prod-logistics"
                 inputMode="decimal"

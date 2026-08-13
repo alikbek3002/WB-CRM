@@ -24,18 +24,25 @@ import {
   TableHeader,
   TableRow,
 } from "@/frontend/components/ui/table";
-import { formatNumber, formatRub } from "@/shared/format";
+import { formatNumber, formatSom } from "@/shared/format";
 import type { FulfillmentPartner } from "@/shared/types";
 
 // Тариф за единицу — база начисления за разбор поставки. Начисление входит
 // в себестоимость товара (не в расходы периода), поэтому правка тарифа НЕ
 // пересчитывает уже принятые партии: их себестоимость зафиксирована приёмкой.
-function PartnerForm({ partner }: { partner?: FulfillmentPartner }) {
+function PartnerForm({
+  partner,
+  cities,
+}: {
+  partner?: FulfillmentPartner;
+  cities: string[]; // подсказки городов: свои склады в кабинете WB + уже заведённые фул-фирмы
+}) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [name, setName] = useState(partner?.name ?? "");
   const [rate, setRate] = useState(String(partner?.ratePerUnitRub ?? ""));
+  const [city, setCity] = useState(partner?.city ?? "");
   const [note, setNote] = useState(partner?.note ?? "");
 
   async function save() {
@@ -48,6 +55,7 @@ function PartnerForm({ partner }: { partner?: FulfillmentPartner }) {
           ...(partner ? { id: partner.id } : {}),
           name: name.trim(),
           ratePerUnitRub: Number(rate) || 0,
+          city: city.trim() || null,
           note: note.trim() || null,
         }),
       });
@@ -88,7 +96,7 @@ function PartnerForm({ partner }: { partner?: FulfillmentPartner }) {
               <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Фул-фирма Москва" />
             </div>
             <div className="grid gap-1.5">
-              <Label className="text-xs text-muted-foreground">Тариф, ₽ за единицу</Label>
+              <Label className="text-xs text-muted-foreground">Тариф, сом за единицу</Label>
               <Input
                 type="number"
                 inputMode="decimal"
@@ -96,6 +104,32 @@ function PartnerForm({ partner }: { partner?: FulfillmentPartner }) {
                 onChange={(e) => setRate(e.target.value)}
                 placeholder="15"
               />
+            </div>
+            {/* Город разгрузки: по нему карточка поставки предлагает, куда
+                приедет карго. Подсказки — города своих складов в кабинете WB
+                (их WB отдаёт по офисам), чтобы не плодить «Спб» рядом с
+                «Санкт-Петербургом». */}
+            <div className="grid gap-1.5">
+              <Label className="text-xs text-muted-foreground">Город разгрузки</Label>
+              <Input
+                value={city}
+                onChange={(e) => setCity(e.target.value)}
+                placeholder="Москва"
+              />
+              {cities.length > 0 && (
+                <div className="flex flex-wrap gap-1">
+                  {cities.map((c) => (
+                    <Button
+                      key={c}
+                      size="xs"
+                      variant={city.trim() === c ? "default" : "outline"}
+                      onClick={() => setCity(c)}
+                    >
+                      {c}
+                    </Button>
+                  ))}
+                </div>
+              )}
             </div>
             <div className="grid gap-1.5">
               <Label className="text-xs text-muted-foreground">Заметка</Label>
@@ -113,9 +147,11 @@ function PartnerForm({ partner }: { partner?: FulfillmentPartner }) {
 
 export function FulfillmentPartners({
   partners,
+  cities,
   canManage,
 }: {
   partners: FulfillmentPartner[];
+  cities: string[];
   canManage: boolean;
 }) {
   const active = partners.filter((p) => !p.archived);
@@ -130,7 +166,7 @@ export function FulfillmentPartners({
               Начисление за поставку = тариф × принято. Входит в себестоимость единицы.
             </div>
           </div>
-          {canManage && <PartnerForm />}
+          {canManage && <PartnerForm cities={cities} />}
         </div>
 
         {active.length === 0 ? (
@@ -145,7 +181,8 @@ export function FulfillmentPartners({
             <TableHeader>
               <TableRow>
                 <TableHead>Фул-фирма</TableHead>
-                <TableHead className="text-right">Тариф, ₽/шт</TableHead>
+                <TableHead>Город</TableHead>
+                <TableHead className="text-right">Тариф, сом/шт</TableHead>
                 <TableHead className="text-right">Поставок</TableHead>
                 <TableHead className="text-right">Начислено</TableHead>
                 <TableHead className="text-right">Оплачено</TableHead>
@@ -162,8 +199,14 @@ export function FulfillmentPartners({
                       <span className="block text-xs text-muted-foreground">{p.note}</span>
                     )}
                   </TableCell>
+                  <TableCell className="text-muted-foreground">
+                    {p.city ?? "—"}
+                    {p.fbsWarehouseName && (
+                      <span className="block text-[11px]">склад WB: {p.fbsWarehouseName}</span>
+                    )}
+                  </TableCell>
                   <TableCell className="text-right tabular-nums">
-                    {p.ratePerUnitRub > 0 ? formatRub(p.ratePerUnitRub) : (
+                    {p.ratePerUnitRub > 0 ? formatSom(p.ratePerUnitRub) : (
                       <Badge variant="outline" className="border-amber-500/50 text-[10px] text-amber-400">
                         не задан
                       </Badge>
@@ -172,18 +215,18 @@ export function FulfillmentPartners({
                   <TableCell className="text-right tabular-nums">
                     {formatNumber(p.suppliesCount)}
                   </TableCell>
-                  <TableCell className="text-right tabular-nums">{formatRub(p.chargedRub)}</TableCell>
+                  <TableCell className="text-right tabular-nums">{formatSom(p.chargedRub)}</TableCell>
                   <TableCell className="text-right tabular-nums text-emerald-400">
-                    {formatRub(p.paidRub)}
+                    {formatSom(p.paidRub)}
                   </TableCell>
                   <TableCell
                     className={`text-right tabular-nums ${p.owedRub > 0 ? "text-amber-400" : "text-muted-foreground"}`}
                   >
-                    {formatRub(p.owedRub)}
+                    {formatSom(p.owedRub)}
                   </TableCell>
                   {canManage && (
                     <TableCell className="text-right">
-                      <PartnerForm partner={p} />
+                      <PartnerForm partner={p} cities={cities} />
                     </TableCell>
                   )}
                 </TableRow>

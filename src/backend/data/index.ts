@@ -15,9 +15,11 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { unstable_cache } from "next/cache";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
+import type { CurrencyRateMap } from "@/shared/currency";
 import type { MemberRole } from "@/shared/rbac";
 import type { DutyStatsPeriod, PnlMonth, PnlView } from "@/shared/types";
 import * as mock from "./mock";
+import { ratesToMap } from "./currency-core";
 import * as payouts from "./payouts-core";
 import * as db from "./supabase";
 
@@ -40,6 +42,7 @@ export type WbScope =
   | "finance"
   | "sales-plan"
   | "cash"
+  | "currency-rates"
   | "finance-refs"
   | "expenses"
   | "payroll"
@@ -56,9 +59,12 @@ export type WbScope =
   | "supplies"
   | "fulfillment"
   | "fulfillment-partners"
+  | "unload-points"
+  | "wb-warehouses"
   | "stocks-overview"
   | "fbs-stocks"
   | "duty-stats"
+  | "duty-templates"
   | "design";
 
 // Сколько переиспользовать результат чтения между навигациями (сек).
@@ -156,6 +162,19 @@ export const getFinanceRefs = cachedRead("finance-refs", db.getFinanceRefs, () =
   accounts: [],
   categories: [],
 }));
+
+// Курсы валют к сому (0043). Читают почти все денежные экраны, меняются редко —
+// правка курса сбрасывает область currency-rates вместе с деньгами (revalidate).
+export const getCurrencyRates = cachedRead(
+  "currency-rates",
+  db.getCurrencyRates,
+  mock.getCurrencyRates,
+);
+
+// Те же курсы «плоской» картой (код → сколько сомов за единицу) — формы на
+// клиенте считают по ней пересчёт «≈ N сом», не дёргая сервер на каждый ввод.
+export const getCurrencyRateMap = async (): Promise<CurrencyRateMap> =>
+  ratesToMap(await getCurrencyRates());
 
 // Параметризованы периодом — кэшируем по ключу периода
 export const getExpensesView = (from?: string, to?: string) =>
@@ -332,6 +351,21 @@ export const getFulfillmentPartners = cachedRead(
   () => [],
 );
 
+// Города разгрузки (0042): справочник для карточки поставки и фул-фирмы.
+// Живёт в области fulfillment-partners — меняется вместе с ними.
+export const getUnloadPoints = cachedRead(
+  "unload-points",
+  db.getUnloadPoints,
+  mock.getUnloadPoints,
+);
+
+// Склады WB для отгрузки FBW — синкается вместе с поставками (источник incomes)
+export const getWbWarehouses = cachedRead(
+  "wb-warehouses",
+  db.getWbWarehouses,
+  mock.getWbWarehouses,
+);
+
 // ─── Остатки по складам ───────────────────────────────────────────────────────
 
 export const getStocksOverview = cachedRead(
@@ -369,6 +403,14 @@ export const getDesignRequests = cachedRead("design", db.getDesignRequests, () =
 
 export const getMyDuties = (userId: string) =>
   fromDb((client) => db.getMyDuties(client, userId), () => []);
+
+// Сам регламент (шаблоны обязанностей). Чистое чтение и меняется редко —
+// кэшируем; правка регламента сбрасывает область duty-templates.
+export const getDutyTemplates = cachedRead(
+  "duty-templates",
+  db.getDutyTemplates,
+  () => [],
+);
 
 // Статистика дисциплины регламента (7/30 дней) — чистое чтение, кэшируем
 // коротко: данные меняются в течение дня по мере закрытия задач.
@@ -409,6 +451,7 @@ export async function warmReadCache(): Promise<{ ms: number; failed: number }> {
     getSalesPlanView,
     getCashOverview,
     getFinanceRefs,
+    getCurrencyRates,
     () => getPnlView(6), // ОПиУ — самая тяжёлая вкладка финансов
     () => getExpensesView(), // расходы текущего месяца
     () => getPayrollView(), // выплаты команде за текущий месяц

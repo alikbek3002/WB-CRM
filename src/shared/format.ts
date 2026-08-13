@@ -1,13 +1,12 @@
-const rub = new Intl.NumberFormat("ru-RU", {
-  style: "currency",
-  currency: "RUB",
-  maximumFractionDigits: 0,
-});
+import { BASE_CURRENCY, CURRENCY_SIGN, normalizeCurrency, type Currency } from "./currency";
 
 const num = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 });
 
-export function formatRub(value: number): string {
-  return rub.format(value);
+// Базовая валюта компании — сом (см. shared/currency.ts). Все сводные суммы
+// (выручка кабинета, касса, расходы, себестоимость, долги фабрикам) показываем
+// в ней: до этого суммы в сомах подписывались рублём и врали в отчёте.
+export function formatSom(value: number): string {
+  return `${num.format(Math.round(value))} сом`;
 }
 
 export function formatNumber(value: number): string {
@@ -21,26 +20,28 @@ export function formatPercent(value: number, digits = 1): string {
   })}%`;
 }
 
-// Мультивалюта для цепочки поставок: ¥ (юань), ₽ (рубль), сум (Узбекистан).
-// Валюта кабинета WB. Юрлицо может быть не российским (у киргизского продавца
-// отчёт приходит в сомах), и подписывать такие суммы рублём — врать в отчёте.
-const CURRENCY_SIGN: Record<string, string> = {
-  RUB: "₽",
-  KGS: "сом",
-  KZT: "₸",
-  BYN: "Br",
-  UZS: "сум",
-  CNY: "¥",
-  USD: "$",
-};
-
-export function currencySign(currency = "RUB"): string {
-  return CURRENCY_SIGN[currency.toUpperCase()] ?? currency.toUpperCase();
+// Знак валюты. Принимает и наш код («usd»), и ISO из ответа WB («KGS»).
+export function currencySign(currency: string = BASE_CURRENCY): string {
+  const code = normalizeCurrency(currency);
+  return code ? CURRENCY_SIGN[code] : currency.toUpperCase();
 }
 
-// Сумма в валюте кабинета: «1 234 567 сом», «1 234 567 ₽»
-export function formatAmount(value: number, currency = "RUB"): string {
+// Сумма в произвольной валюте: «1 234 567 сом», «12 500 $», «18 000 ¥».
+export function formatAmount(value: number, currency: string = BASE_CURRENCY): string {
   return `${num.format(Math.round(value))} ${currencySign(currency)}`;
+}
+
+// То же, но с типизированным кодом валюты — для форм и карточек, где валюта
+// выбрана пользователем (оплаты поставок, счета кассы, заявки на выплату).
+export function formatMoney(value: number, currency: Currency): string {
+  return formatAmount(value, currency);
+}
+
+// Курс валюты к сому: «87,5», «0,0069». Мелкие курсы (сум) при округлении до
+// целого превратились бы в ноль — знаков после запятой даём по величине курса.
+export function formatRate(rate: number): string {
+  const digits = rate >= 100 ? 2 : rate >= 1 ? 4 : 6;
+  return rate.toLocaleString("ru-RU", { maximumFractionDigits: digits });
 }
 
 // Компактно для осей и плотных мест: «220 млн», «1,5 млн», «830 тыс».
@@ -56,21 +57,7 @@ export function formatCompact(value: number): string {
   return String(Math.round(value));
 }
 
-// Компактная сумма в валюте кабинета: «25,3 млрд сом», «138 млн ₽»
-export function formatCompactAmount(value: number, currency = "RUB"): string {
+// Компактная сумма в валюте: «25,3 млрд сом», «138 млн ₽»
+export function formatCompactAmount(value: number, currency: string = BASE_CURRENCY): string {
   return `${formatCompact(value)} ${currencySign(currency)}`;
-}
-
-export function formatMoney(value: number, currency: string): string {
-  switch (currency) {
-    case "cny":
-      return `${num.format(value)} ¥`;
-    case "uzs":
-      return `${num.format(value)} сум`; // у сума нет ISO-символа
-    case "kgs":
-      return `${num.format(value)} сом`;
-    case "rub":
-    default:
-      return rub.format(value);
-  }
 }

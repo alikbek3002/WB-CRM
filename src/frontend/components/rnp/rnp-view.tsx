@@ -12,7 +12,7 @@ import {
 } from "@/frontend/components/ui/card";
 import { Tabs, TabsList, TabsTrigger } from "@/frontend/components/ui/tabs";
 import { cn } from "@/shared/utils";
-import { formatNumber, formatPercent, formatRub } from "@/shared/format";
+import { formatNumber, formatPercent, formatSom } from "@/shared/format";
 import type { RnpDay, RnpProduct } from "@/shared/types";
 import { Download } from "lucide-react";
 
@@ -35,10 +35,10 @@ function pct(fact: number, plan: number): number | null {
 function EconomicsCard({ product }: { product: RnpProduct }) {
   const e = product.economics;
   const metrics: { label: string; value: string }[] = [
-    { label: "Себестоимость", value: formatRub(e.costPrice) },
-    { label: "Цена", value: formatRub(e.priceRub) },
-    { label: "Логистика", value: formatRub(e.logistics) },
-    { label: "Прибыль (мес)", value: formatRub(e.profitRub) },
+    { label: "Себестоимость", value: formatSom(e.costPrice) },
+    { label: "Цена", value: formatSom(e.priceRub) },
+    { label: "Логистика", value: formatSom(e.logistics) },
+    { label: "Прибыль (мес)", value: formatSom(e.profitRub) },
     { label: "Маржа", value: formatPercent(e.marginPct) },
     { label: "Рентабельность", value: formatPercent(e.profitabilityPct) },
     { label: "ДРР", value: formatPercent(e.drrPct) },
@@ -211,16 +211,16 @@ function WeekGrid({
           );
         },
       },
-      { label: "Ср. чек", render: (d) => (d.avgCheck ? formatRub(d.avgCheck) : "—") },
+      { label: "Ср. чек", render: (d) => (d.avgCheck ? formatSom(d.avgCheck) : "—") },
       { label: "Раздачи", render: (d) => d.giveaways },
       {
         label: "Сумма заказов",
         group: "money",
-        render: (d) => (d.ordersSumRub ? formatRub(d.ordersSumRub) : "—"),
+        render: (d) => (d.ordersSumRub ? formatSom(d.ordersSumRub) : "—"),
       },
       {
         label: "Сумма продаж",
-        render: (d) => (d.salesSumRub ? formatRub(d.salesSumRub) : "—"),
+        render: (d) => (d.salesSumRub ? formatSom(d.salesSumRub) : "—"),
       },
       {
         label: "Показы",
@@ -241,7 +241,7 @@ function WeekGrid({
   const GROUP_TITLES: Record<string, string> = {
     orders: "ЗАКАЗЫ",
     sales: "ПРОДАЖИ",
-    money: "СУММА ПРОДАЖ ₽",
+    money: "СУММА ПРОДАЖ, СОМ",
     funnel: "ПОКАЗАТЕЛИ ВОРОНКИ",
   };
 
@@ -358,10 +358,10 @@ function WeeksSummary({ product }: { product: RnpProduct }) {
                     {ps === null ? "—" : `${ps}%`}
                   </td>
                   <td className="px-2 py-1.5 text-right tabular-nums">
-                    {formatRub(w.ordersSumRub)}
+                    {formatSom(w.ordersSumRub)}
                   </td>
                   <td className="px-2 py-1.5 text-right tabular-nums">
-                    {formatRub(w.salesSumRub)}
+                    {formatSom(w.salesSumRub)}
                   </td>
                 </tr>
               );

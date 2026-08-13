@@ -30,7 +30,8 @@ import {
 import { StatRow } from "@/frontend/components/finance/stat-row";
 import { StructureBar } from "@/frontend/components/finance/structure-bar";
 import { SERIES } from "@/frontend/components/charts/palette";
-import { formatMoney, formatRub } from "@/shared/format";
+import { BASE_CURRENCY, type CurrencyRateMap } from "@/shared/currency";
+import { formatMoney, formatSom } from "@/shared/format";
 import { cn } from "@/shared/utils";
 import type { ExpenseCategory, PayrollView } from "@/shared/types";
 
@@ -61,12 +62,14 @@ export function PayrollBoard({
   accounts,
   categories,
   members,
+  rates,
   canEdit,
 }: {
   view: PayrollView;
   accounts: AccountOpt[];
   categories: ExpenseCategory[];
   members: MemberOpt[];
+  rates?: CurrencyRateMap; // курсы к сому для формы выплаты
   canEdit: boolean;
 }) {
   const router = useRouter();
@@ -113,6 +116,7 @@ export function PayrollBoard({
         </div>
         {canEdit && (
           <AddTxButton
+            rates={rates}
             // key пересоздаёт кнопку с диалогом при смене выбранного сотрудника:
             // useState в TxDialog берёт default* только при монтировании
             key={selected?.personId ?? "none"}
@@ -132,23 +136,23 @@ export function PayrollBoard({
         stats={[
           {
             label: `Выплачено команде · ${dmy(view.from)} — ${dmy(view.to)}`,
-            value: formatRub(view.totalRub),
+            value: formatSom(view.totalRub),
             hint: `${view.people.length} чел. · ${view.items.length} выплат`,
           },
           {
             label: "Больше всех получил",
             value: top ? top.name : "—",
-            hint: top ? `${formatRub(top.amountRub)} · ${top.sharePct}%` : undefined,
+            hint: top ? `${formatSom(top.amountRub)} · ${top.sharePct}%` : undefined,
           },
           {
             label: "В среднем на человека",
-            value: avgPerPerson ? formatRub(avgPerPerson) : "—",
+            value: avgPerPerson ? formatSom(avgPerPerson) : "—",
             hint: "за выбранный период",
             tone: "muted",
           },
           {
             label: "Ждёт выплаты",
-            value: formatRub(view.pendingRub),
+            value: formatSom(view.pendingRub),
             hint: "заявки без оплаты",
             tone: view.pendingRub > 0 ? "bad" : "default",
           },
@@ -158,7 +162,7 @@ export function PayrollBoard({
       {view.unassignedRub > 0 && (
         <Card>
           <CardContent className="py-3 text-sm text-amber-400">
-            {formatRub(view.unassignedRub)} по «людским» статьям ({view.unassignedCount}{" "}
+            {formatSom(view.unassignedRub)} по «людским» статьям ({view.unassignedCount}{" "}
             {view.unassignedCount === 1 ? "операция" : "операций"}) записаны без сотрудника —
             в разрезе по людям их не видно. Указывайте, кому выплата, при вводе расхода.
           </CardContent>
@@ -170,11 +174,11 @@ export function PayrollBoard({
           <CardContent className="py-4">
             <div className="mb-2 text-sm">
               Как распределился фонд выплат
-              <span className="ml-2 text-muted-foreground">от {formatRub(view.totalRub)}</span>
+              <span className="ml-2 text-muted-foreground">от {formatSom(view.totalRub)}</span>
             </div>
             <StructureBar
               total={view.totalRub}
-              formatValue={(v) => formatRub(v)}
+              formatValue={(v) => formatSom(v)}
               segments={view.people.slice(0, 6).map((p, i) => ({
                 label: p.name,
                 value: p.amountRub,
@@ -224,7 +228,7 @@ export function PayrollBoard({
                 </div>
 
                 <div className="text-lg font-semibold tabular-nums">
-                  {formatRub(p.amountRub)}
+                  {formatSom(p.amountRub)}
                 </div>
 
                 <div className="text-xs text-muted-foreground">
@@ -240,7 +244,7 @@ export function PayrollBoard({
                         className="rounded-md bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground"
                       >
                         {s.emoji ? `${s.emoji} ` : ""}
-                        {s.name} — {formatRub(s.amountRub)}
+                        {s.name} — {formatSom(s.amountRub)}
                       </span>
                     ))}
                   </div>
@@ -264,7 +268,7 @@ export function PayrollBoard({
                   <SelectItem value={ALL}>Все сотрудники</SelectItem>
                   {view.people.map((p) => (
                     <SelectItem key={p.personId} value={p.personId}>
-                      {p.name} — {formatRub(p.amountRub)}
+                      {p.name} — {formatSom(p.amountRub)}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -272,10 +276,10 @@ export function PayrollBoard({
             </div>
             {selected && (
               <div className="text-sm text-muted-foreground">
-                {selected.name}: {formatRub(selected.amountRub)} за период
+                {selected.name}: {formatSom(selected.amountRub)} за период
                 {selected.monthly.length > 1
                   ? ` · по месяцам ${selected.monthly
-                      .map((m) => `${m.label} ${formatRub(m.amountRub)}`)
+                      .map((m) => `${m.label} ${formatSom(m.amountRub)}`)
                       .join(" · ")}`
                   : ""}
               </div>
@@ -318,9 +322,9 @@ export function PayrollBoard({
                       {t.source === "bot" || t.source === "ai" ? " · бот" : ""}
                     </TableCell>
                     <TableCell className="text-right font-medium whitespace-nowrap tabular-nums">
-                      {t.currency === "rub"
-                        ? formatRub(t.amountRub)
-                        : `${formatMoney(t.amount, t.currency)} (${formatRub(t.amountRub)})`}
+                      {t.currency === BASE_CURRENCY
+                        ? formatSom(t.amountRub)
+                        : `${formatMoney(t.amount, t.currency)} (${formatSom(t.amountRub)})`}
                     </TableCell>
                   </TableRow>
                 ))}

@@ -12,7 +12,7 @@ import { localIsoDate } from "../data/duties-core";
 const FONT = path.join(process.cwd(), "src/assets/fonts/DejaVuSans.ttf");
 
 function rub(n: number): string {
-  return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(n)) + " ₽";
+  return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(n)) + " сом";
 }
 
 function isoDaysAgo(days: number): string {

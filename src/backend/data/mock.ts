@@ -3,6 +3,7 @@
 
 import type {
   Currency,
+  CurrencyRatesView,
   DashboardData,
   DailyPoint,
   Factory,
@@ -20,8 +21,10 @@ import type {
   Tariff,
   TaskItem,
   TeamMember,
+  UnloadPoint,
   WarehouseStock,
   WbDistribution,
+  WbWarehouseRef,
 } from "@/shared/types";
 import {
   assembleSupply,
@@ -30,6 +33,13 @@ import {
   type FactoryBase,
   type SupplyInput,
 } from "@/shared/supply";
+import {
+  BASE_CURRENCY,
+  CURRENCY_CODES,
+  CURRENCY_NAME,
+  CURRENCY_SIGN,
+  DEFAULT_RATES_TO_BASE,
+} from "@/shared/currency";
 
 function mulberry32(seed: number) {
   let a = seed;
@@ -396,8 +406,20 @@ export function getProductList(): ProductListItem[] {
 // ─── Цепочка поставок (Фабрики · Поставки · Фул-фирма) ───────────────────────
 
 const MOCK_FACTORIES: FactoryBase[] = [
-  { id: "f-china", name: "Guangzhou Textile Co.", country: "china", note: "Основной трикотаж/шёлк" },
-  { id: "f-uz", name: "Toshkent Tekstil", country: "uzbekistan", note: "Хлопок, костюмы, гипюр" },
+  {
+    id: "f-china",
+    name: "Guangzhou Textile Co.",
+    country: "china",
+    note: "Основной трикотаж/шёлк",
+    currency: "cny",
+  },
+  {
+    id: "f-uz",
+    name: "Toshkent Tekstil",
+    country: "uzbekistan",
+    note: "Хлопок, костюмы, гипюр",
+    currency: "uzs",
+  },
 ];
 
 const PRODUCT_TITLE: Record<string, string> = Object.fromEntries(
@@ -519,6 +541,9 @@ function seedToInput(seed: SupplySeed): SupplyInput {
     fulfillmentPartnerName: null,
     fulfillmentRatePerUnitRub: 0,
     fulfillmentCostRub: null,
+    // Демо: карго из Китая разгружаем в Москве, из Узбекистана — в Казани,
+    // чтобы разрез фул-фирмы по городам было на чём посмотреть.
+    unloadCity: factory.country === "uzbekistan" ? "Казань" : "Москва",
     factoryId: factory.id,
     factoryName: factory.name,
     country: factory.country,
@@ -557,6 +582,45 @@ export function getFulfillment(): FulfillmentSummary {
   return computeFulfillment(getSupplies());
 }
 
+// Курсы валют в демо-режиме: дефолтные ориентиры из shared/currency.
+// Правка курса без БД никуда не сохранится — так и пишем на вкладке «Валюты».
+export function getCurrencyRates(): CurrencyRatesView {
+  return {
+    base: BASE_CURRENCY,
+    rates: CURRENCY_CODES.map((code) => ({
+      code,
+      name: CURRENCY_NAME[code],
+      sign: CURRENCY_SIGN[code],
+      rateToBase: DEFAULT_RATES_TO_BASE[code],
+      isBase: code === BASE_CURRENCY,
+      updatedAt: null,
+      updatedByName: null,
+      isDefault: true,
+    })),
+    updatedAt: null,
+  };
+}
+
+// Демо-справочники разгрузки: в БД они наполняются синком WB (офисы и склады),
+// здесь — короткий правдоподобный список тех же имён.
+export function getUnloadPoints(): UnloadPoint[] {
+  return [
+    { city: "Казань", partnerNames: ["Фул-фирма Казань"], fbsWarehouseNames: [] },
+    { city: "Москва", partnerNames: ["Фул-фирма Москва"], fbsWarehouseNames: ["Склад Москва (Софьино)"] },
+    { city: "Санкт-Петербург", partnerNames: [], fbsWarehouseNames: ["Склад СПб (Шушары)"] },
+  ];
+}
+
+export function getWbWarehouses(): WbWarehouseRef[] {
+  return [
+    { wbId: 507, name: "Коледино", address: "дер. Коледино, ул. Троицкая, 20", isActive: true },
+    { wbId: 218210, name: "Обухово", address: "Богородский г.о., Атлант-Парк", isActive: true },
+    { wbId: 117501, name: "Электросталь", address: "Электросталь, ул. Западная, 1", isActive: true },
+    { wbId: 130744, name: "Казань", address: "Зеленодольский р-н, Осиново", isActive: true },
+    { wbId: 301229, name: "Санкт-Петербург СГТ", address: "Шушары, Пулковское ш.", isActive: true },
+  ];
+}
+
 // ─── Финансы ────────────────────────────────────────────────────────────────
 
 export function getFinanceRows(): FinanceRow[] {
@@ -592,7 +656,7 @@ export function getTasks(): TaskItem[] {
     { ...base, id: "t4", title: "Отгрузка на Коледино — 120 шт", status: "in_progress", priority: "normal", assignee: "Алия Сатпаева", dueDate: "2026-07-11", productLabel: "Рубашка" },
     { ...base, id: "t5", title: "Пересчитать себестоимость после новой закупки ткани", status: "open", priority: "normal", assignee: "Марат Менеджеров", dueDate: null, productLabel: null },
     { ...base, id: "t6", title: "Ответить на отзывы за неделю", status: "done", priority: "low", assignee: "Алия Сатпаева", dueDate: "2026-07-04", productLabel: null, report: "Обработала 34 отзыва: 28 положительных, 6 с претензией к размеру — передала в контент правку размерной сетки.", completedAt: "2026-07-04T17:40:00Z", completedOnTime: true },
-    { ...base, id: "t7", title: "Согласовать бюджет рекламы на июль", status: "done", priority: "high", assignee: "Айгерим Директорова", dueDate: "2026-07-01", productLabel: null, report: "Бюджет утверждён: 450 000 ₽, приоритет — топ-5 SKU по марже.", completedAt: "2026-07-01T12:10:00Z", completedOnTime: true },
+    { ...base, id: "t7", title: "Согласовать бюджет рекламы на июль", status: "done", priority: "high", assignee: "Айгерим Директорова", dueDate: "2026-07-01", productLabel: null, report: "Бюджет утверждён: 450 000 сом, приоритет — топ-5 SKU по марже.", completedAt: "2026-07-01T12:10:00Z", completedOnTime: true },
   ];
 }
 

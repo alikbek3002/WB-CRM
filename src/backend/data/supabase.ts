@@ -11,6 +11,7 @@ import type {
   DailyPoint,
   DesignRequest,
   DutyItem,
+  DutyTemplateItem,
   Factory,
   FinanceRow,
   FulfillmentPartner,
@@ -43,9 +44,12 @@ import type {
   TeamMember,
   UnitEconRow,
   UnitEconView,
+  CurrencyRatesView,
+  UnloadPoint,
   WarehouseStock,
   WbDistribution,
   WbIncomeGroup,
+  WbWarehouseRef,
 } from "@/shared/types";
 import {
   assembleSupply,
@@ -55,7 +59,10 @@ import {
   type SupplyInput,
   type SupplyItemInput,
 } from "@/shared/supply";
+import { ROLE_LABELS, type MemberRole } from "@/shared/rbac";
+import { scheduleLabel } from "@/shared/duties";
 import { storeCurrency } from "./cash-core";
+import { readCurrencyRateMap, readCurrencyRates } from "./currency-core";
 
 // ─── локальные хелперы дат (без toISOString — не сдвигают день в UTC+5/6) ────
 
@@ -780,11 +787,13 @@ export async function getWbIncomes(db: SupabaseClient): Promise<WbIncomeGroup[]>
 
 // Читает поставки + оплаты + распределения и собирает карточки Supply.
 // Возвращает [] если поставок нет (обёртки решают, отдавать ли null).
+// Отшив и карго идут в валюте фабрики (¥, $, сум) — сводные суммы карточки
+// считаем в сомах по курсам из currency_rates (readCurrencyRateMap мемоизирует).
 async function readSupplies(db: SupabaseClient): Promise<Supply[]> {
   const { data: rows, error } = await db
     .from("supplies")
     .select(
-      "id, factory_id, product_id, title, quantity, ship_date, sewing_cost, sewing_currency, cargo_cost, cargo_currency, cargo_rate_to_rub, fulfillment_partner_id, fulfillment_cost_rub, status, received_at, received_qty, receipt_comment, transit_days, factory:factories(name, country), partner:fulfillment_partners(name, rate_per_unit_rub), responsible:profiles!supplies_responsible_user_id_fkey(full_name)",
+      "id, factory_id, product_id, title, quantity, ship_date, sewing_cost, sewing_currency, cargo_cost, cargo_currency, cargo_rate_to_rub, fulfillment_partner_id, fulfillment_cost_rub, unload_city, status, received_at, received_qty, receipt_comment, transit_days, factory:factories(name, country), partner:fulfillment_partners(name, rate_per_unit_rub, city), responsible:profiles!supplies_responsible_user_id_fkey(full_name)",
     )
     .eq("org_id", DEMO_ORG_ID)
     .order("ship_date", { ascending: false });
@@ -792,7 +801,8 @@ async function readSupplies(db: SupabaseClient): Promise<Supply[]> {
   if (!rows || rows.length === 0) return [];
 
   const ids = rows.map((r) => r.id as string);
-  const [paymentsRes, distsRes, itemsRes] = await Promise.all([
+  const [rates, paymentsRes, distsRes, itemsRes] = await Promise.all([
+    readCurrencyRateMap(db),
     db
       .from("supply_payments")
       .select("id, supply_id, kind, amount, currency, paid_at, note")
@@ -860,7 +870,11 @@ async function readSupplies(db: SupabaseClient): Promise<Supply[]> {
 
   return rows.map((r) => {
     const factory = r.factory as { name?: string; country?: string } | null;
-    const partner = r.partner as { name?: string; rate_per_unit_rub?: number } | null;
+    const partner = r.partner as {
+      name?: string;
+      rate_per_unit_rub?: number;
+      city?: string | null;
+    } | null;
     const responsible = r.responsible as { full_name?: string } | null;
     const input: SupplyInput = {
       id: r.id as string,
@@ -887,10 +901,13 @@ async function readSupplies(db: SupabaseClient): Promise<Supply[]> {
       fulfillmentPartnerName: partner?.name ?? null,
       fulfillmentRatePerUnitRub: Number(partner?.rate_per_unit_rub ?? 0),
       fulfillmentCostRub: r.fulfillment_cost_rub == null ? null : Number(r.fulfillment_cost_rub),
+      // Город: сначала то, что зафиксировали на карточке, иначе — город
+      // выбранной фул-фирмы (карточки, заведённые до 0042)
+      unloadCity: ((r.unload_city as string) ?? partner?.city ?? null) || null,
       payments: paymentsBySupply.get(r.id as string) ?? [],
       distributions: distsBySupply.get(r.id as string) ?? [],
     };
-    return assembleSupply(input);
+    return assembleSupply(input, rates);
   });
 }
 
@@ -918,7 +935,7 @@ export async function getProductGroups(
 export async function getFactories(db: SupabaseClient): Promise<Factory[]> {
   const { data, error } = await db
     .from("factories")
-    .select("id, name, country, note")
+    .select("id, name, country, note, currency")
     .eq("org_id", DEMO_ORG_ID)
     .order("name");
   if (error) throw error;
@@ -929,8 +946,17 @@ export async function getFactories(db: SupabaseClient): Promise<Factory[]> {
     name: f.name as string,
     country: f.country as SupplyCountry,
     note: (f.note as string) ?? null,
+    // Валюта расчётов (0043). Старые фабрики без колонки → по стране, как было.
+    currency:
+      (f.currency as Currency) ?? (f.country === "uzbekistan" ? "uzs" : "cny"),
   }));
-  return computeFactories(base, await readSupplies(db));
+  const [supplies, rates] = await Promise.all([readSupplies(db), readCurrencyRateMap(db)]);
+  return computeFactories(base, supplies, rates);
+}
+
+// Курсы валют к сому (миграция 0043) — вкладка «Финансы → Валюты» и все сводки
+export async function getCurrencyRates(db: SupabaseClient): Promise<CurrencyRatesView> {
+  return readCurrencyRates(db);
 }
 
 export async function getFulfillment(
@@ -945,22 +971,37 @@ export async function getFulfillmentPartners(
 ): Promise<FulfillmentPartner[]> {
   const { data, error } = await db
     .from("fulfillment_partners")
-    .select("id, name, rate_per_unit_rub, note, archived")
+    .select("id, name, rate_per_unit_rub, city, fbs_warehouse_id, note, archived")
     .eq("org_id", DEMO_ORG_ID)
     .order("archived")
     .order("name");
   if (error) throw error;
   if (!data || data.length === 0) return [];
 
-  const supplies = await readSupplies(db);
+  const [supplies, fbs] = await Promise.all([
+    readSupplies(db),
+    // Имя личного склада WB — для подписи «разбирает на складе X»
+    db
+      .from("fbs_warehouses")
+      .select("warehouse_id, name")
+      .eq("store_id", DEMO_STORE_ID),
+  ]);
+  const fbsName = new Map(
+    (fbs.data ?? []).map((w) => [Number(w.warehouse_id), String(w.name)]),
+  );
+
   return (data as unknown as Record<string, unknown>[]).map((p) => {
     const own = supplies.filter((s) => s.fulfillmentPartnerId === p.id);
     const chargedRub = own.reduce((t, s) => t + s.fulfillmentRub, 0);
     const paidRub = own.reduce((t, s) => t + s.paidFulfillmentRub, 0);
+    const fbsId = p.fbs_warehouse_id == null ? null : Number(p.fbs_warehouse_id);
     return {
       id: String(p.id),
       name: String(p.name),
       ratePerUnitRub: Number(p.rate_per_unit_rub ?? 0),
+      city: ((p.city as string) ?? null) || null,
+      fbsWarehouseId: fbsId,
+      fbsWarehouseName: fbsId != null ? fbsName.get(fbsId) ?? null : null,
       note: (p.note as string) ?? null,
       archived: Boolean(p.archived),
       suppliesCount: own.length,
@@ -969,6 +1010,65 @@ export async function getFulfillmentPartners(
       owedRub: Math.max(0, chargedRub - paidRub),
     };
   });
+}
+
+// Точки разгрузки: города, куда реально приезжает карго. Собираем из двух
+// источников — заведённые фул-фирмы (наш справочник) и личные склады кабинета
+// WB, у которых город проставлен из офисов (0042). Второй источник важен: у
+// кабинета уже есть склады в Москве, Петербурге, Самаре и т.д., и заставлять
+// вбивать эти города руками — значит плодить опечатки («Спб» ≠ «Санкт-Петербург»).
+export async function getUnloadPoints(
+  db: SupabaseClient,
+): Promise<UnloadPoint[]> {
+  const [partners, fbs] = await Promise.all([
+    db
+      .from("fulfillment_partners")
+      .select("name, city, archived")
+      .eq("org_id", DEMO_ORG_ID),
+    db
+      .from("fbs_warehouses")
+      .select("name, city, is_deleting")
+      .eq("store_id", DEMO_STORE_ID),
+  ]);
+  if (partners.error) throw partners.error;
+
+  const byCity = new Map<string, UnloadPoint>();
+  const row = (city: string) => {
+    const cur = byCity.get(city) ?? { city, partnerNames: [], fbsWarehouseNames: [] };
+    byCity.set(city, cur);
+    return cur;
+  };
+
+  for (const p of partners.data ?? []) {
+    const city = String(p.city ?? "").trim();
+    if (!city || p.archived) continue;
+    row(city).partnerNames.push(String(p.name));
+  }
+  for (const w of fbs.data ?? []) {
+    const city = String(w.city ?? "").trim();
+    if (!city || w.is_deleting) continue;
+    row(city).fbsWarehouseNames.push(String(w.name));
+  }
+
+  return [...byCity.values()].sort((a, b) => a.city.localeCompare(b.city));
+}
+
+// Склады WB для отгрузки FBW (0042) — список для распределения партии.
+export async function getWbWarehouses(
+  db: SupabaseClient,
+): Promise<WbWarehouseRef[]> {
+  const { data, error } = await db
+    .from("wb_warehouses")
+    .select("wb_id, name, address, is_active")
+    .eq("store_id", DEMO_STORE_ID)
+    .order("name");
+  if (error) throw error;
+  return (data ?? []).map((w) => ({
+    wbId: Number(w.wb_id),
+    name: String(w.name),
+    address: (w.address as string) ?? null,
+    isActive: w.is_active !== false,
+  }));
 }
 
 // ─── Финансы ─────────────────────────────────────────────────────────────────
@@ -1466,10 +1566,21 @@ export async function getFbsStocks(db: SupabaseClient): Promise<FbsStocksView> {
       byProduct.set(r.product_id, row);
     }
     row.totalQty += qty;
-    const wh = row.warehouses.find((w) => w.warehouseId === wid);
-    if (wh) wh.qty += qty;
-    else row.warehouses.push({ warehouseId: wid, name: r.warehouse_name, qty });
     const sizeKey = r.size?.trim() || "б/р";
+    const wh = row.warehouses.find((w) => w.warehouseId === wid);
+    if (wh) {
+      wh.qty += qty;
+      const wsz = wh.sizes.find((s) => s.size === sizeKey);
+      if (wsz) wsz.qty += qty;
+      else wh.sizes.push({ size: sizeKey, qty });
+    } else {
+      row.warehouses.push({
+        warehouseId: wid,
+        name: r.warehouse_name,
+        qty,
+        sizes: [{ size: sizeKey, qty }],
+      });
+    }
     const sz = row.sizes.find((s) => s.size === sizeKey);
     if (sz) sz.qty += qty;
     else row.sizes.push({ size: sizeKey, qty });
@@ -1489,6 +1600,7 @@ export async function getFbsStocks(db: SupabaseClient): Promise<FbsStocksView> {
   const products = [...byProduct.values()];
   for (const p of products) {
     p.warehouses.sort((a, b) => b.qty - a.qty);
+    for (const w of p.warehouses) w.sizes.sort((a, b) => compareSizes(a.size, b.size));
     p.sizes.sort((a, b) => compareSizes(a.size, b.size));
   }
   products.sort((a, b) => b.totalQty - a.totalQty);
@@ -1642,6 +1754,56 @@ export async function getMyDuties(
   userId: string,
 ): Promise<DutyItem[]> {
   return readDuties(db, isoDate(new Date()), userId);
+}
+
+// Сам регламент (шаблоны обязанностей) — справочник для вкладки «Регламент».
+// Выключенные тоже отдаём: их видно отдельным блоком, чтобы включить обратно
+// было чем, а не «обязанность пропала».
+export async function getDutyTemplates(
+  db: SupabaseClient,
+): Promise<DutyTemplateItem[]> {
+  const { data, error } = await db
+    .from("duty_templates")
+    .select(
+      "id, code, title, description, role, assignee_user_id, frequency, weekday, due_time, hours_to_complete, requires_report, active, sort_order, updated_at, assignee:profiles!duty_templates_assignee_user_id_fkey(full_name), editor:profiles!duty_templates_updated_by_fkey(full_name)",
+    )
+    .eq("org_id", DEMO_ORG_ID)
+    .order("sort_order")
+    .order("title");
+  if (error) throw error;
+
+  return ((data ?? []) as unknown as Record<string, unknown>[]).map((t) => {
+    const one = (v: unknown): { full_name?: string } | null => {
+      const row = Array.isArray(v) ? v[0] : v;
+      return (row as { full_name?: string } | null) ?? null;
+    };
+    const assignee = one(t.assignee);
+    const editor = one(t.editor);
+    const role = String(t.role);
+    const frequency = t.frequency as "daily" | "weekly";
+    const weekday = t.weekday == null ? null : Number(t.weekday);
+    const dueTime = String(t.due_time ?? "18:00").slice(0, 5);
+    return {
+      id: String(t.id),
+      code: String(t.code),
+      title: String(t.title),
+      description: (t.description as string) ?? null,
+      role,
+      roleLabel: ROLE_LABELS[role as MemberRole] ?? role,
+      assigneeUserId: (t.assignee_user_id as string) ?? null,
+      assigneeName: assignee?.full_name ?? null,
+      frequency,
+      weekday,
+      dueTime,
+      scheduleLabel: scheduleLabel(frequency, weekday, dueTime),
+      hoursToComplete: Number(t.hours_to_complete ?? 0),
+      requiresReport: Boolean(t.requires_report),
+      active: Boolean(t.active),
+      sortOrder: Number(t.sort_order ?? 100),
+      updatedAt: (t.updated_at as string) ?? null,
+      updatedByName: editor?.full_name ?? null,
+    };
+  });
 }
 
 export async function getReportsBoard(

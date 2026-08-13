@@ -5,8 +5,10 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { DEMO_ORG_ID, DEMO_STORE_ID } from "../../shared/constants";
+import { currencySign } from "../../shared/format";
 import { can, type MemberRole } from "../../shared/rbac";
 import { getCashOverview, getExpensesView, getPayrollView, getPnlView } from "../data/cash-core";
+import { readCurrencyRates } from "../data/currency-core";
 import { getPayouts } from "../data/payouts-core";
 
 export type SnapshotUser = {
@@ -18,7 +20,7 @@ export type SnapshotUser = {
 };
 
 function rub(n: number): string {
-  return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(n)) + " ₽";
+  return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(n)) + " сом";
 }
 
 function isoDaysAgo(days: number): string {
@@ -159,12 +161,24 @@ export async function buildSnapshot(
   // держим ответ прямо в снимке, без вызова инструментов.
   if (can(user.role, "finance:cash")) {
     const block = await safe(async () => {
-      const [cash, expenses, pnl] = await Promise.all([
+      const [cash, expenses, pnl, currency] = await Promise.all([
         getCashOverview(db),
         getExpensesView(db),
         getPnlView(db, 3),
+        readCurrencyRates(db),
       ]);
       const lines: string[] = [];
+
+      // Курсы: все суммы ниже — в сомах. Без этой строки ассистент не сможет
+      // ответить «а сколько это в долларах» и «по какому курсу посчитано».
+      lines.push(
+        "ВАЛЮТА УЧЁТА: сом. Курсы (сколько сомов за единицу): " +
+          currency.rates
+            .filter((r) => !r.isBase)
+            .map((r) => `${r.sign} ${r.rateToBase}${r.isDefault ? " (не сведён, ориентир)" : ""}`)
+            .join(", ") +
+          ". Правят директор и старший менеджер: CRM → Финансы → Валюты.",
+      );
 
       if (cash.accounts.length) {
         lines.push(
@@ -194,7 +208,7 @@ export async function buildSnapshot(
       }
 
       const t = pnl.total;
-      const cur = pnl.currency === "RUB" ? "₽" : pnl.currency;
+      const cur = currencySign(pnl.currency);
       const amt = (v: number) =>
         `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(v))} ${cur}`;
       lines.push(

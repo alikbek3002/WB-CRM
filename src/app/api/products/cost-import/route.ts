@@ -36,7 +36,7 @@ type MatchedRow = {
 type UnmatchedRow = { line: number; value: string; reason: string };
 
 function normalizeHeader(v: string): string {
-  return v.toLowerCase().replace(/[\s_\-–—.,:;()₽]+/g, " ").trim();
+  return v.toLowerCase().replace(/[\s_\-–—.,:;()₽$¥]+/g, " ").trim();
 }
 
 const NM_HEADERS = ["nm id", "nmid", "артикул wb", "артикул вб", "артикул wildberries", "номенклатура", "код wb"];
@@ -56,12 +56,12 @@ function findColumn(headers: string[], candidates: string[]): number {
   return -1;
 }
 
-// «1 250,50 ₽» → 1250.5; мусор → null
+// «1 250,50 сом» → 1250.5; мусор → null. Себестоимость храним в сомах.
 function parseMoney(raw: unknown): number | null {
   if (raw == null) return null;
   if (typeof raw === "number") return Number.isFinite(raw) ? raw : null;
   const s = String(raw)
-    .replace(/[₽рруб.]+\s*$/i, "")
+    .replace(/(₽|руб\.?|р\.|сом|som|\$|¥)\s*$/i, "")
     .replace(/[\s  ]/g, "")
     .replace(",", ".")
     .trim();

@@ -1,5 +1,5 @@
 import { Card, CardContent } from "@/frontend/components/ui/card";
-import { formatNumber, formatPercent, formatRub } from "@/shared/format";
+import { formatNumber, formatPercent, formatSom } from "@/shared/format";
 import type { DashboardKpis } from "@/shared/types";
 
 type Kpi = {
@@ -12,17 +12,17 @@ export function KpiCards({ kpis }: { kpis: DashboardKpis }) {
   const items: Kpi[] = [
     {
       title: "Чистая прибыль",
-      value: formatRub(kpis.profitRub),
+      value: formatSom(kpis.profitRub),
       sub: `рентабельность ${formatPercent(kpis.profitabilityPct)}`,
     },
     {
       title: "Продажи / Выкупы",
-      value: formatRub(kpis.salesRub),
+      value: formatSom(kpis.salesRub),
       sub: `${formatNumber(kpis.salesQty)} шт`,
     },
     {
       title: "Заказы",
-      value: formatRub(kpis.ordersRub),
+      value: formatSom(kpis.ordersRub),
       sub: `${formatNumber(kpis.ordersQty)} шт`,
     },
     {

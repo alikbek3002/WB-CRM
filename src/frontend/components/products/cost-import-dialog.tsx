@@ -13,7 +13,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/frontend/components/ui/dialog";
-import { formatRub } from "@/shared/format";
+import { formatSom } from "@/shared/format";
 
 type MatchedRow = {
   productId: string;
@@ -153,11 +153,11 @@ export function CostImportDialog() {
                           <tr key={m.productId} className="border-b border-border/40 last:border-0">
                             <td className="max-w-48 truncate px-2 py-1.5">{m.title}</td>
                             <td className="px-2 py-1.5 text-right tabular-nums text-muted-foreground">
-                              {formatRub(m.oldCost)}
+                              {formatSom(m.oldCost)}
                             </td>
                             <td className="px-2 py-1.5 text-center text-muted-foreground">→</td>
                             <td className="px-2 py-1.5 text-right font-medium tabular-nums">
-                              {formatRub(m.newCost)}
+                              {formatSom(m.newCost)}
                             </td>
                           </tr>
                         ))}

@@ -22,14 +22,24 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/frontend/components/ui/select";
+import { CURRENCY_CODES, CURRENCY_LABEL } from "@/shared/currency";
+import type { Currency } from "@/shared/types";
 
 export function FactoryForm({ disabled }: { disabled?: boolean }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [country, setCountry] = useState<"china" | "uzbekistan">("china");
+  // Валюта расчётов: китайские фабрики выставляют счёт и в юанях, и в долларах —
+  // от неё зависят отшив, карго и себестоимость партии.
+  const [currency, setCurrency] = useState<Currency>("cny");
   const [note, setNote] = useState("");
   const [saving, setSaving] = useState(false);
+
+  function pickCountry(next: "china" | "uzbekistan") {
+    setCountry(next);
+    setCurrency(next === "uzbekistan" ? "uzs" : "cny");
+  }
 
   async function submit() {
     if (!name.trim()) {
@@ -41,7 +51,12 @@ export function FactoryForm({ disabled }: { disabled?: boolean }) {
       const res = await fetch("/api/factory", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: name.trim(), country, note: note.trim() || null }),
+        body: JSON.stringify({
+          name: name.trim(),
+          country,
+          currency,
+          note: note.trim() || null,
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error ?? "Ошибка");
@@ -53,6 +68,7 @@ export function FactoryForm({ disabled }: { disabled?: boolean }) {
       setName("");
       setNote("");
       setCountry("china");
+      setCurrency("cny");
       setOpen(false);
       router.refresh();
     } catch (e) {
@@ -73,7 +89,9 @@ export function FactoryForm({ disabled }: { disabled?: boolean }) {
           <DialogHeader>
             <DialogTitle>Новая фабрика</DialogTitle>
             <DialogDescription>
-              Производитель товара. Страна определяет валюту расчётов.
+              Производитель товара. Валюта расчётов подставится в стоимость отшива и
+              карго, а в отчётах сумма пересчитается в сомы по курсу из «Финансы →
+              Валюты».
             </DialogDescription>
           </DialogHeader>
 
@@ -89,13 +107,28 @@ export function FactoryForm({ disabled }: { disabled?: boolean }) {
             </div>
             <div className="grid gap-1.5">
               <Label>Страна</Label>
-              <Select value={country} onValueChange={(v) => setCountry(v as "china" | "uzbekistan")}>
+              <Select value={country} onValueChange={(v) => v && pickCountry(v as "china" | "uzbekistan")}>
                 <SelectTrigger className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="china">Китай</SelectItem>
                   <SelectItem value="uzbekistan">Узбекистан</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="grid gap-1.5">
+              <Label>Валюта расчётов</Label>
+              <Select value={currency} onValueChange={(v) => v && setCurrency(v as Currency)}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {CURRENCY_CODES.map((c) => (
+                    <SelectItem key={c} value={c}>
+                      {CURRENCY_LABEL[c]}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             </div>

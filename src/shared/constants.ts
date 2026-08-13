@@ -36,16 +36,7 @@ export const DEMO_SUPPLY_IDS = {
 // (derived-on-read в ридерах; персист — cron /api/cron/supply-auto-arrive).
 export const SUPPLY_AUTO_ARRIVE_DAYS = 15;
 
-// Статические демо-курсы к рублю для сводных сумм (директор видит всё в ₽).
-// MVP: фикс. значения; позже — редактируемые/по API ЦБ.
-export const EXCHANGE_RATES: Record<string, number> = {
-  cny: 12.5, // юань
-  uzs: 0.0068, // сум
-  kgs: 0.93, // сом (валюта кабинета WB у киргизского юрлица)
-  rub: 1,
-};
-
-// Пересчёт суммы в рубли по демо-курсу.
-export function toRub(amount: number, currency: string): number {
-  return Math.round(amount * (EXCHANGE_RATES[currency] ?? 1));
-}
+// Курсы валют переехали в БД (таблица currency_rates, миграция 0043): их правят
+// директор и старший менеджер на вкладке «Финансы → Валюты», а базовой валютой
+// стал сом. Код валют, знаки, дефолты и пересчёт — src/shared/currency.ts,
+// чтение/запись курсов — src/backend/data/currency-core.ts.

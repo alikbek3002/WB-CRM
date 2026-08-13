@@ -1,10 +1,12 @@
 // Чистая доменная логика цепочки поставок — общая для mock- и supabase-ридеров.
 // Сборка карточки Supply из «сырых» полей, авто-статус «Приехал», агрегаты фабрик и фул-фирмы.
 
-import { SUPPLY_AUTO_ARRIVE_DAYS, toRub } from "@/shared/constants";
+import { SUPPLY_AUTO_ARRIVE_DAYS } from "@/shared/constants";
+import { toBase, type CurrencyRateMap } from "@/shared/currency";
 import type {
   Currency,
   Factory,
+  FulfillmentCityRow,
   FulfillmentSummary,
   Supply,
   SupplyCountry,
@@ -67,7 +69,7 @@ export type SupplyItemInput = {
   receivedQty: number | null;
   sewingCost: number;
   sewingCurrency: Currency;
-  sewingRateToRub: number | null;
+  sewingRateToRub: number | null; // курс, зафиксированный при заведении
 };
 
 export type SupplyInput = {
@@ -95,18 +97,21 @@ export type SupplyInput = {
   fulfillmentPartnerName: string | null;
   fulfillmentRatePerUnitRub: number;
   fulfillmentCostRub: number | null; // факт; null → тариф × принято
+  unloadCity: string | null; // город разгрузки карго
   payments: SupplyPayment[];
   distributions: WbDistribution[];
 };
 
-// Сборка карточки Supply с вычислимыми полями (оплаты в ₽, недостача, срок,
+// Сборка карточки Supply с вычислимыми полями (оплаты в сомах, недостача, срок,
 // авто-статус, себестоимость единицы по позициям).
-export function assembleSupply(input: SupplyInput): Supply {
+// rates — курсы к сому из currency_rates: отшив и карго идут в валюте фабрики
+// (юань, доллар), а сводные суммы карточки — в базовой валюте.
+export function assembleSupply(input: SupplyInput, rates?: CurrencyRateMap | null): Supply {
   const eff = effectiveSupplyStatus(input.status, input.shipDate);
   const paidOf = (kind: SupplyPayment["kind"]) =>
     input.payments
       .filter((p) => p.kind === kind)
-      .reduce((t, p) => t + toRub(p.amount, p.currency), 0);
+      .reduce((t, p) => t + toBase(p.amount, p.currency, rates), 0);
   const paidGoodsRub = paidOf("goods");
   const paidCargoRub = paidOf("cargo");
   const paidFulfillmentRub = paidOf("fulfillment");
@@ -138,14 +143,14 @@ export function assembleSupply(input: SupplyInput): Supply {
       ? input.fulfillmentCostRub
       : Math.round(input.fulfillmentRatePerUnitRub * totalQty);
 
-  const cargoRubTotal = toRub(input.cargoCost, input.cargoCurrency);
+  const cargoRubTotal = toBase(input.cargoCost, input.cargoCurrency, rates);
   const cargoPerUnit = totalQty > 0 ? cargoRubTotal / totalQty : 0;
   const ffPerUnit = totalQty > 0 ? fulfillmentRub / totalQty : 0;
   const r2 = (n: number) => Math.round(n * 100) / 100;
 
   const items = rawItems.map((i) => {
     const qty = qtyOf(i);
-    const sewingRub = qty > 0 ? toRub(i.sewingCost, i.sewingCurrency) / qty : 0;
+    const sewingRub = qty > 0 ? toBase(i.sewingCost, i.sewingCurrency, rates) / qty : 0;
     return {
       id: i.id,
       productId: i.productId,
@@ -162,7 +167,7 @@ export function assembleSupply(input: SupplyInput): Supply {
   });
 
   const sewingTotalRub = rawItems.reduce(
-    (t, i) => t + toRub(i.sewingCost, i.sewingCurrency),
+    (t, i) => t + toBase(i.sewingCost, i.sewingCurrency, rates),
     0,
   );
   const totalDueRub = sewingTotalRub + cargoRubTotal + fulfillmentRub;
@@ -221,6 +226,7 @@ export function assembleSupply(input: SupplyInput): Supply {
     fulfillmentPartnerId: input.fulfillmentPartnerId,
     fulfillmentPartnerName: input.fulfillmentPartnerName,
     fulfillmentRub,
+    unloadCity: input.unloadCity,
     owedRub,
     distributions: input.distributions,
     distributedQty,
@@ -232,15 +238,22 @@ export type FactoryBase = {
   name: string;
   country: SupplyCountry;
   note: string | null;
+  currency: Currency; // валюта расчётов с фабрикой
 };
 
-// Аналитика по фабрике: сколько отшили, на какую сумму (₽), в пути, ср. срок
-export function computeFactories(factories: FactoryBase[], supplies: Supply[]): Factory[] {
+// Аналитика по фабрике: сколько отшили, на какую сумму (в сомах), в пути, ср. срок
+export function computeFactories(
+  factories: FactoryBase[],
+  supplies: Supply[],
+  rates?: CurrencyRateMap | null,
+): Factory[] {
   return factories.map((f) => {
     const own = supplies.filter((s) => s.factoryId === f.id);
     const shippedSumRub = own.reduce(
       (t, s) =>
-        t + toRub(s.sewingCost, s.sewingCurrency) + toRub(s.cargoCost, s.cargoCurrency),
+        t +
+        toBase(s.sewingCost, s.sewingCurrency, rates) +
+        toBase(s.cargoCost, s.cargoCurrency, rates),
       0,
     );
     const transitDone = own.filter((s) => s.transitDays != null);
@@ -249,6 +262,7 @@ export function computeFactories(factories: FactoryBase[], supplies: Supply[]): 
       name: f.name,
       country: f.country,
       note: f.note,
+      currency: f.currency,
       suppliesCount: own.length,
       shippedQty: own.reduce((t, s) => t + s.quantity, 0),
       shippedSumRub,
@@ -267,7 +281,28 @@ export function computeFulfillment(supplies: Supply[]): FulfillmentSummary {
   const qty = (s: Supply) => s.receivedQty ?? s.quantity;
   const chargedRub = cards.reduce((t, s) => t + s.fulfillmentRub, 0);
   const paidRub = cards.reduce((t, s) => t + s.paidFulfillmentRub, 0);
+
+  // Разрез по городам разгрузки. Считаем по ВСЕМ поставкам, а не только по
+  // стадиям фул-фирмы: карго, которое ещё едет в Казань, — это уже нагрузка
+  // на казанскую точку, и планировать её надо заранее.
+  const cityMap = new Map<string, FulfillmentCityRow>();
+  for (const s of supplies) {
+    const city = s.unloadCity?.trim() || "—";
+    const row = cityMap.get(city) ?? { city, supplies: 0, qty: 0, chargedRub: 0 };
+    row.supplies += 1;
+    row.qty += qty(s);
+    row.chargedRub += s.fulfillmentRub;
+    cityMap.set(city, row);
+  }
+  // «—» (город не указан) всегда внизу — это хвост старых карточек
+  const byCity = [...cityMap.values()].sort((a, b) => {
+    if (a.city === "—") return 1;
+    if (b.city === "—") return -1;
+    return b.qty - a.qty || a.city.localeCompare(b.city);
+  });
+
   return {
+    byCity,
     receivedQty: cards.reduce((t, s) => t + qty(s), 0),
     sortingQty: cards.filter((s) => s.status === "sorting").reduce((t, s) => t + qty(s), 0),
     inStockQty: cards.filter((s) => s.status === "in_stock").reduce((t, s) => t + qty(s), 0),

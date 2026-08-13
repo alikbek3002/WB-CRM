@@ -499,6 +499,61 @@ export function fetchFbsWarehouses(token: string): Promise<WbFbsWarehouse[]> {
   ).then((r) => r ?? []);
 }
 
+// Офисы (пункты приёмки) WB — ЕДИНСТВЕННЫЙ источник городов по API. Личный
+// склад продавца ссылается сюда через officeId, поэтому город точки разгрузки
+// («Фбс каз» → Ульяновск) берётся отсюда, а не из прозвища подрядчика.
+// Проверено вживую 2026-08-13: 200, 77 офисов, 49 городов.
+export type WbOffice = {
+  id: number;
+  name: string;
+  city?: string;
+  address?: string;
+  federalDistrict?: string;
+  cargoType?: number;
+  deliveryType?: number;
+  selected?: boolean;
+};
+
+export function fetchWbOffices(token: string): Promise<WbOffice[]> {
+  return wbFetch<WbOffice[]>(
+    `${MARKETPLACE}/api/v3/offices`,
+    token,
+    undefined,
+    30_000,
+  ).then((r) => r ?? []);
+}
+
+// Город офиса для справочника разгрузки. У московских точек WB кладёт в city
+// не город, а зону: «Москва_Восток», «Москва_Запад-Юг», «Москва_Север»
+// (проверено на всех 77 офисах — подчёркивание встречается только у Москвы).
+// Без склейки Москва троилась бы в списке «куда разгружаем», а статистика по
+// городу разъезжалась на три строки.
+export function officeCity(office: WbOffice): string | null {
+  const raw = String(office.city ?? "").trim();
+  if (!raw) return null;
+  return raw.split("_")[0].trim() || raw;
+}
+
+// Склады WB, куда можно отгружать поставки FBW («куда» после разбора).
+// Токен категории «Поставки». Проверено вживую 2026-08-13: 200, 18 складов.
+export type WbFbwWarehouse = {
+  ID: number;
+  name: string;
+  address?: string;
+  workTime?: string;
+  isActive?: boolean;
+  isTransitActive?: boolean;
+};
+
+export function fetchFbwWarehouses(token: string): Promise<WbFbwWarehouse[]> {
+  return wbFetch<WbFbwWarehouse[]>(
+    `${SUPPLIES}/api/v1/warehouses`,
+    token,
+    undefined,
+    30_000,
+  ).then((r) => r ?? []);
+}
+
 // Остатки склада по chrtID размеров (≤1000 за запрос — чанкует вызывающая
 // сторона). Контракт body {chrtIds} и ответа {stocks:[{sku, chrtId, amount}]}
 // проверен вживую 2026-08-08 (в старых доках описан body {skus} — на случай
@@ -564,7 +619,7 @@ async function fetchAnalyticsTaskReport<T>(
 export type WbStorageRow = {
   date: string;
   warehouse?: string;
-  warehousePrice?: number; // стоимость хранения за день, ₽
+  warehousePrice?: number; // стоимость хранения за день, в валюте кабинета (сом)
   barcodesCount?: number;
   volume?: number;
   nmId: number;
@@ -591,7 +646,7 @@ export type WbAcceptanceRow = {
   nmID: number;
   giCreateDate?: string;
   count?: number;
-  total?: number; // стоимость приёмки, ₽
+  total?: number; // стоимость приёмки, в валюте кабинета (сом)
   subjectName?: string;
 };
 

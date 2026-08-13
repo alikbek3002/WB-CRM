@@ -46,7 +46,7 @@ export default async function DashboardPage() {
         <Card>
           <CardHeader>
             <CardTitle className="text-sm">Динамика заказов</CardTitle>
-            <CardDescription>Сумма заказов по дням, ₽</CardDescription>
+            <CardDescription>Сумма заказов по дням, сом</CardDescription>
           </CardHeader>
           <CardContent>
             <OrdersBarChart data={data.ordersDynamics} />
@@ -82,7 +82,7 @@ export default async function DashboardPage() {
       <Card>
         <CardHeader>
           <CardTitle className="text-sm">Заказы за период</CardTitle>
-          <CardDescription>Тренд суммы заказов, ₽</CardDescription>
+          <CardDescription>Тренд суммы заказов, сом</CardDescription>
         </CardHeader>
         <CardContent>
           <OrdersLineChart data={data.ordersTrend} />

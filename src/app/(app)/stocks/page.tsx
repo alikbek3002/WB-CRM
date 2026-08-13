@@ -16,9 +16,10 @@ export const dynamic = "force-dynamic";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Остатки в трёх разрезах-вкладках: FBO (склады WB, фильтры в URL),
-// FBS (личные склады продавца из marketplace-api) и Фул-фирма (товар в
-// обработке × тариф — срез модуля /fulfillment).
+// Остатки в трёх разрезах-вкладках: FBO (склады WB), FBS (личные склады
+// продавца из marketplace-api) и Фул-фирма (товар в обработке × тариф — срез
+// модуля /fulfillment). Фильтры вид → бренд → товар живут в URL и общие для
+// FBO и FBS — при переключении вкладок выбор сохраняется.
 export default async function StocksPage({
   searchParams,
 }: {
@@ -79,7 +80,15 @@ export default async function StocksPage({
             productId={productId}
           />
         }
-        fbs={<FbsPanel view={fbs} />}
+        fbs={
+          <FbsPanel
+            view={fbs}
+            products={products}
+            category={category}
+            brand={brand}
+            productId={productId}
+          />
+        }
         ff={showFf ? <FfPanel /> : null}
       />
     </div>

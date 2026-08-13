@@ -1,4 +1,12 @@
 // Контракты данных для панелей. Провайдер (mock | supabase) — src/backend/data/index.ts
+//
+// ДЕНЬГИ. Все суммы с суффиксом *Rub — в БАЗОВОЙ валюте компании, а это СОМ
+// (см. src/shared/currency.ts): кабинет WB киргизского юрлица считает в сомах,
+// «своя» сторона (касса, фабрики, карго, выплаты) приводится к сому по курсам
+// из currency_rates. Суффикс исторический — переименовывать сотни полей в БД и
+// коде дороже, чем один раз договориться, что он значит.
+
+import type { CurrencyCode } from "./currency";
 
 export type DashboardKpis = {
   profitRub: number;
@@ -143,7 +151,7 @@ export type ProductListItem = {
   costPrice: number;
   costPriceSource: CostPriceSource;
   costPriceUpdatedAt: string | null;
-  // Из чего сложилась себестоимость (₽/шт). Сумма трёх = costPrice, когда
+  // Из чего сложилась себестоимость (сом/шт). Сумма трёх = costPrice, когда
   // источник «supply». При ручном вводе и импорте разбивки нет — всё в отшиве.
   costSewingRub: number;
   costCargoRub: number;
@@ -213,6 +221,27 @@ export type FinanceRow = {
   profitRub: number;
 };
 
+// ─── Курсы валют (миграция 0043) ─────────────────────────────────────────────
+// Один курс на валюту: сколько сомов стоит одна её единица. Правят директор и
+// старший менеджер, всё остальное в системе считает по этим числам.
+
+export type CurrencyRate = {
+  code: Currency;
+  name: string; // «Доллар США»
+  sign: string; // «$»
+  rateToBase: number; // сколько сомов за 1 единицу (сом → 1)
+  isBase: boolean; // сом: курс не правится
+  updatedAt: string | null;
+  updatedByName: string | null;
+  isDefault: boolean; // курс ещё не задавали — показываем ориентир
+};
+
+export type CurrencyRatesView = {
+  base: Currency; // всегда «kgs»
+  rates: CurrencyRate[];
+  updatedAt: string | null; // когда курсы правили в последний раз
+};
+
 // ─── Касса и расходы (миграция 0024) ─────────────────────────────────────────
 
 export type CashAccountKind = "cash" | "bank" | "card" | "wb" | "other";
@@ -224,7 +253,7 @@ export type CashAccount = {
   kind: CashAccountKind;
   currency: Currency; // валюта счёта
   balance: number; // остаток в валюте счёта
-  balanceRub: number; // он же в рублях (по общему курсу)
+  balanceRub: number; // он же в сомах (по курсу из «Финансы → Валюты»)
   txCount: number;
   lastTx: string | null; // дата последней операции, yyyy-mm-dd
 };
@@ -255,7 +284,8 @@ export type CashTx = {
   authorName: string | null;
   personId: string | null; // кому эти деньги (сотрудник)
   personName: string | null;
-  source: "manual" | "bot" | "ai" | "supply_payment" | "wb_payout" | "payout";
+  // adjustment — корректировка по сверке остатка (0045)
+  source: "manual" | "bot" | "ai" | "supply_payment" | "wb_payout" | "payout" | "adjustment";
   // processing — WB отправил выплату, но деньги ещё не дошли до счёта:
   // в остатках и ДДС не участвует, ждёт подтверждения кнопкой
   status: "processing" | "received";
@@ -273,7 +303,7 @@ export type CashOverview = {
   // Деньги, которые WB ещё не перечислил: они есть у компании, но не в кассе.
   // Показываем отдельно, чтобы «всего денег» не смешивало наличные и дебиторку.
   wbBalance: { currency: string; current: number; forWithdraw: number; checkedAt: string } | null;
-  totalRub: number; // всего денег в кассе, ₽ (без выплат «в обработке»)
+  totalRub: number; // всего денег в кассе, сом (без выплат «в обработке»)
   monthInRub: number; // приход за текущий месяц
   monthOutRub: number; // расход за текущий месяц
   flow: CashFlowMonth[]; // помесячно за последние 6 мес
@@ -531,8 +561,8 @@ export type Tariff = {
 // ─── Цепочка поставок (КП) ───────────────────────────────────────────────────
 
 export type SupplyCountry = "china" | "uzbekistan";
-// kgs — валюта киргизского кабинета WB (в ней приходят деньги от маркетплейса)
-export type Currency = "cny" | "uzs" | "rub" | "kgs";
+// Валюты системы и базовая валюта (сом) — src/shared/currency.ts
+export type Currency = CurrencyCode;
 export type SupplyStatus =
   | "in_transit" // В пути
   | "arrived" // Приехал (авто через 15 дней, ожидает приёмки)
@@ -547,9 +577,10 @@ export type Factory = {
   name: string;
   country: SupplyCountry;
   note: string | null;
+  currency: Currency; // в чём фабрика выставляет счёт (0043)
   suppliesCount: number; // всего поставок
   shippedQty: number; // сколько отшили, шт
-  shippedSumRub: number; // на какую сумму (отшивка+карго в ₽)
+  shippedSumRub: number; // на какую сумму (отшивка+карго в сомах)
   inTransitCount: number; // сейчас в пути
   avgTransitDays: number | null; // ср. время в пути по завершённым
 };
@@ -580,7 +611,7 @@ export type SupplyItem = {
   receivedQty: number | null; // принято
   sewingCost: number;
   sewingCurrency: Currency;
-  // Себестоимость единицы по этой позиции (₽), считается из партии
+  // Себестоимость единицы по этой позиции (сом), считается из партии
   sewingRub: number;
   cargoRub: number;
   fulfillmentRub: number;
@@ -592,6 +623,9 @@ export type FulfillmentPartner = {
   id: string;
   name: string;
   ratePerUnitRub: number;
+  city: string | null; // город разгрузки (Москва, Казань…)
+  fbsWarehouseId: number | null; // связка со своим складом в кабинете WB (FBS)
+  fbsWarehouseName: string | null;
   note: string | null;
   archived: boolean;
   suppliesCount: number; // сколько поставок разобрала
@@ -625,16 +659,41 @@ export type Supply = {
   responsible: string;
   items: SupplyItem[]; // позиции (пусто — поставка по старой схеме «один товар»)
   payments: SupplyPayment[];
-  paidGoodsRub: number; // оплачено за товар, ₽
-  paidCargoRub: number; // оплачено за карго, ₽
-  paidFulfillmentRub: number; // оплачено фул-фирме, ₽
+  paidGoodsRub: number; // оплачено за товар, сом
+  paidCargoRub: number; // оплачено за карго, сом
+  paidFulfillmentRub: number; // оплачено фул-фирме, сом
   // Услуги фул-фирмы: факт, либо тариф партнёра × принято
   fulfillmentPartnerId: string | null;
   fulfillmentPartnerName: string | null;
-  fulfillmentRub: number; // начислено фул-фирме за эту поставку, ₽
-  owedRub: number; // сколько ещё должны (отшивка + карго + ФФ − оплачено), ₽
+  fulfillmentRub: number; // начислено фул-фирме за эту поставку, сом
+  unloadCity: string | null; // куда разгружаем карго (город фул-фирмы)
+  owedRub: number; // сколько ещё должны (отшивка + карго + ФФ − оплачено), сом
   distributions: WbDistribution[];
   distributedQty: number;
+};
+
+// Точка разгрузки: город, куда приезжает карго с фабрики. Собирается из
+// заведённых фул-фирм и личных складов кабинета WB (город — из офисов WB).
+export type UnloadPoint = {
+  city: string;
+  partnerNames: string[]; // фул-фирмы в этом городе
+  fbsWarehouseNames: string[]; // личные склады WB в этом городе
+};
+
+// Склад WB для отгрузки FBW — справочник supplies-api /api/v1/warehouses
+export type WbWarehouseRef = {
+  wbId: number;
+  name: string;
+  address: string | null;
+  isActive: boolean;
+};
+
+// Разгрузка по городам: сколько партий и штук прошло через каждый город
+export type FulfillmentCityRow = {
+  city: string; // «—» для карточек без города
+  supplies: number;
+  qty: number;
+  chargedRub: number;
 };
 
 export type FulfillmentSummary = {
@@ -647,6 +706,7 @@ export type FulfillmentSummary = {
   chargedRub: number; // начислено за услуги
   paidRub: number; // оплачено
   owedRub: number; // долг фул-фирме
+  byCity: FulfillmentCityRow[]; // разрез по городам разгрузки
   cards: Supply[]; // карточки на стадии фул-фирмы
 };
 
@@ -670,6 +730,29 @@ export type DutyItem = {
   reportOnTime: boolean | null;
   assigneeId: string;
   assigneeName: string;
+};
+
+// Пункт самого регламента (duty_templates) — «кто, что и к какому часу делает».
+// Из него каждый день генерируются наряды (DutyItem).
+export type DutyTemplateItem = {
+  id: string;
+  code: string;
+  title: string;
+  description: string | null;
+  role: string; // member_role: кому по умолчанию
+  roleLabel: string; // «Старший менеджер»
+  assigneeUserId: string | null; // поимённо (приоритетнее роли)
+  assigneeName: string | null;
+  frequency: "daily" | "weekly";
+  weekday: number | null; // 1=пн … 7=вс, только для weekly
+  dueTime: string; // «18:00»
+  scheduleLabel: string; // «Ежедневно до 18:00» / «По вт. до 17:00»
+  hoursToComplete: number;
+  requiresReport: boolean;
+  active: boolean;
+  sortOrder: number;
+  updatedAt: string | null;
+  updatedByName: string | null;
 };
 
 // Сводка дня для вкладки «Отчёты» (директор / старший менеджер)
@@ -755,13 +838,22 @@ export type FbsWarehouseRow = {
   productsCount: number; // товаров с остатком на складе
 };
 
+// Остаток товара на личном складе, с разбивкой по размерам —
+// из неё складывается матрица «склад × размер» в карточке товара
+export type FbsProductWarehouse = {
+  warehouseId: number;
+  name: string;
+  qty: number;
+  sizes: { size: string; qty: number }[];
+};
+
 export type FbsProductRow = {
   productId: string;
   nmId: number;
   title: string;
   photoUrl: string | null;
   totalQty: number;
-  warehouses: { warehouseId: number; name: string; qty: number }[];
+  warehouses: FbsProductWarehouse[];
   sizes: { size: string; qty: number }[];
 };
 

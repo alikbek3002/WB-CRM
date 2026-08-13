@@ -13,14 +13,20 @@
 // Чистый модуль (npm + относительные импорты) — работает и в Turbopack, и в tsx.
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { EXCHANGE_RATES } from "../../shared/constants";
+import { rateToBase, type CurrencyRateMap } from "../../shared/currency";
+import { readCurrencyRateMap } from "./currency-core";
 
-// Курс: зафиксированный на поставке имеет приоритет над текущей константой.
-// EXCHANGE_RATES правится руками, и без фиксации правка задним числом
-// переписала бы себестоимость уже закрытых партий.
-function toRubAt(amount: number, currency: string, rate: number | null): number {
-  const k = rate ?? EXCHANGE_RATES[currency] ?? 1;
-  return amount * k;
+// Себестоимость считается в базовой валюте — сомах (shared/currency.ts).
+// Курс: зафиксированный на поставке имеет приоритет над текущим из «Валют».
+// Курсы правятся руками, и без фиксации правка задним числом переписала бы
+// себестоимость уже закрытых партий.
+function toBaseAt(
+  amount: number,
+  currency: string,
+  rate: number | null,
+  rates: CurrencyRateMap,
+): number {
+  return amount * (rate && rate > 0 ? rate : rateToBase(currency, rates));
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
@@ -37,7 +43,7 @@ export type CostItemInput = {
 export type CostBreakdown = {
   productId: string;
   qty: number; // принято (или отгружено, если приёмки ещё не было)
-  sewingRub: number; // ₽ на единицу
+  sewingRub: number; // сом на единицу
   cargoRub: number;
   fulfillmentRub: number;
   unitCostRub: number; // сумма трёх
@@ -59,6 +65,7 @@ export function computeBatchCosts(
   items: CostItemInput[],
   cargoRubTotal: number,
   fulfillmentRubTotal: number,
+  rates: CurrencyRateMap = {},
 ): CostBreakdown[] {
   const qtyOf = (i: CostItemInput) =>
     i.receivedQty != null && i.receivedQty > 0 ? i.receivedQty : i.quantity;
@@ -74,7 +81,7 @@ export function computeBatchCosts(
     const qty = qtyOf(i);
     if (!i.productId || qty <= 0) continue;
     const sewingRub =
-      toRubAt(i.sewingCost, i.sewingCurrency, i.sewingRateToRub) / qty;
+      toBaseAt(i.sewingCost, i.sewingCurrency, i.sewingRateToRub, rates) / qty;
     out.push({
       productId: i.productId,
       qty,
@@ -150,7 +157,7 @@ export async function applySupplyCost(
         quantity: Number(r.quantity ?? 0),
         receivedQty: r.received_qty == null ? null : Number(r.received_qty),
         sewingCost: Number(r.sewing_cost ?? 0),
-        sewingCurrency: String(r.sewing_currency ?? "rub"),
+        sewingCurrency: String(r.sewing_currency ?? "kgs"),
         sewingRateToRub: r.sewing_rate_to_rub == null ? null : Number(r.sewing_rate_to_rub),
       }))
     : [
@@ -159,7 +166,7 @@ export async function applySupplyCost(
           quantity: Number(supply.quantity ?? 0),
           receivedQty: supply.received_qty == null ? null : Number(supply.received_qty),
           sewingCost: Number(supply.sewing_cost ?? 0),
-          sewingCurrency: String(supply.sewing_currency ?? "rub"),
+          sewingCurrency: String(supply.sewing_currency ?? "kgs"),
           sewingRateToRub: null,
         },
       ];
@@ -169,10 +176,12 @@ export async function applySupplyCost(
     0,
   );
 
-  const cargoRubTotal = toRubAt(
+  const rates = await readCurrencyRateMap(db);
+  const cargoRubTotal = toBaseAt(
     Number(supply.cargo_cost ?? 0),
-    String(supply.cargo_currency ?? "rub"),
+    String(supply.cargo_currency ?? "kgs"),
     supply.cargo_rate_to_rub == null ? null : Number(supply.cargo_rate_to_rub),
+    rates,
   );
   const partnerId = supply.fulfillment_partner_id ? String(supply.fulfillment_partner_id) : null;
 
@@ -188,7 +197,7 @@ export async function applySupplyCost(
     ffRubTotal = Number(partner?.rate_per_unit_rub ?? 0) * totalQty;
   }
 
-  const batch = computeBatchCosts(items, cargoRubTotal, ffRubTotal);
+  const batch = computeBatchCosts(items, cargoRubTotal, ffRubTotal, rates);
   if (batch.length === 0) return empty;
 
   // Остатки на складах WB — база для средневзвешенной

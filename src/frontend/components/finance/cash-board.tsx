@@ -10,7 +10,10 @@ import {
   CreditCard,
   Hourglass,
   Landmark,
+  Pencil,
   Repeat,
+  Scale,
+  Trash2,
   Wallet,
 } from "lucide-react";
 import {
@@ -57,9 +60,17 @@ import {
   SERIES,
   TOOLTIP_STYLE,
 } from "@/frontend/components/charts/palette";
-import { formatAmount, formatMoney, formatRub } from "@/shared/format";
+import {
+  BASE_CURRENCY,
+  CURRENCY_CODES,
+  CURRENCY_LABEL,
+  CURRENCY_SIGN,
+  type CurrencyRateMap,
+} from "@/shared/currency";
+import { formatAmount, formatMoney, formatSom } from "@/shared/format";
 import { cn } from "@/shared/utils";
 import type {
+  CashAccount,
   CashAccountKind,
   CashOverview,
   CashTx,
@@ -117,16 +128,16 @@ function FlowTooltip({
   return (
     <div style={TOOLTIP_STYLE} className="px-3 py-2">
       <div className="font-medium">{p.label}</div>
-      <div>Приход: {formatRub(p.in)}</div>
-      <div>Расход: {formatRub(p.out)}</div>
+      <div>Приход: {formatSom(p.in)}</div>
+      <div>Расход: {formatSom(p.out)}</div>
       <div style={{ color: p.in - p.out >= 0 ? "#34d399" : "#f87171" }}>
-        Итог: {formatRub(p.in - p.out)}
+        Итог: {formatSom(p.in - p.out)}
       </div>
     </div>
   );
 }
 
-// Заведение нового счёта (наличные, банк, карта, кошелёк в юанях)
+// Заведение нового счёта (наличные, банк, карта, кошелёк в юанях или долларах)
 function AccountDialog({
   open,
   onOpenChange,
@@ -137,7 +148,7 @@ function AccountDialog({
   const router = useRouter();
   const [name, setName] = useState("");
   const [kind, setKind] = useState<CashAccountKind>("cash");
-  const [currency, setCurrency] = useState<Currency>("rub");
+  const [currency, setCurrency] = useState<Currency>(BASE_CURRENCY);
   const [opening, setOpening] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -214,9 +225,11 @@ function AccountDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="rub">Рубли ₽</SelectItem>
-                <SelectItem value="cny">Юани ¥</SelectItem>
-                <SelectItem value="uzs">Сумы</SelectItem>
+                {CURRENCY_CODES.map((c) => (
+                  <SelectItem key={c} value={c}>
+                    {CURRENCY_LABEL[c]}
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
           </div>
@@ -238,6 +251,255 @@ function AccountDialog({
           <Button onClick={submit} disabled={saving}>
             {saving ? "Сохранение…" : "Создать счёт"}
           </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// Сверка остатка — главный способ ввести деньги руками. Директор смотрит
+// выписку (или пересчитывает наличные), вписывает фактический остаток, а разницу
+// система пишет корректирующей операцией со статьёй «Сверка кассы». Правку
+// начального остатка для этого не используем: она молча переписала бы историю,
+// а сверка оставляет след в ленте операций.
+function ReconcileDialog({
+  account,
+  open,
+  onOpenChange,
+}: {
+  account: CashAccount | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const router = useRouter();
+  const [actual, setActual] = useState("");
+  const [occurredOn, setOccurredOn] = useState(todayIso());
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const parsed = Number(actual.replace(/\s/g, "").replace(",", "."));
+  const valid = actual.trim() !== "" && Number.isFinite(parsed);
+  const diff = valid && account ? Math.round((parsed - account.balance) * 100) / 100 : 0;
+
+  async function submit() {
+    if (!account) return;
+    if (!valid) {
+      toast.error("Укажите фактический остаток");
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await fetch("/api/finance/cash/reconcile", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          accountId: account.id,
+          actualBalance: parsed,
+          occurredOn,
+          note: note.trim() || null,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.message ?? data?.error ?? "Ошибка");
+      toast.success(data?.message ?? "Остаток сверен");
+      setActual("");
+      setNote("");
+      onOpenChange(false);
+      router.refresh();
+    } catch (e) {
+      toast.error(`Не удалось сверить: ${(e as Error).message}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !saving && onOpenChange(o)}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Сверка остатка{account ? ` · ${account.name}` : ""}</DialogTitle>
+          <DialogDescription>
+            Сколько денег на счёте на самом деле. Разницу с расчётом система запишет
+            отдельной операцией «Сверка кассы» — прибыль периода она не меняет.
+          </DialogDescription>
+        </DialogHeader>
+
+        {account && (
+          <div className="grid gap-3 sm:grid-cols-2 [&>div]:min-w-0">
+            <div className="rounded-lg border border-border/60 px-3 py-2 sm:col-span-2">
+              <div className="text-[11px] text-muted-foreground">Расчётный остаток по системе</div>
+              <div className="text-lg font-medium tabular-nums">
+                {formatMoney(account.balance, account.currency)}
+              </div>
+            </div>
+
+            <div className="grid gap-1.5">
+              <Label htmlFor="rec-amount">Фактический остаток, {CURRENCY_SIGN[account.currency]}</Label>
+              <Input
+                id="rec-amount"
+                inputMode="decimal"
+                value={actual}
+                onChange={(e) => setActual(e.target.value)}
+                placeholder="Сколько есть по выписке"
+                autoFocus
+              />
+              {valid && (
+                <p
+                  className={cn(
+                    "text-[11px]",
+                    diff === 0
+                      ? "text-muted-foreground"
+                      : diff > 0
+                        ? "text-emerald-400"
+                        : "text-red-400",
+                  )}
+                >
+                  {diff === 0
+                    ? "Совпадает с расчётом — операция не понадобится"
+                    : `${diff > 0 ? "Добавим" : "Спишем"} ${formatMoney(Math.abs(diff), account.currency)}`}
+                </p>
+              )}
+            </div>
+
+            <div className="grid gap-1.5">
+              <Label htmlFor="rec-date">Дата сверки</Label>
+              <Input
+                id="rec-date"
+                type="date"
+                value={occurredOn}
+                onChange={(e) => setOccurredOn(e.target.value)}
+              />
+            </div>
+
+            <div className="grid gap-1.5 sm:col-span-2">
+              <Label htmlFor="rec-note">Комментарий</Label>
+              <Input
+                id="rec-note"
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="Например: по выписке банка за 14.08"
+              />
+            </div>
+          </div>
+        )}
+
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>
+            Отмена
+          </Button>
+          <Button onClick={submit} disabled={saving || !valid}>
+            {saving ? "Сохранение…" : "Сверить остаток"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// Правка счёта: название, начальный остаток (с чего счёт начинался) и архив.
+// Валюту менять нельзя — операции уже записаны в ней.
+function EditAccountDialog({
+  account,
+  open,
+  onOpenChange,
+}: {
+  account: CashAccount | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const router = useRouter();
+  const [name, setName] = useState("");
+  const [opening, setOpening] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  // Диалог один на все счёта — при открытии подставляем поля выбранного
+  const [loadedFor, setLoadedFor] = useState<string | null>(null);
+  if (account && loadedFor !== account.id) {
+    setLoadedFor(account.id);
+    setName(account.name);
+    setOpening("");
+  }
+
+  async function patch(body: Record<string, unknown>, okText: string) {
+    if (!account) return;
+    setSaving(true);
+    try {
+      const res = await fetch("/api/finance/cash/accounts", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: account.id, ...body }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.message ?? data?.error ?? "Ошибка");
+      toast.success(okText);
+      onOpenChange(false);
+      router.refresh();
+    } catch (e) {
+      toast.error(`Не удалось сохранить: ${(e as Error).message}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const openingNum = Number(opening.replace(/\s/g, "").replace(",", "."));
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !saving && onOpenChange(o)}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Счёт{account ? ` · ${account.name}` : ""}</DialogTitle>
+          <DialogDescription>
+            Начальный остаток — сколько было на счёте до первой операции в системе.
+            Чтобы просто поправить текущий остаток, лучше сделать сверку: она оставит
+            след в операциях.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid gap-3">
+          <div className="grid gap-1.5">
+            <Label htmlFor="acc-name">Название</Label>
+            <Input id="acc-name" value={name} onChange={(e) => setName(e.target.value)} />
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="acc-open">Начальный остаток{account ? `, ${CURRENCY_SIGN[account.currency]}` : ""}</Label>
+            <Input
+              id="acc-open"
+              inputMode="decimal"
+              value={opening}
+              onChange={(e) => setOpening(e.target.value)}
+              placeholder="Оставьте пустым, чтобы не менять"
+            />
+          </div>
+        </div>
+
+        <DialogFooter className="sm:justify-between">
+          <Button
+            variant="outline"
+            onClick={() => patch({ archived: true }, "Счёт убран в архив")}
+            disabled={saving}
+          >
+            В архив
+          </Button>
+          <div className="flex gap-2">
+            <Button variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>
+              Отмена
+            </Button>
+            <Button
+              onClick={() =>
+                patch(
+                  {
+                    name: name.trim() || undefined,
+                    openingBalance:
+                      opening.trim() !== "" && Number.isFinite(openingNum) ? openingNum : undefined,
+                  },
+                  "Счёт обновлён",
+                )
+              }
+              disabled={saving || (!name.trim() && opening.trim() === "")}
+            >
+              {saving ? "Сохранение…" : "Сохранить"}
+            </Button>
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -301,9 +563,9 @@ function WbProcessingCard({ items, canEdit }: { items: CashTx[]; canEdit: boolea
             <div>
               <div className="text-sm font-medium tabular-nums">
                 {formatMoney(t.amount, t.currency)}
-                {t.currency !== "rub" && (
+                {t.currency !== BASE_CURRENCY && (
                   <span className="ml-1.5 font-normal text-[11px] text-muted-foreground">
-                    ≈ {formatRub(t.amountRub)}
+                    ≈ {formatSom(t.amountRub)}
                   </span>
                 )}
               </div>
@@ -370,14 +632,37 @@ export function CashBoard({
   overview,
   categories,
   members = [],
+  rates,
   canEdit,
 }: {
   overview: CashOverview;
   categories: ExpenseCategory[];
   members?: MemberOpt[];
+  rates?: CurrencyRateMap; // курсы к сому — форма операции показывает пересчёт
   canEdit: boolean;
 }) {
+  const router = useRouter();
   const [accountDialog, setAccountDialog] = useState(false);
+  const [reconciling, setReconciling] = useState<CashAccount | null>(null);
+  const [editing, setEditing] = useState<CashAccount | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
+
+  // Ошибочное поступление (например, старая выплата из API) удаляется здесь же:
+  // касса должна сходиться с выпиской, а не хранить чужие цифры.
+  async function removeTx(id: string) {
+    setDeleting(id);
+    try {
+      const res = await fetch(`/api/finance/cash/tx?id=${id}`, { method: "DELETE" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.message ?? "Ошибка");
+      toast.success("Операция удалена");
+      router.refresh();
+    } catch (e) {
+      toast.error(`Не удалось удалить: ${(e as Error).message}`);
+    } finally {
+      setDeleting(null);
+    }
+  }
   const accountOpts = overview.accounts.map((a) => ({
     id: a.id,
     name: a.name,
@@ -387,13 +672,15 @@ export function CashBoard({
   const monthNet = overview.monthInRub - overview.monthOutRub;
   const processing = overview.wbProcessing;
   const processingSum = processing.reduce((t, x) => t + x.amount, 0);
-  const processingCur = processing[0]?.currency ?? "rub";
+  const processingCur = processing[0]?.currency ?? BASE_CURRENCY;
 
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-sm text-muted-foreground">
-          Остатки считаются от заведённого остатка счёта плюс все операции
+        <div className="max-w-xl text-sm text-muted-foreground">
+          Остатки считаются от заведённого остатка счёта плюс все операции. Деньги от WB
+          в кассу автоматически не попадают: вносите поступление по выписке или
+          нажмите «Сверка» у счёта и впишите фактический остаток.
         </div>
         {canEdit && (
           <div className="flex flex-wrap gap-2">
@@ -403,6 +690,7 @@ export function CashBoard({
               accounts={accountOpts}
               categories={categories}
               members={members}
+              rates={rates}
             />
             <AddTxButton
               kind="in"
@@ -411,6 +699,7 @@ export function CashBoard({
               accounts={accountOpts}
               categories={categories}
               members={members}
+              rates={rates}
               lockKind
             />
             <AddTxButton
@@ -419,6 +708,7 @@ export function CashBoard({
               variant="outline"
               accounts={accountOpts}
               categories={categories}
+              rates={rates}
               lockKind
             />
             <Button size="sm" variant="outline" onClick={() => setAccountDialog(true)}>
@@ -432,22 +722,22 @@ export function CashBoard({
         stats={[
           {
             label: "Всего денег",
-            value: formatRub(overview.totalRub),
+            value: formatSom(overview.totalRub),
             hint: `по ${overview.accounts.length} счетам`,
           },
           {
             label: "Пришло за месяц",
-            value: formatRub(overview.monthInRub),
+            value: formatSom(overview.monthInRub),
             tone: "good",
           },
           {
             label: "Потрачено за месяц",
-            value: formatRub(overview.monthOutRub),
+            value: formatSom(overview.monthOutRub),
             tone: "bad",
           },
           {
             label: "Итог месяца",
-            value: `${monthNet >= 0 ? "+" : ""}${formatRub(monthNet)}`,
+            value: `${monthNet >= 0 ? "+" : ""}${formatSom(monthNet)}`,
             tone: monthNet >= 0 ? "good" : "bad",
             hint: "приход минус расход",
           },
@@ -525,18 +815,42 @@ export function CashBoard({
                       </div>
                     </div>
                   </div>
-                  <div className="text-right">
-                    <div
-                      className={cn(
-                        "font-medium tabular-nums",
-                        a.balance < 0 && "text-red-400",
+                  <div className="flex items-center gap-2">
+                    <div className="text-right">
+                      <div
+                        className={cn(
+                          "font-medium tabular-nums",
+                          a.balance < 0 && "text-red-400",
+                        )}
+                      >
+                        {formatMoney(a.balance, a.currency)}
+                      </div>
+                      {a.currency !== BASE_CURRENCY && (
+                        <div className="text-[11px] text-muted-foreground tabular-nums">
+                          ≈ {formatSom(a.balanceRub)}
+                        </div>
                       )}
-                    >
-                      {formatMoney(a.balance, a.currency)}
                     </div>
-                    {a.currency !== "rub" && (
-                      <div className="text-[11px] text-muted-foreground tabular-nums">
-                        ≈ {formatRub(a.balanceRub)}
+                    {canEdit && (
+                      <div className="flex items-center gap-0.5">
+                        <Button
+                          size="xs"
+                          variant="outline"
+                          onClick={() => setReconciling(a)}
+                          title="Вписать фактический остаток"
+                        >
+                          <Scale className="size-3.5" />
+                          Сверка
+                        </Button>
+                        <Button
+                          size="xs"
+                          variant="ghost"
+                          onClick={() => setEditing(a)}
+                          aria-label="Изменить счёт"
+                          title="Название, начальный остаток, архив"
+                        >
+                          <Pencil className="size-3.5" />
+                        </Button>
                       </div>
                     )}
                   </div>
@@ -551,7 +865,7 @@ export function CashBoard({
             <CardTitle className="text-sm">
               Деньги по месяцам
               <span className="ml-2 font-normal text-muted-foreground">
-                приход и расход, ₽
+                приход и расход, сом
               </span>
             </CardTitle>
           </CardHeader>
@@ -595,12 +909,13 @@ export function CashBoard({
                 <TableHead>Счёт</TableHead>
                 <TableHead>Комментарий</TableHead>
                 <TableHead className="text-right">Сумма</TableHead>
+                {canEdit && <TableHead />}
               </TableRow>
             </TableHeader>
             <TableBody>
               {overview.recent.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={5} className="py-12 text-center text-sm text-muted-foreground">
+                  <TableCell colSpan={canEdit ? 6 : 5} className="py-12 text-center text-sm text-muted-foreground">
                     Операций пока нет.
                   </TableCell>
                 </TableRow>
@@ -647,10 +962,28 @@ export function CashBoard({
                       )}
                     >
                       {t.kind === "in" ? "+" : t.kind === "out" ? "−" : ""}
-                      {t.currency === "rub"
-                        ? formatRub(t.amountRub)
+                      {t.currency === BASE_CURRENCY
+                        ? formatSom(t.amountRub)
                         : formatMoney(t.amount, t.currency)}
                     </TableCell>
+                    {canEdit && (
+                      <TableCell className="text-right">
+                        {/* Оплаты поставок и заявок правятся в своих карточках —
+                            там у них вторая половина записи (сервер тоже откажет) */}
+                        {t.source !== "supply_payment" && t.source !== "payout" && (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            disabled={deleting === t.id}
+                            onClick={() => removeTx(t.id)}
+                            aria-label="Удалить операцию"
+                            title="Удалить ошибочную операцию"
+                          >
+                            <Trash2 className="size-4" />
+                          </Button>
+                        )}
+                      </TableCell>
+                    )}
                   </TableRow>
                 );
               })}
@@ -660,6 +993,16 @@ export function CashBoard({
       </Card>
 
       <AccountDialog open={accountDialog} onOpenChange={setAccountDialog} />
+      <ReconcileDialog
+        account={reconciling}
+        open={reconciling != null}
+        onOpenChange={(o) => !o && setReconciling(null)}
+      />
+      <EditAccountDialog
+        account={editing}
+        open={editing != null}
+        onOpenChange={(o) => !o && setEditing(null)}
+      />
     </div>
   );
 }

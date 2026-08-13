@@ -21,7 +21,7 @@ import {
   SERIES,
   TOOLTIP_STYLE,
 } from "@/frontend/components/charts/palette";
-import { formatNumber, formatRub } from "@/shared/format";
+import { formatNumber, formatSom } from "@/shared/format";
 import type { DailyPoint, WarehouseStock } from "@/shared/types";
 
 const compactRub = (v: number) =>
@@ -44,7 +44,7 @@ function DailyTooltip({
     <div style={TOOLTIP_STYLE} className="px-3 py-2">
       <div className="font-medium">{point.label}</div>
       <div className="mt-1 text-muted-foreground">
-        Сумма: <span className="text-foreground">{formatRub(point.sumRub)}</span>
+        Сумма: <span className="text-foreground">{formatSom(point.sumRub)}</span>
       </div>
       <div className="text-muted-foreground">
         Заказы: <span className="text-foreground">{formatNumber(point.qty)} шт</span>
@@ -53,7 +53,7 @@ function DailyTooltip({
   );
 }
 
-// «Динамика заказов» — столбцы по дням (одна ось: ₽; шт — в тултипе)
+// «Динамика заказов» — столбцы по дням (одна ось: сом; шт — в тултипе)
 export function OrdersBarChart({ data }: { data: DailyPoint[] }) {
   return (
     <ResponsiveContainer width="100%" height={260}>
@@ -86,7 +86,7 @@ export function OrdersBarChart({ data }: { data: DailyPoint[] }) {
   );
 }
 
-// «Заказы за период» — линия тренда (одна ось: ₽; шт — в тултипе)
+// «Заказы за период» — линия тренда (одна ось: сом; шт — в тултипе)
 export function OrdersLineChart({ data }: { data: DailyPoint[] }) {
   return (
     <ResponsiveContainer width="100%" height={260}>

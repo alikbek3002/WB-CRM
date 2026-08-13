@@ -37,6 +37,7 @@ export type Permission =
   | "finance:plan" // задать план продаж WB на период
   | "finance:cash" // касса: остатки по счетам, движение денег, ОПиУ
   | "finance:expense" // вносить расходы/приходы и править кассу
+  | "currency:manage" // сводить курсы валют к сому (директор и ст. менеджер)
   | "payout:request" // попросить выплату (зарплата, подрядчик, счёт фабрики)
   | "payout:approve" // согласовать и оплатить заявку
   | "tasks:view" // viewer видит только свои — фильтрация на уровне данных/RLS
@@ -55,6 +56,7 @@ export type Permission =
   // ─── Регламент и отчёты ───
   | "duty:view" // мои ежедневные обязанности
   | "duty:complete" // отметить выполнение + отчёт
+  | "duty:manage" // править сам регламент (директор — всем, ст. менеджер — кроме своего)
   | "reports:view" // отчёты всех менеджеров (директор/ст. менеджер)
   // ─── Дизайн карточек ───
   | "design:view" // очередь заявок на дизайн
@@ -73,6 +75,7 @@ const ALL: Permission[] = [
   "finance:plan",
   "finance:cash",
   "finance:expense",
+  "currency:manage",
   "payout:request",
   "payout:approve",
   "tasks:view",
@@ -89,6 +92,7 @@ const ALL: Permission[] = [
   "fulfillment:manage",
   "duty:view",
   "duty:complete",
+  "duty:manage",
   "reports:view",
   "design:view",
   "design:request",
@@ -110,6 +114,7 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
     "finance:plan",
     "finance:cash",
     "finance:expense",
+    "currency:manage", // курс доллара к сому сводят директор и ст. менеджер
     "payout:request",
     "payout:approve",
     "tasks:view",
@@ -123,6 +128,9 @@ export const ROLE_PERMISSIONS: Record<MemberRole, Permission[]> = {
     "fulfillment:manage",
     "duty:view",
     "duty:complete",
+    // Регламент ст. менеджер правит всем, КРОМЕ себя — это проверяется по самой
+    // обязанности (shared/duties.ts), правом такое не выразить
+    "duty:manage",
     "reports:view", // старший менеджер видит отчёты команды
     "design:view",
     "design:request",

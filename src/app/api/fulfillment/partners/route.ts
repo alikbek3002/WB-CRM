@@ -16,6 +16,10 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const partnerSchema = z.object({
   name: z.string().trim().min(1).max(200),
   ratePerUnitRub: z.number().min(0).max(100000),
+  // Город разгрузки и связь с личным складом кабинета WB (0042): из них
+  // собирается список «куда разгружаем» в карточке поставки.
+  city: z.string().trim().max(120).nullable().optional(),
+  fbsWarehouseId: z.number().int().positive().nullable().optional(),
   note: z.string().trim().max(500).nullable().optional(),
 });
 
@@ -50,6 +54,8 @@ export async function POST(request: Request) {
       org_id: DEMO_ORG_ID,
       name: parsed.data.name,
       rate_per_unit_rub: parsed.data.ratePerUnitRub,
+      city: parsed.data.city?.trim() || null,
+      fbs_warehouse_id: parsed.data.fbsWarehouseId ?? null,
       note: parsed.data.note ?? null,
     })
     .select("id")
@@ -64,7 +70,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "db_error" }, { status: 500 });
   }
 
-  invalidateWbData("fulfillment", "fulfillment-partners");
+  invalidateWbData("fulfillment", "fulfillment-partners", "unload-points");
   return NextResponse.json({ ok: true, persisted: true, id: data.id });
 }
 
@@ -88,6 +94,10 @@ export async function PATCH(request: Request) {
   if (parsed.data.ratePerUnitRub !== undefined) {
     patch.rate_per_unit_rub = parsed.data.ratePerUnitRub;
   }
+  if (parsed.data.city !== undefined) patch.city = parsed.data.city?.trim() || null;
+  if (parsed.data.fbsWarehouseId !== undefined) {
+    patch.fbs_warehouse_id = parsed.data.fbsWarehouseId ?? null;
+  }
   if (parsed.data.note !== undefined) patch.note = parsed.data.note;
   if (parsed.data.archived !== undefined) patch.archived = parsed.data.archived;
   if (Object.keys(patch).length === 0) {
@@ -108,6 +118,6 @@ export async function PATCH(request: Request) {
   // Тариф меняет расчёт начислений — обновляем и сводку фул-фирмы.
   // Себестоимость уже принятых партий НЕ пересчитывается: она зафиксирована
   // на момент приёмки (см. product_cost_history).
-  invalidateWbData("fulfillment", "fulfillment-partners");
+  invalidateWbData("fulfillment", "fulfillment-partners", "unload-points");
   return NextResponse.json({ ok: true, persisted: true });
 }

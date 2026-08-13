@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { CURRENCY_CODES } from "@/shared/currency";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
@@ -10,11 +11,11 @@ export const runtime = "nodejs";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Счёт компании: наличные, расчётный счёт, карта, кошелёк в юанях…
+// Счёт компании: наличные, расчётный счёт, карта, кошелёк в юанях или долларах…
 const accountSchema = z.object({
   name: z.string().trim().min(1).max(80),
   kind: z.enum(["cash", "bank", "card", "wb", "other"]),
-  currency: z.enum(["rub", "cny", "uzs"]),
+  currency: z.enum(CURRENCY_CODES),
   openingBalance: z.number().min(-1_000_000_000).max(1_000_000_000).optional(),
 });
 

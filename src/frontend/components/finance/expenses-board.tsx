@@ -22,7 +22,8 @@ import {
 import { StatRow } from "@/frontend/components/finance/stat-row";
 import { StructureBar } from "@/frontend/components/finance/structure-bar";
 import { SERIES } from "@/frontend/components/charts/palette";
-import { formatMoney, formatRub } from "@/shared/format";
+import { BASE_CURRENCY, type CurrencyRateMap } from "@/shared/currency";
+import { formatMoney, formatSom } from "@/shared/format";
 import type { ExpenseCategory, ExpensesView } from "@/shared/types";
 
 // Готовые периоды: месяц открывается по умолчанию, остальное — в один клик
@@ -50,12 +51,14 @@ export function ExpensesBoard({
   accounts,
   categories,
   members = [],
+  rates,
   canEdit,
 }: {
   view: ExpensesView;
   accounts: AccountOpt[];
   categories: ExpenseCategory[];
   members?: MemberOpt[];
+  rates?: CurrencyRateMap; // курсы к сому для формы расхода/прихода
   canEdit: boolean;
 }) {
   const router = useRouter();
@@ -96,6 +99,7 @@ export function ExpensesBoard({
         {canEdit && (
           <div className="flex gap-2">
             <AddTxButton
+              rates={rates}
               kind="out"
               label="Добавить расход"
               accounts={accounts}
@@ -104,6 +108,7 @@ export function ExpensesBoard({
               lockKind
             />
             <AddTxButton
+              rates={rates}
               kind="in"
               label="Поступление"
               variant="outline"
@@ -120,12 +125,12 @@ export function ExpensesBoard({
         stats={[
           {
             label: `Расходы · ${dmy(view.from)} — ${dmy(view.to)}`,
-            value: formatRub(view.totalRub),
+            value: formatSom(view.totalRub),
             hint: `${view.items.length} операций`,
           },
           {
             label: "Влияют на прибыль",
-            value: formatRub(view.opexRub),
+            value: formatSom(view.opexRub),
             hint: "без закупа товара и выплат владельцу",
           },
           {
@@ -134,13 +139,13 @@ export function ExpensesBoard({
               ? `${view.categories[0].emoji ?? ""} ${view.categories[0].name}`.trim()
               : "—",
             hint: view.categories[0]
-              ? `${formatRub(view.categories[0].amountRub)} · ${view.categories[0].sharePct}%`
+              ? `${formatSom(view.categories[0].amountRub)} · ${view.categories[0].sharePct}%`
               : undefined,
           },
           {
             label: "Средний расход",
             value: view.items.length
-              ? formatRub(Math.round(view.totalRub / view.items.length))
+              ? formatSom(Math.round(view.totalRub / view.items.length))
               : "—",
             hint: "на одну операцию",
             tone: "muted",
@@ -154,14 +159,14 @@ export function ExpensesBoard({
             <CardTitle className="text-sm">
               Структура расходов
               <span className="ml-2 font-normal text-muted-foreground">
-                доля каждой статьи от {formatRub(view.totalRub)}
+                доля каждой статьи от {formatSom(view.totalRub)}
               </span>
             </CardTitle>
           </CardHeader>
           <CardContent>
             <StructureBar
               total={view.totalRub}
-              formatValue={(v) => formatRub(v)}
+              formatValue={(v) => formatSom(v)}
               segments={view.categories.slice(0, 6).map((c, i) => ({
                 label: c.name,
                 value: c.amountRub,
@@ -220,9 +225,9 @@ export function ExpensesBoard({
                     {t.source === "bot" || t.source === "ai" ? " · бот" : ""}
                   </TableCell>
                   <TableCell className="text-right font-medium whitespace-nowrap tabular-nums">
-                    {t.currency === "rub"
-                      ? formatRub(t.amountRub)
-                      : `${formatMoney(t.amount, t.currency)} (${formatRub(t.amountRub)})`}
+                    {t.currency === BASE_CURRENCY
+                      ? formatSom(t.amountRub)
+                      : `${formatMoney(t.amount, t.currency)} (${formatSom(t.amountRub)})`}
                   </TableCell>
                   {canEdit && (
                     <TableCell className="text-right">

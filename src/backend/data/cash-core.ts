@@ -10,7 +10,15 @@
 // Чистый модуль (npm + относительные импорты) — работает и в Turbopack, и в tsx.
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { DEMO_ORG_ID, DEMO_STORE_ID, EXCHANGE_RATES, toRub } from "../../shared/constants";
+import { DEMO_ORG_ID, DEMO_STORE_ID } from "../../shared/constants";
+import {
+  BASE_CURRENCY,
+  CURRENCY_SIGN,
+  normalizeCurrency,
+  rateToBase,
+  toBase,
+} from "../../shared/currency";
+import { readCurrencyRateMap } from "./currency-core";
 import { can, ROLE_LABELS, type MemberRole } from "../../shared/rbac";
 import type {
   CashAccount,
@@ -171,7 +179,8 @@ export async function getCashOverview(db: SupabaseClient): Promise<CashOverview>
   const flowSince = isoDay(monthStart(5)); // текущий месяц + 5 предыдущих
   const thisMonth = isoDay(monthStart(0));
 
-  const [balRes, flowRes, txRes, wbRes, procRes] = await Promise.all([
+  const [rates, balRes, flowRes, txRes, wbRes, procRes] = await Promise.all([
+    readCurrencyRateMap(db),
     db.rpc("agg_cash_balances", { p_org: DEMO_ORG_ID }),
     db.rpc("agg_cash_flow_monthly", { p_org: DEMO_ORG_ID, p_since: flowSince }),
     db
@@ -217,7 +226,7 @@ export async function getCashOverview(db: SupabaseClient): Promise<CashOverview>
       kind: r.kind,
       currency: r.currency,
       balance,
-      balanceRub: toRub(balance, r.currency),
+      balanceRub: toBase(balance, r.currency, rates),
       txCount: Number(r.tx_count ?? 0),
       lastTx: r.last_tx ? String(r.last_tx) : null,
     };
@@ -341,7 +350,8 @@ export async function getPayrollView(
   const { categories } = await getFinanceRefs(db);
   const payrollCatIds = new Set(categories.filter((c) => c.isPayroll).map((c) => c.id));
 
-  const [peopleRes, sliceRes, monthlyRes, itemsRes, catRes, pendingRes] = await Promise.all([
+  const [rates, peopleRes, sliceRes, monthlyRes, itemsRes, catRes, pendingRes] = await Promise.all([
+    readCurrencyRateMap(db),
     db.rpc("agg_payroll_by_person", { p_org: DEMO_ORG_ID, p_from: periodFrom, p_to: periodTo }),
     db.rpc("agg_payroll_by_person_category", {
       p_org: DEMO_ORG_ID,
@@ -460,7 +470,7 @@ export async function getPayrollView(
   const assignedCount = assignedInPayroll.reduce((t, s) => t + Number(s.tx_count ?? 0), 0);
 
   const pending = ((pendingRes.data ?? []) as { amount: number; currency: Currency }[]).reduce(
-    (t, p) => t + toRub(Number(p.amount ?? 0), p.currency),
+    (t, p) => t + toBase(Number(p.amount ?? 0), p.currency, rates),
     0,
   );
 
@@ -868,7 +878,7 @@ export type CashTxInput = {
   amountTo?: number | null;
   occurredOn?: string | null; // yyyy-mm-dd, по умолчанию сегодня
   note?: string | null;
-  rateToRub?: number | null; // курс валюты счёта; по умолчанию — общий курс
+  rateToRub?: number | null; // курс валюты счёта к сому; по умолчанию — из «Валют»
   personId?: string | null; // кому эти деньги (сотрудник) — для зарплат и гонораров
   source?: CashTx["source"];
   sourceRef?: string | null; // внешний ключ (номер отчёта WB) — защита от дублей
@@ -883,12 +893,15 @@ export type CashResult =
     };
 
 // Крупный расход руководство должно видеть сразу, не заходя в систему.
-export const CASH_NOTIFY_THRESHOLD_RUB = 100_000;
+// Порог — в базовой валюте (сом).
+export const CASH_NOTIFY_THRESHOLD = 100_000;
 
 const NOTE_MAX = 500;
 
-const rubFmt = (n: number) =>
-  new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(n)) + " ₽";
+// Суммы в сообщениях — в базовой валюте (сом): бот и уведомления не должны
+// подписывать рублём то, что лежит в кассе сомами.
+const somFmt = (n: number) =>
+  new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(n)) + " сом";
 
 const KIND_LABEL: Record<CashTxKind, string> = {
   in: "Приход",
@@ -993,13 +1006,15 @@ export async function createCashTx(
     personId = member.id;
   }
 
-  // Курс к рублю: свой можно передать (реальный курс сделки), иначе общий
+  // Курс к базовой валюте (сому): свой можно передать (реальный курс сделки),
+  // иначе берём тот, что свели директор/ст. менеджер во «Валютах».
+  const rates = await readCurrencyRateMap(db);
   const rate =
-    currency === "rub"
+    currency === BASE_CURRENCY
       ? 1
       : Number(input.rateToRub) > 0
         ? Number(input.rateToRub)
-        : (EXCHANGE_RATES[currency] ?? 1);
+        : rateToBase(currency, rates);
 
   const { data, error } = await db
     .from("cash_tx")
@@ -1030,15 +1045,15 @@ export async function createCashTx(
   const catName = first(data.category as { name: string } | { name: string }[] | null)?.name ?? null;
   const what =
     input.kind === "transfer"
-      ? `перевод ${rubFmt(amountRub)}`
-      : `${input.kind === "out" ? "расход" : "приход"} ${rubFmt(amountRub)}${catName ? ` · ${catName}` : ""}`;
+      ? `перевод ${somFmt(amountRub)}`
+      : `${input.kind === "out" ? "расход" : "приход"} ${somFmt(amountRub)}${catName ? ` · ${catName}` : ""}`;
 
   // Адресная выплата — сразу сотруднику: человек узнаёт о деньгах от системы,
   // а не «на словах», и может сверить сумму в тот же день.
   if (personId && input.kind === "out") {
     void notifyProfile(
       personId,
-      `💰 <b>Вам начислена выплата</b> — ${tgEsc(rubFmt(amountRub))}\n` +
+      `💰 <b>Вам начислена выплата</b> — ${tgEsc(somFmt(amountRub))}\n` +
         `Статья: <b>${tgEsc(catName ?? "без статьи")}</b>\n` +
         `Дата: ${tgEsc(occurredOn)}\n` +
         `Провёл: ${tgEsc(actor.name)} (${tgEsc(actor.roleLabel)})` +
@@ -1047,10 +1062,10 @@ export async function createCashTx(
   }
 
   // Крупные расходы — пушем директору (best effort, не роняет запись)
-  if (input.kind === "out" && amountRub >= CASH_NOTIFY_THRESHOLD_RUB) {
+  if (input.kind === "out" && amountRub >= CASH_NOTIFY_THRESHOLD) {
     void notifyRoles(
       ["owner"],
-      `💸 <b>Крупный расход</b> — ${tgEsc(rubFmt(amountRub))}\n` +
+      `💸 <b>Крупный расход</b> — ${tgEsc(somFmt(amountRub))}\n` +
         `Статья: <b>${tgEsc(catName ?? "без статьи")}</b>\n` +
         `Счёт: ${tgEsc(String(acc.name))}\n` +
         `Внёс: ${tgEsc(actor.name)} (${tgEsc(actor.roleLabel)})` +
@@ -1077,7 +1092,10 @@ export async function mirrorSupplyPaymentToCash(
   payment: { id: string; kind: "goods" | "cargo" | "fulfillment"; amount: number; currency: Currency; paidAt: string; note?: string | null; supplyTitle?: string | null },
 ): Promise<boolean> {
   try {
-    const { accounts, categories } = await getFinanceRefs(db);
+    const [{ accounts, categories }, rates] = await Promise.all([
+      getFinanceRefs(db),
+      readCurrencyRateMap(db),
+    ]);
     const account = accounts.find((a) => a.currency === payment.currency);
     if (!account) return false;
 
@@ -1102,7 +1120,7 @@ export async function mirrorSupplyPaymentToCash(
       category_id: category.id,
       amount: payment.amount,
       currency: payment.currency,
-      rate_to_rub: payment.currency === "rub" ? 1 : (EXCHANGE_RATES[payment.currency] ?? 1),
+      rate_to_rub: rateToBase(payment.currency, rates),
       occurred_on: payment.paidAt,
       note:
         `Оплата поставки${payment.supplyTitle ? ` «${payment.supplyTitle}»` : ""}` +
@@ -1123,10 +1141,15 @@ export async function mirrorSupplyPaymentToCash(
   }
 }
 
-// Поступления от Wildberries — по отчётам о реализации.
-// WB перечисляет деньги за отчётный период; сумму периода мы уже умеем считать
-// (agg_wb_payouts). Заводим её приходом в кассу, чтобы «сколько денег» не
-// требовало ручного ввода после каждой выплаты маркетплейса.
+// Поступления от Wildberries по отчётам о реализации.
+//
+// ОТКЛЮЧЕНО В 0045 — синк это больше НЕ вызывает. Причина: сумма из шапки отчёта
+// («итого к оплате») не равна тому, что упало на расчётный счёт — WB держит
+// деньги до вывода, удерживает по другим периодам и платит частями. Касса
+// показывала 198,8 млн сом, которых на счетах нет. Теперь поступления вносит
+// человек по выписке (или закрывает сверкой остатка, см. reconcileAccount).
+// Функция оставлена для ручного восстановления истории: включать только если
+// появится источник ФАКТИЧЕСКИХ зачислений, а не начислений по отчёту.
 // ВАЖНО: выплата рождается «в обработке» (status = processing) — от отчёта до
 // фактического зачисления на р/с проходит до недели-двух, и всё это время
 // денег на счёте нет. В остатки она попадёт после подтверждения кнопкой
@@ -1155,8 +1178,12 @@ export async function syncWbPayoutsToCash(
   }[];
   if (!reports.length) return { created: 0, skipped: 0 };
 
-  const currency = ((reports[0].currency ?? "RUB").toLowerCase() as Currency) ?? "rub";
-  const { accounts, categories } = await getFinanceRefs(db);
+  // Валюта кабинета из отчёта («KGS» → kgs). Она же валюта счёта WB.
+  const currency = (normalizeCurrency(reports[0].currency) ?? BASE_CURRENCY) as Currency;
+  const [{ accounts, categories }, rates] = await Promise.all([
+    getFinanceRefs(db),
+    readCurrencyRateMap(db),
+  ]);
 
   let account = accounts.find((a) => a.kind === "wb" && a.currency === currency)
     ?? accounts.find((a) => a.currency === currency);
@@ -1206,7 +1233,7 @@ export async function syncWbPayoutsToCash(
       category_id: category?.id ?? null,
       amount,
       currency,
-      rate_to_rub: currency === "rub" ? 1 : (EXCHANGE_RATES[currency] ?? 1),
+      rate_to_rub: rateToBase(currency, rates),
       occurred_on: r.period_end ?? isoDay(new Date()),
       note: `Выплата WB за период ${r.period_start} — ${r.period_end} (отчёт ${ref})`,
       source: "wb_payout",
@@ -1298,6 +1325,15 @@ export async function deleteCashTx(
       message: "Это оплата поставки — удаляйте её в карточке поставки.",
     };
   }
+  // Оплата заявки: у заявки останется статус «выплачено» со ссылкой на
+  // удалённую операцию — расходятся две книги. Правится через «Выплаты».
+  if (tx.source === "payout") {
+    return {
+      ok: false,
+      code: "invalid",
+      message: "Это оплата заявки на выплату — правьте её в разделе «Выплаты».",
+    };
+  }
   const { error } = await db.from("cash_tx").delete().eq("id", txId);
   if (error) return { ok: false, code: "db_error", message: error.message };
   return {
@@ -1305,6 +1341,106 @@ export async function deleteCashTx(
     id: String(txId),
     amountRub: Math.round(Number(tx.amount_rub ?? 0)),
     message: "Операция удалена.",
+  };
+}
+
+// ─── Сверка остатка: «на счёте фактически столько» ───────────────────────────
+//
+// Главный способ ввести деньги руками. Директор смотрит выписку (или считает
+// наличные) и вписывает фактический остаток; система сама пишет разницу
+// корректирующей операцией со статьёй «Сверка кассы» (in_pnl = false — это не
+// доход и не расход периода). Почему не правкой начального остатка: правка
+// задним числом переписала бы историю молча, а сверка оставляет след — кто,
+// когда и на сколько поправил.
+export async function reconcileAccount(
+  db: SupabaseClient,
+  actor: CashActor,
+  input: {
+    accountId: string;
+    actualBalance: number;
+    occurredOn?: string | null;
+    note?: string | null;
+  },
+): Promise<CashResult> {
+  if (!can(actor.role, "finance:expense")) {
+    return { ok: false, code: "forbidden", message: "Нет права вести кассу и расходы." };
+  }
+
+  const actual = Number(input.actualBalance);
+  if (!Number.isFinite(actual)) {
+    return { ok: false, code: "invalid", message: "Укажите фактический остаток числом." };
+  }
+  if (Math.abs(actual) > 1_000_000_000_000) {
+    return { ok: false, code: "invalid", message: "Слишком большая сумма — проверьте ввод." };
+  }
+
+  const occurredOn = /^\d{4}-\d{2}-\d{2}$/.test(String(input.occurredOn ?? ""))
+    ? String(input.occurredOn)
+    : isoDay(new Date());
+
+  // Расчётный остаток берём ТОЙ ЖЕ функцией, что показывает интерфейс
+  // (agg_cash_balances): иначе разница не сойдётся с числом на экране.
+  const { data: balances, error: balErr } = await db.rpc("agg_cash_balances", {
+    p_org: DEMO_ORG_ID,
+  });
+  if (balErr) return { ok: false, code: "db_error", message: balErr.message };
+  const row = ((balances ?? []) as { account_id: string; name: string; currency: Currency; balance: number }[])
+    .find((b) => String(b.account_id) === String(input.accountId));
+  if (!row) return { ok: false, code: "not_found", message: "Счёт не найден." };
+
+  const current = Number(row.balance ?? 0);
+  const diff = Math.round((actual - current) * 100) / 100;
+  const money = (n: number) =>
+    `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(n))} ${
+      CURRENCY_SIGN[row.currency] ?? row.currency
+    }`;
+
+  if (diff === 0) {
+    return {
+      ok: true,
+      id: "",
+      amountRub: 0,
+      message: `Сверка: на «${row.name}» и так ${money(current)} — ничего править не нужно.`,
+    };
+  }
+
+  const kind: CashTxKind = diff > 0 ? "in" : "out";
+  const { categories } = await getFinanceRefs(db);
+  const category = categories.find(
+    (c) => c.direction === kind && c.name === (kind === "in" ? "Сверка кассы: излишек" : "Сверка кассы: недостача"),
+  );
+
+  const rates = await readCurrencyRateMap(db);
+  const { data, error } = await db
+    .from("cash_tx")
+    .insert({
+      org_id: DEMO_ORG_ID,
+      kind,
+      account_id: String(input.accountId),
+      category_id: category?.id ?? null,
+      amount: Math.abs(diff),
+      currency: row.currency,
+      rate_to_rub: rateToBase(row.currency, rates),
+      occurred_on: occurredOn,
+      note:
+        (input.note ? String(input.note).slice(0, NOTE_MAX - 60) + " · " : "") +
+        `сверка: фактический остаток ${money(actual)} (было ${money(current)})`,
+      source: "adjustment",
+      created_by: authorId(actor),
+    })
+    .select("id, amount_rub")
+    .single();
+  if (error || !data) {
+    return { ok: false, code: "db_error", message: error?.message ?? "Ошибка записи" };
+  }
+
+  return {
+    ok: true,
+    id: String(data.id),
+    amountRub: Math.round(Number(data.amount_rub ?? 0)),
+    message:
+      `Сверка «${row.name}»: остаток ${money(actual)}. ` +
+      `${diff > 0 ? "Добавлено" : "Списано"} ${money(Math.abs(diff))} (${occurredOn}).`,
   };
 }
 

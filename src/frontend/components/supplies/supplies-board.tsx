@@ -1,9 +1,9 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { Plus, X } from "lucide-react";
+import { ImageOff, Plus, Search, X } from "lucide-react";
 import { Badge } from "@/frontend/components/ui/badge";
 import { Button } from "@/frontend/components/ui/button";
 import { Card, CardContent } from "@/frontend/components/ui/card";
@@ -33,13 +33,43 @@ import {
   TableRow,
 } from "@/frontend/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/frontend/components/ui/tabs";
-import { toRub } from "@/shared/constants";
-import { formatMoney, formatNumber, formatRub } from "@/shared/format";
-import type { Currency, Supply, SupplyStatus } from "@/shared/types";
+import {
+  CURRENCY_CODES,
+  CURRENCY_LABEL,
+  CURRENCY_SIGN,
+  toBase,
+  type CurrencyRateMap,
+} from "@/shared/currency";
+import { formatMoney, formatNumber, formatSom } from "@/shared/format";
+import type {
+  Currency,
+  Supply,
+  SupplyStatus,
+  UnloadPoint,
+  WbWarehouseRef,
+} from "@/shared/types";
 
-type FactoryOpt = { id: string; name: string; country: "china" | "uzbekistan" };
-type ProductOpt = { id: string; title: string };
-type PartnerOpt = { id: string; name: string; ratePerUnitRub: number };
+type FactoryOpt = {
+  id: string;
+  name: string;
+  country: "china" | "uzbekistan";
+  currency: Currency; // валюта расчётов фабрики — подставляется в отшив и карго
+};
+// Товар для привязки позиции: закупщик ищет его по артикулу и узнаёт по фото,
+// поэтому кроме названия несём vendorCode, nmID и картинку.
+type ProductOpt = {
+  id: string;
+  title: string;
+  vendorCode: string;
+  nmId: number;
+  photoUrl: string | null;
+};
+type PartnerOpt = {
+  id: string;
+  name: string;
+  ratePerUnitRub: number;
+  city: string | null; // город разгрузки — им фильтруем список под выбранный город
+};
 
 // Черновик позиции в форме создания поставки (строки — потому что это поля ввода)
 type ItemDraft = {
@@ -57,13 +87,6 @@ const emptyItem = (cur: Currency): ItemDraft => ({
   sewingCost: "",
   sewingCurrency: cur,
 });
-
-const CURRENCY_LABEL: Record<Currency, string> = {
-  cny: "¥ юань",
-  uzs: "сум",
-  rub: "₽ рубль",
-  kgs: "сом", // валюта кабинета WB (киргизское юрлицо)
-};
 
 const STATUS_ORDER: (SupplyStatus | "all")[] = [
   "all",
@@ -113,11 +136,93 @@ function todayIso(): string {
   return `${y}-${m}-${day}`;
 }
 
+// Фото товара с карточки WB. Размер задаём классом снаружи: в таблице нужна
+// маленькая, в поиске — покрупнее. Нет фото — рисуем плашку, чтобы строки
+// списка не прыгали по высоте.
+function Thumb({
+  url,
+  alt,
+  size = "size-9",
+}: {
+  url: string | null;
+  alt: string;
+  size?: string;
+}) {
+  if (!url) {
+    return (
+      <div
+        className={`flex ${size} shrink-0 items-center justify-center rounded bg-muted/40 text-muted-foreground`}
+      >
+        <ImageOff className="size-3.5" />
+      </div>
+    );
+  }
+  return (
+    // eslint-disable-next-line @next/next/no-img-element
+    <img
+      src={url}
+      alt={alt}
+      loading="lazy"
+      className={`${size} shrink-0 rounded bg-muted/40 object-cover`}
+    />
+  );
+}
+
+// Товары, к карточкам которых привязана поставка (шапка + позиции), без повторов
+function linkedProducts(
+  supply: Supply,
+  productById: Map<string, ProductOpt>,
+): ProductOpt[] {
+  const ids = supply.items.map((i) => i.productId).filter((v): v is string => v != null);
+  if (supply.productId) ids.unshift(supply.productId);
+  const seen = new Set<string>();
+  const out: ProductOpt[] = [];
+  for (const id of ids) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const p = productById.get(id);
+    if (p) out.push(p);
+  }
+  return out;
+}
+
+// Первая колонка списка: фото + название поставки + артикулы позиций —
+// по ним поставку узнают быстрее, чем по названию карго.
+function SupplyTitleCell({
+  supply,
+  productById,
+}: {
+  supply: Supply;
+  productById: Map<string, ProductOpt>;
+}) {
+  const linked = linkedProducts(supply, productById);
+  const codes = linked.slice(0, 2).map((p) => p.vendorCode).join(" · ");
+  const rest = linked.length - Math.min(linked.length, 2);
+
+  return (
+    <div className="flex items-center gap-2">
+      <Thumb url={linked[0]?.photoUrl ?? null} alt={supply.title} size="size-8" />
+      <div className="min-w-0">
+        <div className="truncate">{supply.title}</div>
+        {codes && (
+          <div className="truncate text-[11px] font-normal text-muted-foreground">
+            {codes}
+            {rest > 0 && ` +${rest}`}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function SuppliesBoard({
   supplies,
   factories,
   products,
   partners,
+  unloadPoints,
+  wbWarehouses,
+  rates,
   canEdit,
   canPay,
   canReceive,
@@ -126,6 +231,9 @@ export function SuppliesBoard({
   factories: FactoryOpt[];
   products: ProductOpt[];
   partners: PartnerOpt[];
+  unloadPoints: UnloadPoint[]; // города разгрузки: фул-фирмы + свои склады WB
+  wbWarehouses: WbWarehouseRef[]; // склады WB для распределения после разбора
+  rates: CurrencyRateMap; // курсы к сому: предпросчёт себестоимости в форме
   canEdit: boolean;
   canPay: boolean;
   canReceive: boolean;
@@ -139,6 +247,8 @@ export function SuppliesBoard({
     [supplies, filter],
   );
   const detail = detailId ? supplies.find((s) => s.id === detailId) ?? null : null;
+  // Позиции хранят только product_id — артикул и фото подтягиваем из каталога
+  const productById = useMemo(() => new Map(products.map((p) => [p.id, p])), [products]);
 
   return (
     <div className="space-y-3">
@@ -167,20 +277,27 @@ export function SuppliesBoard({
             <TableHeader>
               <TableRow>
                 <TableHead>Товар</TableHead>
-                <TableHead>Фабрика</TableHead>
+                <TableHead>Фабрика → разгрузка</TableHead>
                 <TableHead className="text-right">Кол-во</TableHead>
                 <TableHead>Отгружено</TableHead>
                 <TableHead>Статус</TableHead>
                 <TableHead className="text-right">В пути</TableHead>
-                <TableHead className="text-right">Долг, ₽</TableHead>
+                <TableHead className="text-right">Долг, сом</TableHead>
                 <TableHead />
               </TableRow>
             </TableHeader>
             <TableBody>
               {visible.map((s) => (
                 <TableRow key={s.id}>
-                  <TableCell className="font-medium">{s.title}</TableCell>
-                  <TableCell className="text-muted-foreground">{s.factoryName}</TableCell>
+                  <TableCell className="font-medium">
+                    <SupplyTitleCell supply={s} productById={productById} />
+                  </TableCell>
+                  <TableCell className="text-muted-foreground">
+                    {s.factoryName}
+                    {s.unloadCity && (
+                      <span className="block text-[11px]">→ {s.unloadCity}</span>
+                    )}
+                  </TableCell>
                   <TableCell className="text-right tabular-nums">
                     {formatNumber(s.quantity)}
                   </TableCell>
@@ -201,7 +318,7 @@ export function SuppliesBoard({
                   </TableCell>
                   <TableCell className="text-right tabular-nums">
                     {s.owedRub > 0 ? (
-                      <span className="text-amber-400">{formatRub(s.owedRub)}</span>
+                      <span className="text-amber-400">{formatSom(s.owedRub)}</span>
                     ) : (
                       <span className="text-emerald-400">оплачено</span>
                     )}
@@ -228,6 +345,8 @@ export function SuppliesBoard({
       {canEdit && (
         <CreateSupplyDialog
           partners={partners}
+          unloadPoints={unloadPoints}
+          rates={rates}
           open={createOpen}
           onOpenChange={setCreateOpen}
           factories={factories}
@@ -237,10 +356,180 @@ export function SuppliesBoard({
 
       <SupplyDetailDialog
         supply={detail}
+        productById={productById}
+        wbWarehouses={wbWarehouses}
         onClose={() => setDetailId(null)}
         canPay={canPay}
         canReceive={canReceive}
       />
+    </div>
+  );
+}
+
+// ─── Выбор товара позиции по артикулу ─────────────────────────────────────────
+
+// Закупщик держит в голове артикулы, а не названия карточек WB («PJ-104», а не
+// «Пижама женская тёплая с начёсом…»), поэтому вместо длинного выпадающего
+// списка — поиск: артикул продавца, nmID или кусок названия. Список рисуем
+// прямо в потоке (диалог скроллится сам) — так он не обрезается краем окна и
+// не тянет за собой поповер.
+const MAX_HITS = 40;
+
+function ProductPicker({
+  products,
+  value,
+  onPick,
+}: {
+  products: ProductOpt[];
+  value: string; // id товара или "none" — без привязки к WB
+  onPick: (id: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const wantFocus = useRef(false);
+
+  const selected = value === "none" ? null : products.find((p) => p.id === value) ?? null;
+
+  // После «Сменить» фокус уводим в поиск — иначе пришлось бы целиться мышью
+  useEffect(() => {
+    if (!selected && wantFocus.current) {
+      wantFocus.current = false;
+      inputRef.current?.focus();
+    }
+  }, [selected]);
+
+  const hits = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return products.slice(0, MAX_HITS);
+    const found = products.filter(
+      (p) =>
+        p.vendorCode.toLowerCase().includes(q) ||
+        String(p.nmId).includes(q) ||
+        p.title.toLowerCase().includes(q),
+    );
+    // Артикул обычно вводят с начала — такие совпадения поднимаем наверх
+    const rank = (p: ProductOpt) => {
+      const vc = p.vendorCode.toLowerCase();
+      if (vc.startsWith(q)) return 0;
+      if (vc.includes(q)) return 1;
+      if (String(p.nmId).startsWith(q)) return 2;
+      return 3;
+    };
+    found.sort((a, b) => rank(a) - rank(b) || a.vendorCode.localeCompare(b.vendorCode));
+    return found.slice(0, MAX_HITS);
+  }, [products, query]);
+
+  function pick(id: string) {
+    onPick(id);
+    setQuery("");
+    setOpen(false);
+  }
+
+  if (selected) {
+    return (
+      <div className="flex flex-1 items-center gap-2 rounded-lg border border-border/60 bg-background/60 px-2 py-1">
+        <Thumb url={selected.photoUrl} alt={selected.title} size="size-9" />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-xs font-medium">{selected.vendorCode}</div>
+          <div className="truncate text-[10px] leading-tight text-muted-foreground">
+            {selected.title} · {selected.nmId}
+          </div>
+        </div>
+        <Button
+          size="xs"
+          variant="ghost"
+          onClick={() => {
+            wantFocus.current = true;
+            pick("none");
+            setOpen(true);
+          }}
+        >
+          Сменить
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-w-0 flex-1">
+      <div className="relative">
+        <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          ref={inputRef}
+          value={query}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setActive(0);
+            setOpen(true);
+          }}
+          onFocus={() => setOpen(true)}
+          onBlur={() => setOpen(false)}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowDown") {
+              e.preventDefault();
+              setOpen(true);
+              setActive((a) => Math.min(a + 1, hits.length - 1));
+            } else if (e.key === "ArrowUp") {
+              e.preventDefault();
+              setActive((a) => Math.max(a - 1, 0));
+            } else if (e.key === "Enter") {
+              if (open && hits[active]) {
+                e.preventDefault();
+                pick(hits[active].id);
+              }
+            } else if (e.key === "Escape" && open) {
+              // Гасим здесь, иначе Escape закрыл бы всю форму поставки
+              e.stopPropagation();
+              setOpen(false);
+            }
+          }}
+          placeholder="Артикул, nmID или название"
+          className="h-8 pl-7"
+        />
+      </div>
+
+      {open ? (
+        <div className="mt-1 max-h-56 overflow-y-auto rounded-lg border border-border/60 bg-popover">
+          {hits.map((p, n) => (
+            <button
+              key={p.id}
+              type="button"
+              // Без этого input теряет фокус раньше клика и список успевает закрыться
+              onMouseDown={(e) => e.preventDefault()}
+              onMouseEnter={() => setActive(n)}
+              onClick={() => pick(p.id)}
+              className={`flex w-full items-center gap-2 border-b border-border/40 px-2 py-1.5 text-left last:border-0 ${
+                n === active ? "bg-muted/60" : "hover:bg-muted/40"
+              }`}
+            >
+              <Thumb url={p.photoUrl} alt={p.title} size="size-9" />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-xs font-medium">{p.vendorCode}</div>
+                <div className="truncate text-[10px] leading-tight text-muted-foreground">
+                  {p.title} · {p.nmId}
+                </div>
+              </div>
+            </button>
+          ))}
+          {hits.length === 0 && (
+            <div className="px-2 py-3 text-center text-xs text-muted-foreground">
+              По «{query.trim()}» ничего не нашли — проверьте артикул или оставьте позицию
+              без привязки к WB.
+            </div>
+          )}
+          {hits.length === MAX_HITS && (
+            <div className="border-t border-border/40 px-2 py-1 text-[10px] text-muted-foreground">
+              показаны первые {MAX_HITS} — уточните артикул
+            </div>
+          )}
+        </div>
+      ) : (
+        <p className="mt-1 text-[10px] leading-tight text-muted-foreground">
+          Не нашли карточку — оставьте пустым, позиция уйдёт без привязки к WB.
+        </p>
+      )}
     </div>
   );
 }
@@ -253,12 +542,16 @@ function CreateSupplyDialog({
   factories,
   products,
   partners,
+  unloadPoints,
+  rates,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   factories: FactoryOpt[];
   products: ProductOpt[];
   partners: PartnerOpt[];
+  unloadPoints: UnloadPoint[];
+  rates: CurrencyRateMap;
 }) {
   const router = useRouter();
   const [factoryId, setFactoryId] = useState(factories[0]?.id ?? "");
@@ -268,12 +561,39 @@ function CreateSupplyDialog({
   const [cargoCost, setCargoCost] = useState("");
   const [cargoCurrency, setCargoCurrency] = useState<Currency>("cny");
   const [partnerId, setPartnerId] = useState("none");
+  // Куда разгружаем: город из справочника («other» — свой, вводится руками)
+  const [city, setCity] = useState("none");
+  const [cityOther, setCityOther] = useState("");
   const [saving, setSaving] = useState(false);
+
+  const unloadCity = city === "none" ? "" : city === "other" ? cityOther.trim() : city;
+
+  // Фул-фирмы показываем те, что стоят в выбранном городе (плюс без города —
+  // их ещё не донастроили). Без выбора города — все.
+  const partnersInCity = unloadCity
+    ? partners.filter((p) => !p.city || p.city === unloadCity)
+    : partners;
+
+  function pickCity(value: string) {
+    setCity(value);
+    // Сменили город — фул-фирма из прошлого города больше не подходит
+    const chosen = partners.find((p) => p.id === partnerId);
+    if (chosen?.city && value !== "other" && chosen.city !== value) setPartnerId("none");
+  }
+
+  function pickPartner(id: string) {
+    setPartnerId(id);
+    // Город не выбирали — берём из фул-фирмы: обычно он и есть ответ
+    const p = partners.find((x) => x.id === id);
+    if (p?.city && city === "none") setCity(p.city);
+  }
 
   function pickFactory(id: string) {
     setFactoryId(id);
     const f = factories.find((x) => x.id === id);
-    const cur: Currency = f?.country === "uzbekistan" ? "uzs" : "cny";
+    // Валюта берётся у фабрики (её задают в карточке фабрики): китайская может
+    // считать и в юанях, и в долларах — угадывать по стране больше нельзя.
+    const cur: Currency = f?.currency ?? (f?.country === "uzbekistan" ? "uzs" : "cny");
     setCargoCurrency(cur);
     setItems((prev) => prev.map((i) => ({ ...i, sewingCurrency: cur })));
   }
@@ -282,11 +602,16 @@ function CreateSupplyDialog({
     setItems((prev) => prev.map((i, n) => (n === idx ? { ...i, ...patch } : i)));
 
   function pickItemProduct(idx: number, id: string) {
-    const p = products.find((x) => x.id === id);
-    // Наименование подставляем из карточки, если его ещё не вводили руками
+    const cur = items[idx];
+    const prev = products.find((x) => x.id === cur.productId) ?? null;
+    const next = products.find((x) => x.id === id) ?? null;
+    // Наименование ведём за карточкой, пока его не правили руками: если там
+    // стоит название прошлого выбранного товара — это наша подстановка, её и
+    // заменяем. Свой текст закупщика не трогаем.
+    const manual = cur.title.trim() !== "" && cur.title.trim() !== (prev?.title ?? "").trim();
     patchItem(idx, {
       productId: id,
-      title: !items[idx].title.trim() && p ? p.title : items[idx].title,
+      title: manual ? cur.title : next?.title ?? "",
     });
   }
 
@@ -295,7 +620,7 @@ function CreateSupplyDialog({
   // пропорционально количеству.
   const totalQty = items.reduce((t, i) => t + (Number(i.quantity) || 0), 0);
   const partner = partners.find((p) => p.id === partnerId) ?? null;
-  const cargoRub = toRub(Number(cargoCost) || 0, cargoCurrency);
+  const cargoRub = toBase(Number(cargoCost) || 0, cargoCurrency, rates);
   const ffRub = partner ? partner.ratePerUnitRub * totalQty : 0;
   const perUnitShared = totalQty > 0 ? (cargoRub + ffRub) / totalQty : 0;
 
@@ -329,6 +654,7 @@ function CreateSupplyDialog({
           cargoCost: Number(cargoCost) || 0,
           cargoCurrency,
           fulfillmentPartnerId: partnerId === "none" ? null : partnerId,
+          unloadCity: unloadCity || null,
           items: filled.map((i) => ({
             productId: i.productId === "none" ? null : i.productId,
             title: i.title.trim(),
@@ -349,6 +675,8 @@ function CreateSupplyDialog({
       setItems([emptyItem(cargoCurrency)]);
       setCargoCost("");
       setPartnerId("none");
+      setCity("none");
+      setCityOther("");
       onOpenChange(false);
       router.refresh();
     } catch (e) {
@@ -421,26 +749,15 @@ function CreateSupplyDialog({
 
             {items.map((item, idx) => {
               const qty = Number(item.quantity) || 0;
-              const sewingPerUnit = qty > 0 ? toRub(Number(item.sewingCost) || 0, item.sewingCurrency) / qty : 0;
+              const sewingPerUnit = qty > 0 ? toBase(Number(item.sewingCost) || 0, item.sewingCurrency, rates) / qty : 0;
               return (
                 <div key={idx} className="space-y-1.5 rounded-md bg-muted/20 p-2">
-                  <div className="flex items-center gap-2">
-                    <Select
+                  <div className="flex items-start gap-2">
+                    <ProductPicker
+                      products={products}
                       value={item.productId}
-                      onValueChange={(v) => v && pickItemProduct(idx, String(v))}
-                    >
-                      <SelectTrigger className="h-8 flex-1">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="none">Без привязки к WB</SelectItem>
-                        {products.map((p) => (
-                          <SelectItem key={p.id} value={p.id}>
-                            {p.title}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                      onPick={(id) => pickItemProduct(idx, id)}
+                    />
                     {items.length > 1 && (
                       <Button
                         size="xs"
@@ -486,9 +803,11 @@ function CreateSupplyDialog({
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="cny">¥</SelectItem>
-                          <SelectItem value="uzs">сум</SelectItem>
-                          <SelectItem value="rub">₽</SelectItem>
+                          {CURRENCY_CODES.map((c) => (
+                            <SelectItem key={c} value={c}>
+                              {CURRENCY_SIGN[c]}
+                            </SelectItem>
+                          ))}
                         </SelectContent>
                       </Select>
                     </div>
@@ -496,9 +815,9 @@ function CreateSupplyDialog({
 
                   {qty > 0 && (
                     <div className="text-[10px] leading-tight text-muted-foreground">
-                      себестоимость ≈ {formatRub(Math.round(sewingPerUnit + perUnitShared))}/шт
+                      себестоимость ≈ {formatSom(Math.round(sewingPerUnit + perUnitShared))}/шт
                       {perUnitShared > 0 &&
-                        ` (отшив ${formatRub(Math.round(sewingPerUnit))} + карго и ФФ ${formatRub(Math.round(perUnitShared))})`}
+                        ` (отшив ${formatSom(Math.round(sewingPerUnit))} + карго и ФФ ${formatSom(Math.round(perUnitShared))})`}
                     </div>
                   )}
                 </div>
@@ -514,24 +833,68 @@ function CreateSupplyDialog({
             onCurrency={setCargoCurrency}
           />
 
+          {/* Куда приезжает карго с фабрики. Города берём из справочника:
+              фул-фирмы + личные склады кабинета WB (город у них из офисов WB),
+              поэтому «Санкт-Петербург» не превращается в «Спб» и «СПБ». */}
+          <div className="grid gap-1.5">
+            <Label>Куда разгружаем</Label>
+            <Select value={city} onValueChange={(v) => v && pickCity(String(v))}>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">Город не указан</SelectItem>
+                {unloadPoints.map((p) => (
+                  <SelectItem key={p.city} value={p.city}>
+                    {p.city}
+                    {p.partnerNames.length > 0 && ` · ${p.partnerNames.join(", ")}`}
+                    {p.partnerNames.length === 0 &&
+                      p.fbsWarehouseNames.length > 0 &&
+                      ` · ${p.fbsWarehouseNames.join(", ")}`}
+                  </SelectItem>
+                ))}
+                <SelectItem value="other">Другой город…</SelectItem>
+              </SelectContent>
+            </Select>
+            {city === "other" && (
+              <Input
+                value={cityOther}
+                onChange={(e) => setCityOther(e.target.value)}
+                placeholder="Например, Новосибирск"
+              />
+            )}
+            {unloadPoints.length === 0 && city !== "other" && (
+              <p className="text-xs text-muted-foreground">
+                Городов пока нет — укажите город у фул-фирмы на странице «Фул-фирма»,
+                либо выберите «Другой город».
+              </p>
+            )}
+          </div>
+
           <div className="grid gap-1.5">
             <Label>Фул-фирма (разбор и упаковка)</Label>
-            <Select value={partnerId} onValueChange={(v) => v && setPartnerId(String(v))}>
+            <Select value={partnerId} onValueChange={(v) => v && pickPartner(String(v))}>
               <SelectTrigger className="w-full">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="none">Не привлекаем</SelectItem>
-                {partners.map((p) => (
+                {partnersInCity.map((p) => (
                   <SelectItem key={p.id} value={p.id}>
-                    {p.name} · {formatRub(p.ratePerUnitRub)}/шт
+                    {p.name}
+                    {p.city && ` · ${p.city}`} · {formatSom(p.ratePerUnitRub)}/шт
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
+            {unloadCity && partnersInCity.length === 0 && (
+              <p className="text-xs text-muted-foreground">
+                В городе «{unloadCity}» фул-фирм не заведено — разбираем сами.
+              </p>
+            )}
             {partner && totalQty > 0 && (
               <p className="text-xs text-muted-foreground">
-                Начислим {formatRub(ffRub)} за {formatNumber(totalQty)} шт — войдёт в себестоимость.
+                Начислим {formatSom(ffRub)} за {formatNumber(totalQty)} шт — войдёт в себестоимость.
               </p>
             )}
           </div>
@@ -606,11 +969,15 @@ function CostRow({
 
 function SupplyDetailDialog({
   supply,
+  productById,
+  wbWarehouses,
   onClose,
   canPay,
   canReceive,
 }: {
   supply: Supply | null;
+  productById: Map<string, ProductOpt>;
+  wbWarehouses: WbWarehouseRef[];
   onClose: () => void;
   canPay: boolean;
   canReceive: boolean;
@@ -623,7 +990,8 @@ function SupplyDetailDialog({
             <DialogHeader>
               <DialogTitle>{supply.title}</DialogTitle>
               <DialogDescription>
-                {supply.factoryName} · {supply.statusLabel}
+                {supply.factoryName}
+                {supply.unloadCity && ` → ${supply.unloadCity}`} · {supply.statusLabel}
               </DialogDescription>
             </DialogHeader>
 
@@ -636,7 +1004,7 @@ function SupplyDetailDialog({
               </TabsList>
 
               <TabsContent value="overview" className="pt-3">
-                <OverviewTab supply={supply} />
+                <OverviewTab supply={supply} productById={productById} />
               </TabsContent>
               <TabsContent value="finance" className="pt-3">
                 <FinanceTab supply={supply} canPay={canPay} />
@@ -645,7 +1013,11 @@ function SupplyDetailDialog({
                 <ReceiptTab supply={supply} canReceive={canReceive} />
               </TabsContent>
               <TabsContent value="distribute" className="pt-3">
-                <DistributeTab supply={supply} canReceive={canReceive} />
+                <DistributeTab
+                  supply={supply}
+                  wbWarehouses={wbWarehouses}
+                  canReceive={canReceive}
+                />
               </TabsContent>
             </Tabs>
           </>
@@ -664,7 +1036,13 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-function OverviewTab({ supply }: { supply: Supply }) {
+function OverviewTab({
+  supply,
+  productById,
+}: {
+  supply: Supply;
+  productById: Map<string, ProductOpt>;
+}) {
   return (
     <div className="divide-y divide-border/60">
       <Row label="Количество" value={`${formatNumber(supply.quantity)} шт`} />
@@ -677,7 +1055,7 @@ function OverviewTab({ supply }: { supply: Supply }) {
       {supply.fulfillmentPartnerName && (
         <Row
           label={`Фул-фирма · ${supply.fulfillmentPartnerName}`}
-          value={formatRub(supply.fulfillmentRub)}
+          value={formatSom(supply.fulfillmentRub)}
         />
       )}
       <Row label="В пути" value={supply.daysInTransit != null ? `${supply.daysInTransit} дн` : "—"} />
@@ -690,21 +1068,32 @@ function OverviewTab({ supply }: { supply: Supply }) {
             Позиции · {supply.items.length}
           </div>
           <div className="space-y-1.5">
-            {supply.items.map((i) => (
-              <div key={i.id} className="rounded-md bg-muted/20 px-2.5 py-1.5">
-                <div className="flex items-baseline justify-between gap-2 text-sm">
-                  <span className="truncate font-medium">{i.title}</span>
-                  <span className="shrink-0 tabular-nums">
-                    {formatNumber(i.receivedQty ?? i.quantity)} шт
-                  </span>
+            {supply.items.map((i) => {
+              const p = i.productId ? productById.get(i.productId) ?? null : null;
+              return (
+                <div key={i.id} className="flex gap-2 rounded-md bg-muted/20 px-2.5 py-1.5">
+                  <Thumb url={p?.photoUrl ?? null} alt={i.title} size="size-10" />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-baseline justify-between gap-2 text-sm">
+                      <span className="truncate font-medium">{i.title}</span>
+                      <span className="shrink-0 tabular-nums">
+                        {formatNumber(i.receivedQty ?? i.quantity)} шт
+                      </span>
+                    </div>
+                    {p && (
+                      <div className="truncate text-[11px] leading-tight text-muted-foreground">
+                        арт. {p.vendorCode} · {p.nmId}
+                      </div>
+                    )}
+                    <div className="text-[11px] leading-tight text-muted-foreground">
+                      {formatSom(i.unitCostRub)}/шт = отшив {formatSom(i.sewingRub)} + карго{" "}
+                      {formatSom(i.cargoRub)}
+                      {i.fulfillmentRub > 0 && ` + фул-фирма ${formatSom(i.fulfillmentRub)}`}
+                    </div>
+                  </div>
                 </div>
-                <div className="text-[11px] leading-tight text-muted-foreground">
-                  {formatRub(i.unitCostRub)}/шт = отшив {formatRub(i.sewingRub)} + карго{" "}
-                  {formatRub(i.cargoRub)}
-                  {i.fulfillmentRub > 0 && ` + фул-фирма ${formatRub(i.fulfillmentRub)}`}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
@@ -760,15 +1149,15 @@ function FinanceTab({ supply, canPay }: { supply: Supply; canPay: boolean }) {
   return (
     <div className="space-y-3">
       <div className="divide-y divide-border/60">
-        <Row label="Оплачено за товар" value={formatRub(supply.paidGoodsRub)} />
-        <Row label="Оплачено за карго" value={formatRub(supply.paidCargoRub)} />
+        <Row label="Оплачено за товар" value={formatSom(supply.paidGoodsRub)} />
+        <Row label="Оплачено за карго" value={formatSom(supply.paidCargoRub)} />
         {(supply.fulfillmentRub > 0 || supply.paidFulfillmentRub > 0) && (
-          <Row label="Оплачено фул-фирме" value={formatRub(supply.paidFulfillmentRub)} />
+          <Row label="Оплачено фул-фирме" value={formatSom(supply.paidFulfillmentRub)} />
         )}
         <div className="flex items-center justify-between gap-2 py-1 text-sm">
           <span className="text-muted-foreground">Остаток долга</span>
           <span className={`tabular-nums font-medium ${supply.owedRub > 0 ? "text-amber-400" : "text-emerald-400"}`}>
-            {supply.owedRub > 0 ? formatRub(supply.owedRub) : "нет"}
+            {supply.owedRub > 0 ? formatSom(supply.owedRub) : "нет"}
           </span>
         </div>
       </div>
@@ -914,28 +1303,43 @@ function ReceiptTab({ supply, canReceive }: { supply: Supply; canReceive: boolea
   );
 }
 
-function DistributeTab({ supply, canReceive }: { supply: Supply; canReceive: boolean }) {
+function DistributeTab({
+  supply,
+  wbWarehouses,
+  canReceive,
+}: {
+  supply: Supply;
+  wbWarehouses: WbWarehouseRef[];
+  canReceive: boolean;
+}) {
   const router = useRouter();
-  const [warehouse, setWarehouse] = useState("");
+  // Склад выбираем из справочника WB (supplies-api, 0042). «other» — вручную:
+  // список у WB меняется, и вбить новый склад должно быть можно сразу.
+  const active = wbWarehouses.filter((w) => w.isActive);
+  const [warehouse, setWarehouse] = useState(active.length > 0 ? "none" : "other");
+  const [warehouseOther, setWarehouseOther] = useState("");
   const [qty, setQty] = useState("");
   const [saving, setSaving] = useState(false);
   const received = supply.receivedAt != null;
   const remaining = (supply.receivedQty ?? supply.quantity) - supply.distributedQty;
+  const warehouseName =
+    warehouse === "other" ? warehouseOther.trim() : warehouse === "none" ? "" : warehouse;
 
   async function distribute() {
-    if (!warehouse.trim()) return toast.error("Укажите склад WB");
+    if (!warehouseName) return toast.error("Укажите склад WB");
     if (!(Number(qty) > 0)) return toast.error("Укажите количество");
     setSaving(true);
     try {
       const res = await fetch(`/api/supplies/${supply.id}/distribute`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ warehouse: warehouse.trim(), quantity: Number(qty) }),
+        body: JSON.stringify({ warehouse: warehouseName, quantity: Number(qty) }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error ?? "Ошибка");
-      toast.success(data.persisted ? `Отправлено на «${warehouse.trim()}»` : "Распределение принято (демо)");
-      setWarehouse("");
+      toast.success(data.persisted ? `Отправлено на «${warehouseName}»` : "Распределение принято (демо)");
+      setWarehouse(active.length > 0 ? "none" : "other");
+      setWarehouseOther("");
       setQty("");
       router.refresh();
     } catch (e) {
@@ -970,24 +1374,54 @@ function DistributeTab({ supply, canReceive }: { supply: Supply; canReceive: boo
             Отправить на склад WB · остаток {formatNumber(Math.max(0, remaining))} шт
           </div>
           <div className="flex gap-2">
-            <Input
-              value={warehouse}
-              onChange={(e) => setWarehouse(e.target.value)}
-              placeholder="Коледино"
-              className="flex-1"
-            />
+            {active.length > 0 ? (
+              <Select value={warehouse} onValueChange={(v) => v && setWarehouse(String(v))}>
+                <SelectTrigger className="h-8 flex-1">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">Выберите склад WB</SelectItem>
+                  {active.map((w) => (
+                    <SelectItem key={w.wbId} value={w.name}>
+                      {w.name}
+                    </SelectItem>
+                  ))}
+                  <SelectItem value="other">Другой склад…</SelectItem>
+                </SelectContent>
+              </Select>
+            ) : (
+              <Input
+                value={warehouseOther}
+                onChange={(e) => setWarehouseOther(e.target.value)}
+                placeholder="Коледино"
+                className="h-8 flex-1"
+              />
+            )}
             <Input
               type="number"
               min={1}
               value={qty}
               onChange={(e) => setQty(e.target.value)}
               placeholder="Кол-во"
-              className="w-28"
+              className="h-8 w-24"
             />
             <Button size="sm" onClick={distribute} disabled={saving}>
               {saving ? "…" : "OK"}
             </Button>
           </div>
+          {warehouse === "other" && active.length > 0 && (
+            <Input
+              value={warehouseOther}
+              onChange={(e) => setWarehouseOther(e.target.value)}
+              placeholder="Название склада WB"
+              className="h-8"
+            />
+          )}
+          {active.length === 0 && (
+            <p className="text-[10px] leading-tight text-muted-foreground">
+              Справочник складов WB пуст — подтянется после ближайшей синхронизации.
+            </p>
+          )}
         </div>
       )}
       {!received && (

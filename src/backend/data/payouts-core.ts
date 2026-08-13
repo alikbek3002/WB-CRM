@@ -9,7 +9,14 @@
 // Чистый модуль (npm + относительные импорты) — работает и в Turbopack, и в tsx.
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { DEMO_ORG_ID, EXCHANGE_RATES, toRub } from "../../shared/constants";
+import { DEMO_ORG_ID } from "../../shared/constants";
+import {
+  BASE_CURRENCY,
+  CURRENCY_SIGN,
+  isCurrencyCode,
+  toBase,
+  type CurrencyRateMap,
+} from "../../shared/currency";
 import { can, ROLE_LABELS, type MemberRole } from "../../shared/rbac";
 import type {
   Currency,
@@ -20,6 +27,7 @@ import type {
 } from "../../shared/types";
 import { notifyProfile, notifyRoles, tgEsc } from "../telegram/notify";
 import { createCashTx, isoDay, listMembers, type CashActor } from "./cash-core";
+import { readCurrencyRateMap } from "./currency-core";
 
 export type PayoutActor = CashActor;
 
@@ -49,15 +57,14 @@ export const PAYOUT_STATUS_LABELS: Record<PayoutStatus, string> = {
   cancelled: "отменено",
 };
 
-const rubFmt = (n: number) =>
-  new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(n)) + " ₽";
+// Сводные суммы — в базовой валюте (сом); суммы заявок — в валюте заявки.
+const somFmt = (n: number) =>
+  new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(n)) +
+  ` ${CURRENCY_SIGN[BASE_CURRENCY]}`;
 
 const money = (amount: number, currency: Currency) => {
   const n = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(amount));
-  if (currency === "rub") return `${n} ₽`;
-  if (currency === "cny") return `${n} ¥`;
-  if (currency === "kgs") return `${n} сом`;
-  return `${n} сум`;
+  return `${n} ${CURRENCY_SIGN[currency] ?? currency}`;
 };
 
 function first<T>(v: T | T[] | null): T | null {
@@ -105,7 +112,11 @@ type PayoutRow = {
   account: { name: string } | { name: string }[] | null;
 };
 
-function mapPayout(r: PayoutRow, roleByUser: Map<string, string>): PayoutRequest {
+function mapPayout(
+  r: PayoutRow,
+  roleByUser: Map<string, string>,
+  rates: CurrencyRateMap,
+): PayoutRequest {
   const amount = Number(r.amount);
   return {
     id: String(r.id),
@@ -115,7 +126,7 @@ function mapPayout(r: PayoutRow, roleByUser: Map<string, string>): PayoutRequest
     description: r.description,
     amount,
     currency: r.currency,
-    amountRub: toRub(amount, r.currency),
+    amountRub: toBase(amount, r.currency, rates),
     dueDate: r.due_date,
     payee: r.payee ?? first(r.payee_user)?.full_name ?? null,
     payeeUserId: r.payee_user_id ? String(r.payee_user_id) : null,
@@ -153,9 +164,10 @@ export async function getPayouts(
     .limit(limit);
   if (!isLead(viewer.role)) q = q.eq("requester_id", viewer.id);
 
-  const [{ data, error }, membersRes] = await Promise.all([
+  const [{ data, error }, membersRes, rates] = await Promise.all([
     q,
     db.from("org_members").select("user_id, role").eq("org_id", DEMO_ORG_ID),
+    readCurrencyRateMap(db),
   ]);
   if (error) throw error;
 
@@ -166,7 +178,9 @@ export async function getPayouts(
     ]),
   );
 
-  const items = ((data ?? []) as unknown as PayoutRow[]).map((r) => mapPayout(r, roleByUser));
+  const items = ((data ?? []) as unknown as PayoutRow[]).map((r) =>
+    mapPayout(r, roleByUser, rates),
+  );
   const monthStart = isoDay(new Date(new Date().getFullYear(), new Date().getMonth(), 1));
 
   return {
@@ -221,8 +235,9 @@ export async function createPayoutRequest(
     return { ok: false, code: "invalid", message: "Слишком большая сумма — проверьте ввод." };
   }
 
-  const currency: Currency =
-    input.currency && EXCHANGE_RATES[input.currency] !== undefined ? input.currency : "rub";
+  // По умолчанию — базовая валюта: компания живёт в сомах, и заявка «на 50 000»
+  // без указания валюты значит сомы, а не рубли.
+  const currency: Currency = isCurrencyCode(input.currency) ? input.currency : BASE_CURRENCY;
   const dueDate = /^\d{4}-\d{2}-\d{2}$/.test(String(input.dueDate ?? ""))
     ? String(input.dueDate)
     : null;
@@ -454,7 +469,7 @@ export async function payPayout(
   return {
     ok: true,
     id,
-    message: `«${row.title}» оплачена: ${money(Number(row.amount), row.currency)} (${rubFmt(tx.amountRub)}).`,
+    message: `«${row.title}» оплачена: ${money(Number(row.amount), row.currency)} (${somFmt(tx.amountRub)}).`,
   };
 }
 

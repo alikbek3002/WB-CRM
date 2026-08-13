@@ -22,8 +22,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/frontend/components/ui/select";
-import { EXCHANGE_RATES } from "@/shared/constants";
-import { formatMoney } from "@/shared/format";
+import {
+  BASE_CURRENCY,
+  CURRENCY_CODES,
+  CURRENCY_LABEL,
+  CURRENCY_SIGN,
+  rateToBase,
+  type CurrencyRateMap,
+} from "@/shared/currency";
+import { formatRate, formatSom } from "@/shared/format";
 import type { CashTxKind, Currency, ExpenseCategory } from "@/shared/types";
 
 export type AccountOpt = { id: string; name: string; currency: Currency };
@@ -45,8 +52,12 @@ const todayIso = () => {
   return `${d.getFullYear()}-${m}-${String(d.getDate()).padStart(2, "0")}`;
 };
 
-// Одна форма на расход / приход / перевод: валюту и курс подставляет счёт,
-// поэтому пользователь вводит только сумму «как в жизни».
+// Одна форма на расход / приход / перевод.
+//
+// ВАЛЮТА. Деньги физически уходят со счёта, поэтому валюта операции = валюта
+// счёта: выбор валюты сверху просто отбирает счета в ней (доллар, юань, сом…).
+// Сумму вводят «как в жизни», а под полем сразу видно, сколько это в сомах —
+// в базовой валюте считаются касса и прибыль.
 export function TxDialog({
   open,
   onOpenChange,
@@ -54,6 +65,7 @@ export function TxDialog({
   accounts,
   categories,
   members = [],
+  rates,
   defaultCategoryId = "",
   defaultPersonId = "",
   lockKind = false,
@@ -64,6 +76,7 @@ export function TxDialog({
   accounts: AccountOpt[];
   categories: ExpenseCategory[];
   members?: MemberOpt[];
+  rates?: CurrencyRateMap; // курсы к сому из «Финансы → Валюты»
   defaultCategoryId?: string; // предзаполнение с экрана «Выплаты команде»
   defaultPersonId?: string;
   lockKind?: boolean;
@@ -81,11 +94,37 @@ export function TxDialog({
   const [note, setNote] = useState("");
   const [saving, setSaving] = useState(false);
 
-  const account = accounts.find((a) => a.id === accountId);
+  const [currency, setCurrency] = useState<Currency>(
+    accounts[0]?.currency ?? BASE_CURRENCY,
+  );
+
   const toAccount = accounts.find((a) => a.id === toAccountId);
-  const currency = account?.currency ?? "rub";
-  const needsRate = currency !== "rub";
+  // Счёт — источник правды по валюте (её же проверит сервер); селект валюты
+  // отбирает счета, а не переопределяет валюту операции.
+  const accountsInCurrency = accounts.filter((a) => a.currency === currency);
+  const noAccountInCurrency = accountsInCurrency.length === 0;
+  const sign = CURRENCY_SIGN[currency];
+  const needsRate = currency !== BASE_CURRENCY;
   const crossCurrency = kind === "transfer" && toAccount && toAccount.currency !== currency;
+
+  // Курс: свой (курс сделки) важнее общего из «Валют»
+  const rateNumber = Number(rate.replace(",", "."));
+  const effectiveRate =
+    Number.isFinite(rateNumber) && rateNumber > 0 ? rateNumber : rateToBase(currency, rates);
+  const amountNumber = Number(amount.replace(/\s/g, "").replace(",", "."));
+  const inBase =
+    needsRate && Number.isFinite(amountNumber) && amountNumber > 0
+      ? amountNumber * effectiveRate
+      : null;
+
+  function pickCurrency(next: Currency) {
+    setCurrency(next);
+    const first = accounts.find((a) => a.currency === next);
+    setAccountId(first?.id ?? "");
+    if (first && first.id === toAccountId) {
+      setToAccountId(accounts.find((a) => a.id !== first.id)?.id ?? "");
+    }
+  }
 
   const options = useMemo(
     () => categories.filter((c) => c.direction === (kind === "in" ? "in" : "out")),
@@ -115,7 +154,11 @@ export function TxDialog({
       return;
     }
     if (!accountId) {
-      toast.error("Выберите счёт");
+      toast.error(
+        noAccountInCurrency
+          ? `Нет счёта в ${sign} — создайте его в «Кассе»`
+          : "Выберите счёт",
+      );
       return;
     }
     if (kind !== "transfer" && !categoryId) {
@@ -131,8 +174,6 @@ export function TxDialog({
       toast.error("Счета в разных валютах — укажите сумму зачисления");
       return;
     }
-    const rateNum = Number(rate.replace(",", "."));
-
     setSaving(true);
     try {
       const res = await fetch("/api/finance/cash/tx", {
@@ -148,7 +189,9 @@ export function TxDialog({
           occurredOn,
           note: note.trim() || null,
           personId: needsPerson && personId !== PERSON_NONE ? personId : null,
-          rateToRub: needsRate && Number.isFinite(rateNum) && rateNum > 0 ? rateNum : null,
+          // Историческое имя поля: это курс к БАЗОВОЙ валюте (сому), см. 0043
+          rateToRub:
+            needsRate && Number.isFinite(rateNumber) && rateNumber > 0 ? rateNumber : null,
         }),
       });
       const data = await res.json();
@@ -211,7 +254,7 @@ export function TxDialog({
           )}
 
           <div className="grid gap-1.5">
-            <Label htmlFor="tx-amount">Сумма{currency !== "rub" ? `, ${currency === "cny" ? "¥" : "сум"}` : ", ₽"}</Label>
+            <Label htmlFor="tx-amount">Сумма, {sign}</Label>
             <Input
               id="tx-amount"
               inputMode="decimal"
@@ -220,6 +263,35 @@ export function TxDialog({
               placeholder="Например: 25000"
               autoFocus
             />
+            {inBase != null && (
+              <p className="text-[11px] text-muted-foreground">≈ {formatSom(inBase)}</p>
+            )}
+          </div>
+
+          <div className="grid gap-1.5">
+            <Label>Валюта</Label>
+            <Select value={currency} onValueChange={(v) => v && pickCurrency(v as Currency)}>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {CURRENCY_CODES.map((c) => {
+                  const has = accounts.some((a) => a.currency === c);
+                  return (
+                    <SelectItem key={c} value={c}>
+                      {CURRENCY_LABEL[c]}
+                      {has ? "" : " · нет счёта"}
+                    </SelectItem>
+                  );
+                })}
+              </SelectContent>
+            </Select>
+            {noAccountInCurrency && (
+              <p className="text-[11px] text-amber-400">
+                Счёта в {sign} нет. Завести его можно в «Кассе» — операция без счёта не
+                запишется.
+              </p>
+            )}
           </div>
 
           <div className="grid gap-1.5">
@@ -249,10 +321,9 @@ export function TxDialog({
                 <SelectValue placeholder="Выберите счёт" />
               </SelectTrigger>
               <SelectContent>
-                {accounts.map((a) => (
+                {accountsInCurrency.map((a) => (
                   <SelectItem key={a.id} value={a.id}>
-                    {a.name}
-                    {a.currency !== "rub" ? ` · ${a.currency === "cny" ? "¥" : "сум"}` : ""}
+                    {a.name} · {CURRENCY_SIGN[a.currency]}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -271,8 +342,7 @@ export function TxDialog({
                     .filter((a) => a.id !== accountId)
                     .map((a) => (
                       <SelectItem key={a.id} value={a.id}>
-                        {a.name}
-                        {a.currency !== "rub" ? ` · ${a.currency === "cny" ? "¥" : "сум"}` : ""}
+                        {a.name} · {CURRENCY_SIGN[a.currency]}
                       </SelectItem>
                     ))}
                 </SelectContent>
@@ -323,7 +393,7 @@ export function TxDialog({
           {crossCurrency && (
             <div className="grid gap-1.5">
               <Label htmlFor="tx-amount-to">
-                Зачислено, {toAccount?.currency === "cny" ? "¥" : toAccount?.currency === "uzs" ? "сум" : "₽"}
+                Зачислено, {CURRENCY_SIGN[toAccount?.currency ?? BASE_CURRENCY]}
               </Label>
               <Input
                 id="tx-amount-to"
@@ -337,17 +407,18 @@ export function TxDialog({
 
           {needsRate && (
             <div className="grid gap-1.5">
-              <Label htmlFor="tx-rate">Курс к рублю</Label>
+              <Label htmlFor="tx-rate">Курс к сому</Label>
               <Input
                 id="tx-rate"
                 inputMode="decimal"
                 value={rate}
                 onChange={(e) => setRate(e.target.value)}
-                placeholder={String(EXCHANGE_RATES[currency] ?? 1)}
+                placeholder={formatRate(rateToBase(currency, rates))}
               />
               <p className="text-[11px] text-muted-foreground">
-                Пусто — возьмём общий курс ({formatMoney(1, currency)} ≈{" "}
-                {EXCHANGE_RATES[currency] ?? 1} ₽)
+                Пусто — возьмём курс из «Валют»: 1 {sign} ={" "}
+                {formatRate(rateToBase(currency, rates))} сом. Свой курс нужен, когда
+                обменяли по другому.
               </p>
             </div>
           )}
@@ -367,7 +438,7 @@ export function TxDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>
             Отмена
           </Button>
-          <Button onClick={submit} disabled={saving || accounts.length === 0}>
+          <Button onClick={submit} disabled={saving || accounts.length === 0 || !accountId}>
             {saving ? "Сохранение…" : "Записать"}
           </Button>
         </DialogFooter>
@@ -382,6 +453,7 @@ export function AddTxButton({
   accounts,
   categories,
   members = [],
+  rates,
   defaultCategoryId = "",
   defaultPersonId = "",
   label,
@@ -392,6 +464,7 @@ export function AddTxButton({
   accounts: AccountOpt[];
   categories: ExpenseCategory[];
   members?: MemberOpt[];
+  rates?: CurrencyRateMap;
   defaultCategoryId?: string;
   defaultPersonId?: string;
   label: string;
@@ -412,6 +485,7 @@ export function AddTxButton({
         accounts={accounts}
         categories={categories}
         members={members}
+        rates={rates}
         defaultCategoryId={defaultCategoryId}
         defaultPersonId={defaultPersonId}
         lockKind={lockKind}

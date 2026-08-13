@@ -6,6 +6,7 @@ import {
   Boxes,
   CalendarRange,
   ClipboardCheck,
+  Coins,
   CreditCard,
   Factory,
   FileText,
@@ -65,6 +66,9 @@ const NAV: NavGroup[] = [
   {
     section: "Управление",
     items: [
+      // Ведёт на вкладку «Финансы → Валюты»: курс к сому — множитель под всеми
+      // суммами компании, поэтому строка в меню у тех, кто его сводит
+      { href: "/finance/currencies", label: "Валюты", icon: Coins, permission: "currency:manage" },
       { href: "/team", label: "Команда", icon: Users, permission: "team:manage" },
       { href: "/settings/integrations", label: "Интеграции", icon: Plug, permission: "integrations:manage" },
       { href: "/tariffs", label: "Тарифы", icon: CreditCard, permission: "tariffs:manage" },
@@ -85,6 +89,13 @@ export function AppSidebar({
     items: g.items.filter((item) => can(role, item.permission)),
   })).filter((g) => g.items.length > 0);
 
+  // Подсвечиваем ОДНУ строку — с самым длинным совпадением пути. Иначе на
+  // /finance/currencies горели бы сразу «Финансы» и «Валюты».
+  const activeHref = groups
+    .flatMap((g) => g.items.map((i) => i.href))
+    .filter((href) => pathname === href || pathname.startsWith(href + "/"))
+    .sort((a, b) => b.length - a.length)[0];
+
   return (
     <aside className="flex h-svh w-56 shrink-0 flex-col border-r border-border bg-sidebar">
       <div className="flex h-14 items-center gap-2 border-b border-border px-4">
@@ -103,8 +114,7 @@ export function AppSidebar({
               </div>
             )}
             {group.items.map((item) => {
-              const active =
-                pathname === item.href || pathname.startsWith(item.href + "/");
+              const active = item.href === activeHref;
               return (
                 <Link
                   key={item.href}

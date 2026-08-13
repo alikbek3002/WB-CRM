@@ -11,7 +11,7 @@ import {
 // Вкладки «Остатков»: FBO (склады WB) / FBS (личные склады) / Фул-фирма.
 // Панели приходят готовыми серверными ReactNode — здесь только переключение.
 // URL обновляем через replaceState (без RSC-перерендера): ?tab=fbs|ff,
-// остальные параметры (category/brand/product FBO-фильтров) не трогаем.
+// остальные параметры (общие category/brand/product фильтры) не трогаем.
 export function StocksTabs({
   defaultTab,
   fbo,

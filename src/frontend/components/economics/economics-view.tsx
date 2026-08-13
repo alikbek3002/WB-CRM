@@ -5,7 +5,7 @@ import Link from "next/link";
 import { ArrowDown, ArrowUp, ImageOff } from "lucide-react";
 import { Badge } from "@/frontend/components/ui/badge";
 import { Card, CardContent } from "@/frontend/components/ui/card";
-import { formatNumber, formatRub } from "@/shared/format";
+import { formatNumber, formatSom } from "@/shared/format";
 import { cn } from "@/shared/utils";
 import type { UnitEconRow, UnitEconView } from "@/shared/types";
 
@@ -60,13 +60,13 @@ export function EconomicsView({ view }: { view: UnitEconView }) {
 
   const t = view.totals;
   const kpis = [
-    { label: "Выручка", value: formatRub(t.revenueRub) },
-    { label: "Удержания WB", value: formatRub(t.wbFeesRub) },
-    { label: "Реклама", value: formatRub(t.advertRub) },
-    { label: "Себестоимость", value: formatRub(t.cogsRub) },
+    { label: "Выручка", value: formatSom(t.revenueRub) },
+    { label: "Удержания WB", value: formatSom(t.wbFeesRub) },
+    { label: "Реклама", value: formatSom(t.advertRub) },
+    { label: "Себестоимость", value: formatSom(t.cogsRub) },
     {
       label: "Прибыль",
-      value: formatRub(t.profitRub),
+      value: formatSom(t.profitRub),
       sub: `маржа ${t.marginPct}%`,
       cls: profitClass(t.profitRub),
     },
@@ -128,23 +128,23 @@ export function EconomicsView({ view }: { view: UnitEconView }) {
         </div>
       </td>
       <td className="px-2 py-2 text-right tabular-nums">{formatNumber(r.saleQty)}</td>
-      <td className="px-2 py-2 text-right tabular-nums">{formatRub(r.revenueRub)}</td>
+      <td className="px-2 py-2 text-right tabular-nums">{formatSom(r.revenueRub)}</td>
       <td className="px-2 py-2 text-right tabular-nums text-muted-foreground">
-        {formatRub(r.commissionRub + r.acquiringRub)}
+        {formatSom(r.commissionRub + r.acquiringRub)}
       </td>
       <td className="px-2 py-2 text-right tabular-nums text-muted-foreground">
-        {formatRub(r.logisticsRub)}
+        {formatSom(r.logisticsRub)}
       </td>
       <td className="px-2 py-2 text-right tabular-nums text-muted-foreground">
-        {formatRub(r.storageRub)}
+        {formatSom(r.storageRub)}
       </td>
       <td className="px-2 py-2 text-right tabular-nums text-muted-foreground">
-        {otherFees(r) !== 0 ? formatRub(otherFees(r)) : "—"}
+        {otherFees(r) !== 0 ? formatSom(otherFees(r)) : "—"}
       </td>
       <td className="px-2 py-2 text-right tabular-nums text-muted-foreground">
         {r.advertRub !== 0 ? (
           <>
-            {formatRub(r.advertRub)}
+            {formatSom(r.advertRub)}
             {r.drrPct > 0 && (
               <span className="ml-1 text-[11px]">({r.drrPct}%)</span>
             )}
@@ -155,7 +155,7 @@ export function EconomicsView({ view }: { view: UnitEconView }) {
       </td>
       <td className="px-2 py-2 text-right tabular-nums text-muted-foreground">
         {r.cogsRub > 0 ? (
-          formatRub(r.cogsRub)
+          formatSom(r.cogsRub)
         ) : r.nmId > 0 && r.saleQty > 0 ? (
           <span className="text-amber-400" title="Себестоимость не заполнена — прибыль завышена">
             нет себест.
@@ -165,7 +165,7 @@ export function EconomicsView({ view }: { view: UnitEconView }) {
         )}
       </td>
       <td className={cn("px-2 py-2 text-right font-medium tabular-nums", profitClass(r.profitRub))}>
-        {formatRub(r.profitRub)}
+        {formatSom(r.profitRub)}
       </td>
       <td className={cn("px-2 py-2 text-right tabular-nums", profitClass(r.profitRub))}>
         {r.revenueRub !== 0 ? `${r.marginPct}%` : "—"}
@@ -273,19 +273,19 @@ export function EconomicsView({ view }: { view: UnitEconView }) {
                     {formatNumber(t.saleQty)}
                   </td>
                   <td className="px-2 py-2 text-right tabular-nums">
-                    {formatRub(t.revenueRub)}
+                    {formatSom(t.revenueRub)}
                   </td>
                   <td className="px-2 py-2 text-right tabular-nums" colSpan={4}>
-                    удержания {formatRub(t.wbFeesRub)}
+                    удержания {formatSom(t.wbFeesRub)}
                   </td>
                   <td className="px-2 py-2 text-right tabular-nums">
-                    {formatRub(t.advertRub)}
+                    {formatSom(t.advertRub)}
                   </td>
                   <td className="px-2 py-2 text-right tabular-nums">
-                    {formatRub(t.cogsRub)}
+                    {formatSom(t.cogsRub)}
                   </td>
                   <td className={cn("px-2 py-2 text-right tabular-nums", profitClass(t.profitRub))}>
-                    {formatRub(t.profitRub)}
+                    {formatSom(t.profitRub)}
                   </td>
                   <td className={cn("px-2 py-2 text-right tabular-nums", profitClass(t.profitRub))}>
                     {t.marginPct}%

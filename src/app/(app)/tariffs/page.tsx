@@ -8,7 +8,7 @@ import {
   CardTitle,
 } from "@/frontend/components/ui/card";
 import { NoAccess } from "@/frontend/components/layout/no-access";
-import { formatNumber, formatRub } from "@/shared/format";
+import { formatNumber, formatSom } from "@/shared/format";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getTariffs } from "@/backend/data";
@@ -43,7 +43,7 @@ export default async function TariffsPage() {
               </CardTitle>
               <CardDescription>
                 <span className="text-xl font-semibold text-foreground">
-                  {t.priceMonth === 0 ? "0 ₽" : formatRub(t.priceMonth)}
+                  {t.priceMonth === 0 ? "0 сом" : formatSom(t.priceMonth)}
                 </span>{" "}
                 / мес
               </CardDescription>

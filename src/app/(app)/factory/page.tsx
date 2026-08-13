@@ -2,7 +2,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/frontend/components/
 import { Badge } from "@/frontend/components/ui/badge";
 import { NoAccess } from "@/frontend/components/layout/no-access";
 import { FactoryForm } from "@/frontend/components/factory/factory-form";
-import { formatNumber, formatRub } from "@/shared/format";
+import { CURRENCY_LABEL } from "@/shared/currency";
+import { formatNumber, formatSom } from "@/shared/format";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getFactories } from "@/backend/data";
@@ -32,7 +33,8 @@ export default async function FactoryPage() {
         <div>
           <h1 className="text-xl font-semibold tracking-tight">Фабрики</h1>
           <p className="text-sm text-muted-foreground">
-            Производители (Китай / Узбекистан): сколько отшили, на какую сумму, что в пути
+            Производители (Китай / Узбекистан): сколько отшили, на какую сумму (в сомах по
+            курсу из «Валют»), что в пути
             {!canEdit && " · только просмотр"}
           </p>
         </div>
@@ -50,8 +52,8 @@ export default async function FactoryPage() {
         </Card>
         <Card className="py-4">
           <CardContent className="px-4">
-            <div className="text-xs text-muted-foreground">Сумма отшивки + карго</div>
-            <div className="mt-1 text-2xl font-semibold tabular-nums">{formatRub(totalSum)}</div>
+            <div className="text-xs text-muted-foreground">Сумма отшивки + карго, сом</div>
+            <div className="mt-1 text-2xl font-semibold tabular-nums">{formatSom(totalSum)}</div>
           </CardContent>
         </Card>
         <Card className="py-4">
@@ -68,15 +70,20 @@ export default async function FactoryPage() {
             <CardHeader className="px-4">
               <div className="flex items-center justify-between gap-2">
                 <CardTitle className="text-base">{f.name}</CardTitle>
-                <Badge variant="secondary" className="text-[10px]">
-                  {COUNTRY[f.country]}
-                </Badge>
+                <div className="flex items-center gap-1.5">
+                  <Badge variant="outline" className="text-[10px]">
+                    {CURRENCY_LABEL[f.currency]}
+                  </Badge>
+                  <Badge variant="secondary" className="text-[10px]">
+                    {COUNTRY[f.country]}
+                  </Badge>
+                </div>
               </div>
               {f.note && <p className="text-xs text-muted-foreground">{f.note}</p>}
             </CardHeader>
             <CardContent className="grid grid-cols-2 gap-x-4 gap-y-3 px-4 sm:grid-cols-4">
               <Metric label="Отшито, шт" value={formatNumber(f.shippedQty)} />
-              <Metric label="Сумма, ₽" value={formatRub(f.shippedSumRub)} />
+              <Metric label="Сумма, сом" value={formatSom(f.shippedSumRub)} />
               <Metric label="Поставок" value={String(f.suppliesCount)} />
               <Metric label="В пути" value={String(f.inTransitCount)} />
               <Metric

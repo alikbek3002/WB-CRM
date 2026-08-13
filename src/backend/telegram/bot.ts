@@ -13,6 +13,7 @@ import type { Context } from "grammy";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { ROLE_LABELS, can, isMemberRole, type MemberRole } from "../../shared/rbac";
 import { SUPPLY_AUTO_ARRIVE_DAYS, DEMO_ORG_ID, DEMO_STORE_ID } from "../../shared/constants";
+import { currencySign } from "../../shared/format";
 import { askAssistant, aiConfigured, type ChatMessage } from "../ai/assistant";
 import { buildSnapshot } from "../ai/snapshot";
 import { transcribeTelegramVoice } from "../ai/transcribe";
@@ -410,7 +411,7 @@ function short(s: string, max = 28): string {
 const RULE = "──────────";
 
 function rub(n: number): string {
-  return num(n) + " ₽";
+  return num(n) + " сом";
 }
 
 // Количества тоже с разделителями разрядов: «131 809 шт», а не «131809 шт»
@@ -1064,7 +1065,7 @@ async function renderPnl(): Promise<string> {
   const view = await getPnlView(admin(), 3);
   const t = view.total;
   const mark = t.netRub >= 0 ? "🟢" : "🔴";
-  const cur = view.currency === "RUB" ? "₽" : view.currency === "KGS" ? "сом" : view.currency;
+  const cur = currencySign(view.currency);
   const money = (v: number) => `${num(v)} ${cur}`;
 
   const lines = [
@@ -1108,7 +1109,7 @@ async function renderPnl(): Promise<string> {
   }
 
   if (view.wbBalance) {
-    const bcur = view.wbBalance.currency === "RUB" ? "₽" : view.wbBalance.currency === "KGS" ? "сом" : view.wbBalance.currency;
+    const bcur = currencySign(view.wbBalance.currency);
     lines.push("", RULE, "", `🟣 На балансе WB — <b>${num(view.wbBalance.current)} ${bcur}</b>`);
   }
 
@@ -1322,7 +1323,7 @@ async function renderPayouts(user: AuthedUser): Promise<{ body: string; kb: Inli
   if (active.length) {
     lines.push("", RULE, "", "<b>В РАБОТЕ</b>");
     for (const p of active.slice(0, 8)) {
-      const cur = p.currency === "rub" ? "₽" : p.currency === "cny" ? "¥" : p.currency === "kgs" ? "сом" : "сум";
+      const cur = currencySign(p.currency);
       lines.push(
         "",
         `${PAYOUT_STATUS_EMOJI[p.status] ?? "▪️"} <b>${esc(p.title)}</b> — ${num(p.amount)} ${cur}`,

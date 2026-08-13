@@ -5,7 +5,6 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { DEMO_STORE_ID } from "@/shared/constants";
-import { syncWbPayoutsToCash } from "@/backend/data/cash-core";
 import {
   decodeTokenMeta,
   fetchAcceptanceReport,
@@ -17,6 +16,7 @@ import {
   fetchCommissionTariffs,
   fetchFbsStocks,
   fetchFbsWarehouses,
+  fetchFbwWarehouses,
   fetchFinanceReport,
   fetchSalesFunnelHistory,
   fetchOrders,
@@ -25,10 +25,14 @@ import {
   fetchSales,
   fetchSellerInfo,
   fetchWarehouseRemains,
+  fetchWbOffices,
+  officeCity,
   fetchWbSupplyDetail,
   fetchWbSupplyGoods,
   fetchWbSupplyList,
   getWbToken,
+  type WbFbwWarehouse,
+  type WbOffice,
 } from "./client";
 
 // Локальная дата yyyy-mm-dd (пояс UTC+5/6 — не toISOString)
@@ -399,7 +403,37 @@ export async function runWbSync(
   // (наполняет источник cards). Бюджет: 1 запрос складов + склады × чанки
   // по 1000 chrtId ≈ 15 запросов; лимит 300/мин — с большим запасом.
   if (want.has("fbs")) await runSource(db, "fbs", isoDate(new Date()), async () => {
-    const warehouses = await fetchFbsWarehouses(token);
+    // Офисы тянем тем же скоупом: только из них WB отдаёт ГОРОД точки
+    // разгрузки. Имя личного склада — прозвище подрядчика («Фбс каз» стоит в
+    // Ульяновске), поэтому город берём по officeId, а не из названия.
+    const [warehouses, offices] = await Promise.all([
+      fetchFbsWarehouses(token),
+      fetchWbOffices(token).catch(() => [] as WbOffice[]),
+    ]);
+    if (offices.length > 0) {
+      await chunkedUpsert(
+        db,
+        "wb_offices",
+        offices.map((o) => ({
+          store_id: DEMO_STORE_ID,
+          office_id: o.id,
+          name: o.name,
+          city: officeCity(o),
+          address: o.address ?? null,
+          federal_district: o.federalDistrict ?? null,
+          cargo_type: o.cargoType ?? null,
+          delivery_type: o.deliveryType ?? null,
+          synced_at: new Date().toISOString(),
+        })),
+        "store_id,office_id",
+      );
+    }
+
+    const cityByOffice = new Map<number, string>();
+    for (const o of offices) {
+      const city = officeCity(o);
+      if (city) cityByOffice.set(o.id, city);
+    }
     if (warehouses.length > 0) {
       await chunkedUpsert(
         db,
@@ -409,6 +443,7 @@ export async function runWbSync(
           warehouse_id: w.id,
           name: w.name,
           office_id: w.officeId ?? null,
+          city: w.officeId != null ? cityByOffice.get(w.officeId) ?? null : null,
           cargo_type: w.cargoType ?? null,
           delivery_type: w.deliveryType ?? null,
           is_deleting: Boolean(w.isDeleting),
@@ -775,6 +810,27 @@ export async function runWbSync(
     const minDate = new Date();
     minDate.setDate(minDate.getDate() - 90);
 
+    // Заодно обновляем справочник складов WB (тот же скоуп «Поставки»): из
+    // него выбирают склад при распределении партии — раньше его вбивали руками.
+    const fbw = await fetchFbwWarehouses(token!).catch(() => [] as WbFbwWarehouse[]);
+    if (fbw.length > 0) {
+      await chunkedUpsert(
+        db,
+        "wb_warehouses",
+        fbw.map((w) => ({
+          store_id: DEMO_STORE_ID,
+          wb_id: w.ID,
+          name: w.name,
+          address: w.address ?? null,
+          work_time: w.workTime ?? null,
+          is_active: w.isActive !== false,
+          is_transit_active: Boolean(w.isTransitActive),
+          synced_at: new Date().toISOString(),
+        })),
+        "store_id,wb_id",
+      );
+    }
+
     const list = await fetchWbSupplyList(token!, 500);
     const changed = list
       .filter((s) => {
@@ -1033,17 +1089,13 @@ export async function runWbSync(
     return n;
   }, counts, errors);
 
-  // ── Выплаты WB → приход в кассу ──────────────────────────────────────────
-  // Маркетплейс перечисляет деньги за отчётный период — заводим это приходом
-  // автоматически, иначе касса врёт до тех пор, пока кто-то не внесёт руками.
-  if (want.has("finance")) await runSource(db, "wb-payouts", null, async () => {
-    const res = await syncWbPayoutsToCash(
-      db,
-      { id: "", name: "Синхронизация WB", role: "owner", roleLabel: "Система" },
-      120,
-    );
-    return res.created;
-  }, counts, errors);
+  // ── Выплаты WB в кассу больше НЕ заводятся автоматически (0045) ──────────
+  // Раньше здесь вызывался syncWbPayoutsToCash: приход на «итого к оплате» из
+  // шапки отчёта реализации. На расчётный счёт приходит другое — WB держит
+  // деньги до вывода, удерживает по другим периодам и платит частями, — поэтому
+  // касса показывала суммы, которых на счетах нет. Теперь поступления вносит
+  // человек (по выписке) или закрывает сверкой остатка в «Финансы → Касса».
+  // Сколько маркетплейс ещё должен, видно строкой «В кабинете WB» (wb_balance).
 
   // ── Баланс кабинета WB (сколько маркетплейс должен продавцу) ─────────────
   if (want.has("finance")) await runSource(db, "balance", null, async () => {

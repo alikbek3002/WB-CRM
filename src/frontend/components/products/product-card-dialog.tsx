@@ -15,7 +15,7 @@ import {
   catalogContext,
   RecoButton,
 } from "@/frontend/components/products/reco-button";
-import { formatNumber, formatRub } from "@/shared/format";
+import { formatNumber, formatSom } from "@/shared/format";
 import type {
   CostPriceSource,
   ProductGroup,
@@ -152,7 +152,7 @@ function CostBreakdown({ product }: { product: ProductListItem }) {
 
   return (
     <span className="mt-0.5 block text-[10px] font-normal leading-tight text-muted-foreground">
-      {parts.map((p) => `${p.label} ${formatRub(p.value)}`).join(" + ")}
+      {parts.map((p) => `${p.label} ${formatSom(p.value)}`).join(" + ")}
     </span>
   );
 }
@@ -287,12 +287,12 @@ export function ProductDialog({
               {product.priceDiscountedWb !== null && (
                 <div className="flex items-baseline gap-2">
                   <span className="text-2xl font-semibold tabular-nums">
-                    {formatRub(product.priceDiscountedWb)}
+                    {formatSom(product.priceDiscountedWb)}
                   </span>
                   {product.priceWb !== null &&
                     product.priceWb > product.priceDiscountedWb && (
                       <span className="text-sm text-muted-foreground line-through tabular-nums">
-                        {formatRub(product.priceWb)}
+                        {formatSom(product.priceWb)}
                       </span>
                     )}
                   <span className="text-xs text-muted-foreground">цена WB</span>
@@ -320,7 +320,7 @@ export function ProductDialog({
                 </span>
                 <span className="text-muted-foreground">Себестоимость</span>
                 <span className="text-right tabular-nums">
-                  {formatRub(product.costPrice)}
+                  {formatSom(product.costPrice)}
                   {costSourceLabel(product) && (
                     <span className="ml-1.5 text-[10px] text-muted-foreground">
                       {costSourceLabel(product)}
@@ -380,7 +380,7 @@ export function ProductDialog({
                           <span className="text-muted-foreground">{r.label}</span>
                           <span className="tabular-nums">
                             {r.value > 0 ? "" : "−"}
-                            {formatRub(Math.abs(r.value))}
+                            {formatSom(Math.abs(r.value))}
                           </span>
                         </div>
                       ))}
@@ -395,7 +395,7 @@ export function ProductDialog({
                               : ""
                         }`}
                       >
-                        {formatRub(product.econ.profitPerUnitRub)}
+                        {formatSom(product.econ.profitPerUnitRub)}
                       </span>
                     </div>
                     <div className="flex justify-between text-xs text-muted-foreground">
@@ -404,7 +404,7 @@ export function ProductDialog({
                         {product.econ.costPrice > 0 && ` · ROI ${product.econ.roiPct}%`}
                       </span>
                       <span className="tabular-nums">
-                        за период: {formatRub(product.econ.profitRub)}
+                        за период: {formatSom(product.econ.profitRub)}
                       </span>
                     </div>
                     {product.econ.costPrice <= 0 && (

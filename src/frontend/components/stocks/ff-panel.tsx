@@ -7,14 +7,14 @@ import {
   CardHeader,
   CardTitle,
 } from "@/frontend/components/ui/card";
-import { formatNumber, formatRub } from "@/shared/format";
+import { formatNumber, formatSom } from "@/shared/format";
 import { getFulfillment, getFulfillmentPartners } from "@/backend/data";
 import type { Supply } from "@/shared/types";
 
 const qtyOf = (s: Supply) => s.receivedQty ?? s.quantity;
 
 // Вкладка «Фул-фирма» на Остатках: сколько товара сейчас в обработке у
-// фул-фирмы и во что обработка обходится («приняли N шт × тариф ₽/шт = сумма»).
+// фул-фирмы и во что обработка обходится («приняли N шт × тариф сом/шт = сумма»).
 // Данные — модуль /fulfillment (computeFulfillment), тут только срез и ссылка.
 export async function FfPanel() {
   const [f, partners] = await Promise.all([
@@ -31,9 +31,9 @@ export async function FfPanel() {
     { label: "У фул-фирмы сейчас", value: formatNumber(inProcessingQty) + " шт" },
     { label: "В разборе", value: formatNumber(f.sortingQty) + " шт" },
     { label: "Лежит на складе", value: formatNumber(f.inStockQty) + " шт" },
-    { label: "Начислено за услуги", value: formatRub(f.chargedRub) },
-    { label: "Оплачено", value: formatRub(f.paidRub) },
-    { label: "Долг фул-фирме", value: formatRub(f.owedRub) },
+    { label: "Начислено за услуги", value: formatSom(f.chargedRub) },
+    { label: "Оплачено", value: formatSom(f.paidRub) },
+    { label: "Долг фул-фирме", value: formatSom(f.owedRub) },
   ];
 
   // «Принято всего» по партнёру — включая распределённые: формула начисления
@@ -78,7 +78,7 @@ export async function FfPanel() {
               <thead>
                 <tr className="border-b border-border/60 text-xs text-muted-foreground">
                   <th className="px-4 py-2 text-left font-normal">Фул-фирма</th>
-                  <th className="px-2 py-2 text-right font-normal">Тариф, ₽/шт</th>
+                  <th className="px-2 py-2 text-right font-normal">Тариф, сом/шт</th>
                   <th className="px-2 py-2 text-right font-normal">Принято, шт</th>
                   <th className="px-2 py-2 text-right font-normal">Начислено</th>
                   <th className="px-4 py-2 text-right font-normal">Долг</th>
@@ -89,20 +89,20 @@ export async function FfPanel() {
                   <tr key={p.id} className="border-b border-border/40 last:border-0">
                     <td className="px-4 py-2 font-medium">{p.name}</td>
                     <td className="px-2 py-2 text-right tabular-nums">
-                      {formatRub(p.ratePerUnitRub)}
+                      {formatSom(p.ratePerUnitRub)}
                     </td>
                     <td className="px-2 py-2 text-right tabular-nums">
                       {formatNumber(qtyByPartner.get(p.id) ?? 0)}
                     </td>
                     <td className="px-2 py-2 text-right tabular-nums">
-                      {formatRub(p.chargedRub)}
+                      {formatSom(p.chargedRub)}
                     </td>
                     <td
                       className={`px-4 py-2 text-right tabular-nums ${
                         p.owedRub > 0 ? "text-amber-400" : "text-muted-foreground"
                       }`}
                     >
-                      {formatRub(p.owedRub)}
+                      {formatSom(p.owedRub)}
                     </td>
                   </tr>
                 ))}
@@ -159,7 +159,7 @@ export async function FfPanel() {
                 className="w-28 text-right text-sm tabular-nums"
                 title="Начислено фул-фирме за партию (факт или тариф × принято)"
               >
-                {s.fulfillmentRub > 0 ? formatRub(s.fulfillmentRub) : "—"}
+                {s.fulfillmentRub > 0 ? formatSom(s.fulfillmentRub) : "—"}
               </span>
             </div>
           ))}

@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { DEMO_ORG_ID, DEMO_STORE_ID, EXCHANGE_RATES } from "@/shared/constants";
+import { DEMO_ORG_ID, DEMO_STORE_ID } from "@/shared/constants";
+import { CURRENCY_CODES, rateToBase } from "@/shared/currency";
+import { readCurrencyRateMap } from "@/backend/data/currency-core";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
@@ -19,7 +21,7 @@ const itemSchema = z.object({
   title: z.string().trim().min(1).max(200),
   quantity: z.number().int().min(0),
   sewingCost: z.number().min(0),
-  sewingCurrency: z.enum(["cny", "uzs", "rub"]),
+  sewingCurrency: z.enum(CURRENCY_CODES),
 });
 
 const supplySchema = z.object({
@@ -29,12 +31,15 @@ const supplySchema = z.object({
   quantity: z.number().int().min(0),
   shipDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   sewingCost: z.number().min(0),
-  sewingCurrency: z.enum(["cny", "uzs", "rub"]),
+  sewingCurrency: z.enum(CURRENCY_CODES),
   cargoCost: z.number().min(0),
-  cargoCurrency: z.enum(["cny", "uzs", "rub"]),
+  cargoCurrency: z.enum(CURRENCY_CODES),
   // Несколько товаров в одном карго. Пусто — карточка старой схемы «один товар».
   items: z.array(itemSchema).max(50).optional(),
   fulfillmentPartnerId: z.string().nullable().optional(),
+  // Куда разгружаем карго (0042): город фул-фирмы. Фиксируем на карточке —
+  // подрядчика могут сменить, а факт «партия приехала в Казань» остаётся.
+  unloadCity: z.string().trim().max(120).nullable().optional(),
 });
 
 export async function POST(request: Request) {
@@ -78,9 +83,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "invalid_partner_id" }, { status: 400 });
   }
 
-  // Курсы фиксируем на дату заведения: EXCHANGE_RATES — правимая константа, и
-  // без фиксации её правка задним числом переписала бы себестоимость партии.
-  const rateOf = (c: string) => EXCHANGE_RATES[c] ?? 1;
+  // Курсы фиксируем на дату заведения: их правят руками во «Валютах», и без
+  // фиксации правка задним числом переписала бы себестоимость закрытой партии.
+  const rates = await readCurrencyRateMap(admin);
+  const rateOf = (c: string) => rateToBase(c, rates);
 
   // Шапка: количество и отшив — сумма по позициям (при их наличии)
   const headQty = items.length
@@ -103,6 +109,7 @@ export async function POST(request: Request) {
       cargo_currency: parsed.data.cargoCurrency,
       cargo_rate_to_rub: rateOf(parsed.data.cargoCurrency),
       fulfillment_partner_id: partnerId,
+      unload_city: parsed.data.unloadCity?.trim() || null,
       status: "in_transit",
     })
     .select("id")

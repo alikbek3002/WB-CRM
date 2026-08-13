@@ -33,7 +33,7 @@ import {
   catalogContext,
   RecoButton,
 } from "@/frontend/components/products/reco-button";
-import { formatNumber, formatRub } from "@/shared/format";
+import { formatNumber, formatSom } from "@/shared/format";
 import type { ProductGroup, ProductListItem } from "@/shared/types";
 
 type ViewMode = "cards" | "table";
@@ -117,12 +117,12 @@ function GridCard({
             {product.priceDiscountedWb !== null ? (
               <>
                 <span className="text-base font-semibold tabular-nums">
-                  {formatRub(product.priceDiscountedWb)}
+                  {formatSom(product.priceDiscountedWb)}
                 </span>
                 {product.priceWb !== null &&
                   product.priceWb > product.priceDiscountedWb && (
                     <span className="text-xs text-muted-foreground line-through tabular-nums">
-                      {formatRub(product.priceWb)}
+                      {formatSom(product.priceWb)}
                     </span>
                   )}
               </>
@@ -240,10 +240,10 @@ function ProductsTable({
                   </TableCell>
                 )}
                 <TableCell className="text-right tabular-nums">
-                  {p.priceDiscountedWb !== null ? formatRub(p.priceDiscountedWb) : "—"}
+                  {p.priceDiscountedWb !== null ? formatSom(p.priceDiscountedWb) : "—"}
                 </TableCell>
                 <TableCell className="text-right tabular-nums">
-                  {formatRub(p.costPrice)}
+                  {formatSom(p.costPrice)}
                   {p.costPrice > 0 && p.costPriceSource !== "manual" && (
                     <span className="block text-[10px] text-muted-foreground">
                       {p.costPriceSource === "supply" ? "из поставки" : "импорт"}
@@ -260,7 +260,7 @@ function ProductsTable({
                   }`}
                   title={
                     p.econ
-                      ? `Прибыль ${formatRub(p.econ.profitPerUnitRub)}/шт за 30 дней`
+                      ? `Прибыль ${formatSom(p.econ.profitPerUnitRub)}/шт за 30 дней`
                       : "Продаж за 30 дней не было"
                   }
                 >

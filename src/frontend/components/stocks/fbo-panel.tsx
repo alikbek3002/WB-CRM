@@ -8,7 +8,7 @@ import {
   CardTitle,
 } from "@/frontend/components/ui/card";
 import { StockFilters } from "@/frontend/components/stocks/stock-filters";
-import { formatNumber, formatRub } from "@/shared/format";
+import { formatNumber, formatSom } from "@/shared/format";
 import { cn } from "@/shared/utils";
 import type { ProductListItem, StocksOverview, WbIncomeGroup } from "@/shared/types";
 import { getProductStocks, getProductWarehouseOrders } from "@/backend/data";
@@ -311,7 +311,7 @@ export async function FboPanel({
                   <span className="block truncate text-sm font-medium">{p.title}</span>
                   <span className="block text-xs text-muted-foreground">
                     арт. {p.nmId}
-                    {p.priceDiscountedWb !== null && ` · ${formatRub(p.priceDiscountedWb)}`}
+                    {p.priceDiscountedWb !== null && ` · ${formatSom(p.priceDiscountedWb)}`}
                   </span>
                 </span>
                 <span className="shrink-0 text-right">

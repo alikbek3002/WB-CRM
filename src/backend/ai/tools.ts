@@ -11,13 +11,23 @@
 // 30 минут показывает старые данные (см. cachedRead в backend/data/index.ts).
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { DEMO_ORG_ID, DEMO_STORE_ID, toRub } from "../../shared/constants";
+import { DEMO_ORG_ID, DEMO_STORE_ID } from "../../shared/constants";
+import {
+  BASE_CURRENCY,
+  CURRENCY_CODES,
+  CURRENCY_SIGN,
+  normalizeCurrency,
+  toBase,
+  type CurrencyRateMap,
+} from "../../shared/currency";
+import { readCurrencyRateMap } from "../data/currency-core";
 import { can, type MemberRole, type Permission } from "../../shared/rbac";
 import { applySupplyCost } from "../data/cost-core";
 import type { Currency, PayoutKind } from "../../shared/types";
 import {
-  CASH_NOTIFY_THRESHOLD_RUB,
+  CASH_NOTIFY_THRESHOLD,
   createCashTx,
+  reconcileAccount,
   createExpenseCategory,
   deleteCashTx,
   findAccounts,
@@ -62,9 +72,9 @@ export type ToolCtx = {
 const LEAD_ROLES = ["owner", "admin", "manager"];
 const isLead = (role: string) => LEAD_ROLES.includes(role);
 
-const CURRENCIES = ["cny", "uzs", "rub"] as const;
-// kgs в CURRENCIES нет (счета кассы — rub/cny/uzs), но заявки бывают в сомах
-const CURRENCY_LABEL: Record<string, string> = { cny: "¥", uzs: "сум", rub: "₽", kgs: "сом" };
+// Валюты системы; базовая — сом (shared/currency.ts). Доллар нужен фабрикам и
+// карго: счёт часто выставляют в USD.
+const CURRENCIES = CURRENCY_CODES;
 
 // Схемы-заготовки, чтобы описания инструментов не расползались
 const str = (description: string) => ({ type: "string", description });
@@ -241,8 +251,8 @@ const CATALOG: ToolSpec[] = [
     input_schema: obj(
       {
         product: str("Часть названия товара или артикул WB"),
-        cost_price: int("Себестоимость, ₽"),
-        logistics_cost: int("Логистика на единицу, ₽"),
+        cost_price: int("Себестоимость, сом"),
+        logistics_cost: int("Логистика на единицу, сом"),
         status: str("Статус карточки (например «Активный», «Новинка», «Архив»)"),
         category: str("Категория"),
         brand: str("Бренд"),
@@ -262,7 +272,7 @@ const CATALOG: ToolSpec[] = [
         vendor_code: str("Артикул продавца (необязательно)"),
         brand: str("Бренд (необязательно)"),
         category: str("Категория (необязательно)"),
-        cost_price: int("Себестоимость, ₽ (необязательно)"),
+        cost_price: int("Себестоимость, сом (необязательно)"),
       },
       ["nm_id", "title"],
     ),
@@ -273,12 +283,12 @@ const CATALOG: ToolSpec[] = [
     name: "set_sales_plan",
     permission: "finance:plan",
     description:
-      "Задать план продаж WB на период (сумма в рублях). Используй на «поставь план 30 млн на второе полугодие», «план на июль — 5 000 000».",
+      "Задать план продаж WB на период (сумма в сомах — кабинет считает в них). Используй на «поставь план 30 млн на второе полугодие», «план на июль — 5 000 000».",
     input_schema: obj(
       {
         period_start: str("Начало периода yyyy-mm-dd"),
         period_end: str("Конец периода yyyy-mm-dd"),
-        amount_rub: int("Сумма плана в рублях"),
+        amount_rub: int("Сумма плана в сомах"),
       },
       ["period_start", "period_end", "amount_rub"],
     ),
@@ -293,7 +303,7 @@ const CATALOG: ToolSpec[] = [
       "инструмент вернёт список: уточни у сотрудника, с какого платили. «Вчера» и другие относительные даты переведи в yyyy-mm-dd сам.",
     input_schema: obj(
       {
-        amount: int("Сумма расхода (в валюте счёта; для рублёвого счёта — рубли)"),
+        amount: int("Сумма расхода в валюте счёта (сомы, доллары, юани — как у счёта)"),
         category: str("Статья расхода словами: «реклама», «зарплата», «налоги», «карго», «закуп товара»…"),
         account: str("Название счёта, если известно: «наличные», «карта», «юани» (необязательно)"),
         note: str("За что именно (необязательно, но полезно)"),
@@ -301,10 +311,34 @@ const CATALOG: ToolSpec[] = [
         confirm: {
           type: "boolean",
           description:
-            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 ₽) отдельным сообщением",
+            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 сом) отдельным сообщением",
         },
       },
       ["amount", "category"],
+    ),
+  },
+  {
+    name: "reconcile_cash",
+    permission: "finance:expense",
+    description:
+      "СВЕРКА ОСТАТКА: сказать системе, сколько денег на счёте ФАКТИЧЕСКИ (по выписке или пересчёту наличных). " +
+      "Разницу с расчётом система запишет корректирующей операцией «Сверка кассы» — это основной способ " +
+      "поправить кассу, если в ней неверная сумма. Используй на «на расчётном счету сейчас 5 миллионов», " +
+      "«в кассе фактически 300 тысяч», «поправь остаток по карте до 0». " +
+      "Выплаты WB в кассу автоматически НЕ попадают — их вносят как поступление или закрывают сверкой.",
+    input_schema: obj(
+      {
+        balance: int("Фактический остаток на счёте в валюте счёта (0 — денег нет)"),
+        account: str("Название счёта: «расчётный счёт», «наличные», «карта»… (если счёт один — можно не указывать)"),
+        date: str("Дата сверки yyyy-mm-dd (по умолчанию сегодня)"),
+        note: str("Откуда цифра: «по выписке банка за 14.08» (необязательно)"),
+        confirm: {
+          type: "boolean",
+          description:
+            "true ТОЛЬКО если сотрудник явно подтвердил крупную правку (от 100 000 сом) отдельным сообщением",
+        },
+      },
+      ["balance"],
     ),
   },
   {
@@ -323,7 +357,7 @@ const CATALOG: ToolSpec[] = [
         confirm: {
           type: "boolean",
           description:
-            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 ₽) отдельным сообщением",
+            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 сом) отдельным сообщением",
         },
       },
       ["amount", "category"],
@@ -349,7 +383,7 @@ const CATALOG: ToolSpec[] = [
         confirm: {
           type: "boolean",
           description:
-            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 ₽) отдельным сообщением",
+            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 сом) отдельным сообщением",
         },
       },
       ["from_account", "to_account", "amount"],
@@ -455,7 +489,7 @@ const CATALOG: ToolSpec[] = [
     input_schema: obj(
       {
         employee: str("Имя сотрудника (например «Азиз» или «Назира»)"),
-        amount: int("Сумма выплаты (в валюте счёта; для рублёвого счёта — рубли)"),
+        amount: int("Сумма выплаты в валюте счёта (сомы, доллары, юани — как у счёта)"),
         kind: {
           type: "string",
           enum: ["salary", "bonus", "contractor", "reimbursement"],
@@ -471,7 +505,7 @@ const CATALOG: ToolSpec[] = [
         confirm: {
           type: "boolean",
           description:
-            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 ₽) отдельным сообщением",
+            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 сом) отдельным сообщением",
         },
       },
       ["employee", "amount", "kind"],
@@ -574,7 +608,7 @@ const CATALOG: ToolSpec[] = [
         confirm: {
           type: "boolean",
           description:
-            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 ₽) отдельным сообщением",
+            "true ТОЛЬКО если сотрудник явно подтвердил крупную сумму (от 100 000 сом) отдельным сообщением",
         },
       },
       ["payout"],
@@ -614,7 +648,7 @@ const CATALOG: ToolSpec[] = [
     name: "create_supply",
     permission: "supply:edit",
     description:
-      "Создать карточку отгрузки: фабрика, товар, количество, дата отгрузки, стоимость отшивки и карго (мультивалюта ¥/сум/₽). Используй на «заведи поставку с фабрики X — 500 пижам, отшивка 12000 юаней, карго 3000 юаней».",
+      "Создать карточку отгрузки: фабрика, товар, количество, дата отгрузки, стоимость отшивки и карго (мультивалюта ¥/$/сом/₽/сум). Используй на «заведи поставку с фабрики X — 500 пижам, отшивка 12000 юаней, карго 3000 юаней».",
     input_schema: obj(
       {
         factory: str("Название фабрики (найдём по части названия)"),
@@ -649,13 +683,17 @@ const CATALOG: ToolSpec[] = [
     name: "add_supply_payment",
     permission: "supply:pay",
     description:
-      "ДОБАВИТЬ РАСХОД — оплату по поставке: за товар (goods) или за карго (cargo), мультивалюта ¥/сум/₽. Используй на «оплатили фабрике 5000 юаней за пижамы», «запиши расход на карго 30000 рублей», «добавь оплату по поставке X».",
+      "ДОБАВИТЬ РАСХОД — оплату по поставке: за товар (goods) или за карго (cargo), мультивалюта ¥/$/сом/₽/сум. Используй на «оплатили фабрике 5000 юаней за пижамы», «запиши расход на карго 30000 рублей», «добавь оплату по поставке X».",
     input_schema: obj(
       {
         supply: str("Часть названия поставки, по которой платим"),
         kind: { type: "string", enum: ["goods", "cargo"], description: "За товар (goods) или за карго (cargo)" },
         amount: int("Сумма платежа"),
-        currency: { type: "string", enum: CURRENCIES, description: "Валюта: cny (юань), uzs (сум), rub (рубль)" },
+        currency: {
+          type: "string",
+          enum: CURRENCIES,
+          description: "Валюта: kgs (сом), usd (доллар), cny (юань), rub (рубль), uzs (сум)",
+        },
         paid_at: str("Дата оплаты yyyy-mm-dd (по умолчанию сегодня)"),
         note: str("Комментарий (необязательно)"),
       },
@@ -806,8 +844,22 @@ function num(n: number): string {
   return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Math.round(n));
 }
 
+// Знак валюты по свободной строке: модель может прислать «USD», «usd», «сом».
+function sign(currency: string): string {
+  const code = normalizeCurrency(currency);
+  return code ? CURRENCY_SIGN[code] : currency;
+}
+
 function money(amount: number, currency: string): string {
-  return `${num(amount)} ${CURRENCY_LABEL[currency] ?? currency}`;
+  return `${num(amount)} ${sign(currency)}`;
+}
+
+// «$ 87,5 / ¥ 12,2 / ₽ 1,1» — по каким курсам собрана сводка в сомах. Без этого
+// модель пересказывает суммы как факт, а сотрудник не понимает, откуда цифра.
+function rateHint(rates: CurrencyRateMap): string {
+  return CURRENCY_CODES.filter((c) => c !== BASE_CURRENCY)
+    .map((c) => `${CURRENCY_SIGN[c]} ${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 4 }).format(rates[c] ?? 0)}`)
+    .join(" / ");
 }
 
 const actorOf = (user: SnapshotUser): TaskActor => ({
@@ -894,7 +946,7 @@ async function resolveAccountStrict(
       ok: false,
       message:
         `С какого счёта проводим? Есть: ${all
-          .map((a) => `${a.name} (${CURRENCY_LABEL[a.currency] ?? a.currency})`)
+          .map((a) => `${a.name} (${sign(a.currency)})`)
           .join(", ")}. ` + "Спроси у сотрудника и повтори вызов с параметром account.",
     };
   }
@@ -904,9 +956,9 @@ async function resolveAccountStrict(
 // Стоп-кран на крупные суммы: без явного подтверждения человека операция не
 // проводится. Порог тот же, что у Telegram-пуша директору о крупных расходах.
 function confirmGate(amountRub: number, confirm: unknown, summary: string): string | null {
-  if (amountRub < CASH_NOTIFY_THRESHOLD_RUB || confirm === true) return null;
+  if (amountRub < CASH_NOTIFY_THRESHOLD || confirm === true) return null;
   return (
-    `Крупная сумма — ${num(amountRub)} ₽. Ничего не записано. ` +
+    `Крупная сумма — ${num(amountRub)} сом. Ничего не записано. ` +
     `Покажи сотруднику сводку (${summary}) и дождись явного «да», ` +
     "затем повтори вызов с confirm=true."
   );
@@ -957,7 +1009,17 @@ async function findProducts(db: SupabaseClient, query: string): Promise<ProductR
     .eq("store_id", DEMO_STORE_ID)
     .ilike("title", `%${likeSafe(q)}%`)
     .limit(8);
-  return (data ?? []) as ProductRow[];
+  if (data?.length) return data as ProductRow[];
+
+  // По названию не нашли — пробуем артикул продавца («PJ-104»): сотрудники
+  // называют товар именно им, а не длинным заголовком карточки.
+  const { data: byCode } = await db
+    .from("products")
+    .select("id, nm_id, title, cost_price, price_discounted_wb")
+    .eq("store_id", DEMO_STORE_ID)
+    .ilike("vendor_code", `%${likeSafe(q)}%`)
+    .limit(8);
+  return (byCode ?? []) as ProductRow[];
 }
 
 type SupplyRow = {
@@ -1470,8 +1532,8 @@ async function execProductInfo(ctx: ToolCtx, input: { query?: string }): Promise
     parts.push(
       `${p.title} (арт. ${p.nm_id}): продажи 30д — ${num(sales30)} шт (~${avg.toFixed(1)}/день), ${stockLine}` +
         (cover !== null ? `, хватит на ${cover} дн` : "") +
-        (p.price_discounted_wb != null ? `, цена ${num(Number(p.price_discounted_wb))} ₽` : "") +
-        (p.cost_price ? `, себестоимость ${num(Number(p.cost_price))} ₽` : ""),
+        (p.price_discounted_wb != null ? `, цена ${num(Number(p.price_discounted_wb))} сом` : "") +
+        (p.cost_price ? `, себестоимость ${num(Number(p.cost_price))} сом` : ""),
     );
   }
   return parts.join("\n");
@@ -1556,12 +1618,12 @@ async function execUpdateProduct(
     patch.cost_price = cost;
     patch.cost_price_source = "manual";
     patch.cost_price_updated_at = new Date().toISOString();
-    changed.push(`себестоимость ${num(cost)} ₽`);
+    changed.push(`себестоимость ${num(cost)} сом`);
   }
   const logistics = posInt(input.logistics_cost);
   if (input.logistics_cost !== undefined && logistics !== null) {
     patch.logistics_cost = logistics;
-    changed.push(`логистика ${num(logistics)} ₽`);
+    changed.push(`логистика ${num(logistics)} сом`);
   }
   if (String(input.status ?? "").trim()) {
     patch.status = String(input.status).trim().slice(0, 50);
@@ -1656,7 +1718,7 @@ async function execSetSalesPlan(
   const amount = posInt(input.amount_rub);
   if (!start || !end) return "Ошибка: нужны даты начала и конца периода в формате yyyy-mm-dd.";
   if (start >= end) return "Ошибка: начало периода должно быть раньше конца.";
-  if (amount === null) return "Ошибка: нужна сумма плана в рублях.";
+  if (amount === null) return "Ошибка: нужна сумма плана в сомах.";
 
   const { error } = await ctx.db.from("sales_plans").upsert(
     {
@@ -1671,7 +1733,7 @@ async function execSetSalesPlan(
   );
   if (error) return `Не удалось сохранить план: ${error.message}`;
   ctx.touch();
-  return `План продаж на ${start} — ${end} установлен: ${num(amount)} ₽.`;
+  return `План продаж на ${start} — ${end} установлен: ${num(amount)} сом.`;
 }
 
 // ── Касса и расходы компании (правила — в data/cash-core) ───────────────────
@@ -1749,10 +1811,11 @@ async function execAddExpense(
   const parsed = await resolveTxInput(ctx, input, "out");
   if (!parsed.ok) return parsed.message;
 
+  const rates = await readCurrencyRateMap(ctx.db);
   const gate = confirmGate(
-    toRub(parsed.amount, parsed.accountCurrency),
+    toBase(parsed.amount, parsed.accountCurrency, rates),
     input.confirm,
-    `расход ${num(parsed.amount)} ${CURRENCY_LABEL[parsed.accountCurrency] ?? "₽"} · статья «${parsed.categoryName}» · счёт «${parsed.accountName}» · ${parsed.date}`,
+    `расход ${num(parsed.amount)} ${sign(parsed.accountCurrency)} · статья «${parsed.categoryName}» · счёт «${parsed.accountName}» · ${parsed.date}`,
   );
   if (gate) return gate;
 
@@ -1768,7 +1831,7 @@ async function execAddExpense(
   if (!result.ok) return `Не удалось записать расход: ${result.message}`;
   ctx.touch();
   return (
-    `Расход записан: ${num(result.amountRub)} ₽ · статья «${parsed.categoryName}» · ` +
+    `Расход записан: ${num(result.amountRub)} сом · статья «${parsed.categoryName}» · ` +
     `счёт «${parsed.accountName}» · дата ${parsed.date}. ` +
     (parsed.autoPicked ? "Счёт в кассе один — взят он." : "")
   );
@@ -1788,10 +1851,11 @@ async function execAddIncome(
   const parsed = await resolveTxInput(ctx, input, "in");
   if (!parsed.ok) return parsed.message;
 
+  const rates = await readCurrencyRateMap(ctx.db);
   const gate = confirmGate(
-    toRub(parsed.amount, parsed.accountCurrency),
+    toBase(parsed.amount, parsed.accountCurrency, rates),
     input.confirm,
-    `приход ${num(parsed.amount)} ${CURRENCY_LABEL[parsed.accountCurrency] ?? "₽"} · статья «${parsed.categoryName}» · счёт «${parsed.accountName}» · ${parsed.date}`,
+    `приход ${num(parsed.amount)} ${sign(parsed.accountCurrency)} · статья «${parsed.categoryName}» · счёт «${parsed.accountName}» · ${parsed.date}`,
   );
   if (gate) return gate;
 
@@ -1807,10 +1871,58 @@ async function execAddIncome(
   if (!result.ok) return `Не удалось записать поступление: ${result.message}`;
   ctx.touch();
   return (
-    `Поступление записано: ${num(result.amountRub)} ₽ · статья «${parsed.categoryName}» · ` +
+    `Поступление записано: ${num(result.amountRub)} сом · статья «${parsed.categoryName}» · ` +
     `счёт «${parsed.accountName}» · дата ${parsed.date}.` +
     (parsed.autoPicked ? " Счёт в кассе один — взят он." : "")
   );
+}
+
+// Сверка остатка: человек называет ФАКТ, система считает разницу сама. Порог
+// подтверждения считаем по размеру правки — «поправить кассу на 20 млн» голосом
+// без подтверждения быть не должно.
+async function execReconcileCash(
+  ctx: ToolCtx,
+  input: {
+    balance?: number;
+    account?: string;
+    date?: string;
+    note?: string;
+    confirm?: boolean;
+  },
+): Promise<string> {
+  const balance = Number(input.balance);
+  if (!Number.isFinite(balance)) {
+    return "Ошибка: назови фактический остаток числом (0 — если денег на счёте нет).";
+  }
+
+  const acc = await resolveAccountStrict(ctx, input.account);
+  if (!acc.ok) return acc.message;
+  const account = acc.account;
+  const date = isoOr(input.date, localIsoDate()) ?? localIsoDate();
+
+  // Размер правки — разница с расчётным остатком (его знает касса)
+  const overview = await getCashOverview(ctx.db);
+  const current = overview.accounts.find((a) => a.id === account.id)?.balance ?? 0;
+  const rates = await readCurrencyRateMap(ctx.db);
+  const diffBase = Math.abs(toBase(balance - current, account.currency, rates));
+
+  const gate = confirmGate(
+    diffBase,
+    input.confirm,
+    `сверка «${account.name}»: было ${num(current)} ${sign(account.currency)}, ` +
+      `станет ${num(balance)} ${sign(account.currency)} · ${date}`,
+  );
+  if (gate) return gate;
+
+  const result = await reconcileAccount(ctx.db, cashActorOf(ctx.user), {
+    accountId: account.id,
+    actualBalance: balance,
+    occurredOn: date,
+    note: input.note ? String(input.note) : null,
+  });
+  if (!result.ok) return `Не удалось сверить остаток: ${result.message}`;
+  ctx.touch();
+  return result.message + (acc.autoPicked ? " Счёт в кассе один — взят он." : "");
 }
 
 // ── Перевод между счетами и удаление ошибочной операции ─────────────────────
@@ -1849,16 +1961,17 @@ async function execTransferMoney(
   const hasTo = Number.isFinite(amountTo) && amountTo > 0;
   if (cross && !hasTo) {
     return (
-      `Счета в разных валютах («${from.account.name}» ${CURRENCY_LABEL[from.account.currency]} → ` +
-      `«${to.account.name}» ${CURRENCY_LABEL[to.account.currency]}). ` +
+      `Счета в разных валютах («${from.account.name}» ${sign(from.account.currency)} → ` +
+      `«${to.account.name}» ${sign(to.account.currency)}). ` +
       "Спроси, сколько зачислено на второй счёт (курс сделки), и повтори с amount_to."
     );
   }
 
+  const rates = await readCurrencyRateMap(ctx.db);
   const gate = confirmGate(
-    toRub(amount, from.account.currency),
+    toBase(amount, from.account.currency, rates),
     input.confirm,
-    `перевод ${num(amount)} ${CURRENCY_LABEL[from.account.currency]} со счёта «${from.account.name}» на «${to.account.name}»`,
+    `перевод ${num(amount)} ${sign(from.account.currency)} со счёта «${from.account.name}» на «${to.account.name}»`,
   );
   if (gate) return gate;
 
@@ -1875,10 +1988,10 @@ async function execTransferMoney(
   if (!result.ok) return `Не удалось провести перевод: ${result.message}`;
   ctx.touch();
   return (
-    `Перевод проведён: ${num(amount)} ${CURRENCY_LABEL[from.account.currency]} · ` +
+    `Перевод проведён: ${num(amount)} ${sign(from.account.currency)} · ` +
     `«${from.account.name}» → «${to.account.name}»` +
     (hasTo && (cross || amountTo !== amount)
-      ? ` (зачислено ${num(amountTo)} ${CURRENCY_LABEL[to.account.currency]})`
+      ? ` (зачислено ${num(amountTo)} ${sign(to.account.currency)})`
       : "") +
     "."
   );
@@ -1899,7 +2012,7 @@ async function execDeleteCashTx(
   // Ищем за последние 60 дней ТОЛЬКО ручные операции (manual/bot/ai):
   // системные нельзя — удаление оплаты заявки рассинхронизирует payout_requests,
   // а поступление WB воскреснет при следующем синке. Сумму матчим и в валюте
-  // операции, и в рублях (сотрудник обычно называет рубли), допуск ±1.
+  // операции, и в сомах (сотрудник обычно называет сомы), допуск ±1.
   const since = localIsoDate(new Date(Date.now() - 60 * 86_400_000));
   const LIMIT = 100;
   let sel = ctx.db
@@ -1949,7 +2062,7 @@ async function execDeleteCashTx(
 
   const label = (r: (typeof rows)[number]) =>
     `${r.occurred_on}: ${r.kind === "in" ? "приход" : r.kind === "transfer" ? "перевод" : "расход"} ` +
-    `${num(r.amount)} ${CURRENCY_LABEL[r.currency] ?? r.currency} · ${r.categoryName || "без статьи"} · ` +
+    `${num(r.amount)} ${sign(r.currency)} · ${r.categoryName || "без статьи"} · ` +
     `счёт «${r.accountName}»${r.note ? ` · ${r.note}` : ""}`;
 
   if (!rows.length) {
@@ -2018,20 +2131,20 @@ async function execCashBalance(ctx: ToolCtx): Promise<string> {
     return "Счетов кассы ещё нет — их заводят в CRM → Финансы → Касса.";
   }
   const lines = [
-    `ДЕНЬГИ КОМПАНИИ: всего ${num(view.totalRub)} ₽ по ${view.accounts.length} счетам.`,
+    `ДЕНЬГИ КОМПАНИИ: всего ${num(view.totalRub)} сом по ${view.accounts.length} счетам.`,
     ...view.accounts.map(
       (a) =>
         `- ${a.name}: ${money(a.balance, a.currency)}` +
-        (a.currency === "rub" ? "" : ` (≈ ${num(a.balanceRub)} ₽)`) +
+        (a.currency === "rub" ? "" : ` (≈ ${num(a.balanceRub)} сом)`) +
         (a.lastTx ? ` · последняя операция ${a.lastTx}` : " · операций не было"),
     ),
-    `За текущий месяц: пришло ${num(view.monthInRub)} ₽, ушло ${num(view.monthOutRub)} ₽, ` +
-      `итог ${num(view.monthInRub - view.monthOutRub)} ₽.`,
+    `За текущий месяц: пришло ${num(view.monthInRub)} сом, ушло ${num(view.monthOutRub)} сом, ` +
+      `итог ${num(view.monthInRub - view.monthOutRub)} сом.`,
   ];
   if (view.wbProcessing.length) {
     const sum = view.wbProcessing.reduce((t, x) => t + x.amountRub, 0);
     lines.push(
-      `ВЫПЛАТЫ WB В ОБРАБОТКЕ (отправлены, но ещё НЕ на счёте — в кассе не учтены): ≈ ${num(sum)} ₽.`,
+      `ВЫПЛАТЫ WB В ОБРАБОТКЕ (отправлены, но ещё НЕ на счёте — в кассе не учтены): ≈ ${num(sum)} сом.`,
       ...view.wbProcessing.map((t) => `- ${t.note ?? t.occurredOn}: ${money(t.amount, t.currency)}`),
       "Когда деньги придут на счёт, поступление подтверждают в CRM → Финансы → Касса → «Поступили на счёт».",
     );
@@ -2043,7 +2156,7 @@ async function execCashBalance(ctx: ToolCtx): Promise<string> {
         t.kind === "transfer"
           ? `перевод на «${t.toAccountName ?? "—"}»`
           : `${t.kind === "in" ? "приход" : "расход"} «${t.categoryName ?? "без статьи"}»`;
-      lines.push(`- ${t.occurredOn}: ${what} ${num(t.amountRub)} ₽ · счёт «${t.accountName}»${t.note ? ` · ${t.note}` : ""}`);
+      lines.push(`- ${t.occurredOn}: ${what} ${num(t.amountRub)} сом · счёт «${t.accountName}»${t.note ? ` · ${t.note}` : ""}`);
     }
   }
   return lines.join("\n");
@@ -2053,7 +2166,7 @@ async function execPnlReport(ctx: ToolCtx, input: { months?: number }): Promise<
   const months = Math.min(12, Math.max(1, Math.round(Number(input.months) || 3)));
   const view = await getPnlView(ctx.db, months);
   const t = view.total;
-  const cur = view.currency === "RUB" ? "₽" : view.currency;
+  const cur = CURRENCY_SIGN[normalizeCurrency(view.currency) ?? BASE_CURRENCY];
   const money = (v: number) => `${num(v)} ${cur}`;
   const lines = [
     `ПРИБЫЛЬ ЗА ${months} МЕС.${view.hasWbReport ? " (удержания — из отчёта о реализации WB)" : " (отчёт WB не загружен, удержания оценочные)"}:`,
@@ -2105,7 +2218,9 @@ async function execPnlReport(ctx: ToolCtx, input: { months?: number }): Promise<
     lines.push("ВАЖНО: расходы компании не внесены — прибыль без зарплат, налогов и внешней рекламы.");
   }
   if (view.currency !== "RUB") {
-    lines.push(`ВАЖНО: кабинет ведёт расчёты в ${view.currency} — суммы выше в этой валюте, не в рублях.`);
+    lines.push(
+      `ВАЖНО: кабинет ведёт расчёты в ${view.currency} — суммы выше в этой валюте.`,
+    );
   }
   return lines.join("\n");
 }
@@ -2124,18 +2239,18 @@ async function execCompanyExpenses(ctx: ToolCtx, input: { days?: number }): Prom
     return `РАСХОДЫ КОМПАНИИ за ${view.from} — ${view.to}: записей нет.`;
   }
   return [
-    `РАСХОДЫ КОМПАНИИ за ${view.from} — ${view.to}: ${num(view.totalRub)} ₽ (${view.items.length} операций).`,
-    `Из них влияют на прибыль: ${num(view.opexRub)} ₽.`,
+    `РАСХОДЫ КОМПАНИИ за ${view.from} — ${view.to}: ${num(view.totalRub)} сом (${view.items.length} операций).`,
+    `Из них влияют на прибыль: ${num(view.opexRub)} сом.`,
     "По статьям:",
     ...view.categories.map(
-      (c) => `- ${c.name}: ${num(c.amountRub)} ₽ (${c.sharePct}%, ${c.txCount} оп.)${c.inPnl ? "" : " — не влияет на прибыль"}`,
+      (c) => `- ${c.name}: ${num(c.amountRub)} сом (${c.sharePct}%, ${c.txCount} оп.)${c.inPnl ? "" : " — не влияет на прибыль"}`,
     ),
     "Последние операции:",
     ...view.items
       .slice(0, 8)
       .map(
         (t) =>
-          `- ${t.occurredOn}: ${t.categoryName ?? "без статьи"} ${num(t.amountRub)} ₽` +
+          `- ${t.occurredOn}: ${t.categoryName ?? "без статьи"} ${num(t.amountRub)} сом` +
           `${t.note ? ` · ${t.note}` : ""}${t.authorName ? ` · внёс ${t.authorName}` : ""}`,
       ),
   ].join("\n");
@@ -2235,10 +2350,10 @@ async function execUnitEconomics(
   });
 
   const fmtRow = (i: (typeof items)[number]) =>
-    `«${i.title}»: продано ${num(i.qty)} шт, выручка ${num(i.revenue)} ₽, ` +
-    `удержания WB ${num(i.wbFees)} ₽, реклама ${num(i.advert)} ₽ (ДРР ${i.drrPct}%), ` +
-    `себестоимость ${num(i.cogs)} ₽${i.costPrice === 0 && i.nm !== 0 ? " (⚠ себестоимость не заполнена!)" : ""}, ` +
-    `прибыль ${num(i.profit)} ₽ (маржа ${i.marginPct}%)`;
+    `«${i.title}»: продано ${num(i.qty)} шт, выручка ${num(i.revenue)} сом, ` +
+    `удержания WB ${num(i.wbFees)} сом, реклама ${num(i.advert)} сом (ДРР ${i.drrPct}%), ` +
+    `себестоимость ${num(i.cogs)} сом${i.costPrice === 0 && i.nm !== 0 ? " (⚠ себестоимость не заполнена!)" : ""}, ` +
+    `прибыль ${num(i.profit)} сом (маржа ${i.marginPct}%)`;
 
   // Разбор одного товара
   const q = String(input.product ?? "").trim();
@@ -2262,13 +2377,13 @@ async function execUnitEconomics(
   const noCost = products.filter((i) => i.costPrice === 0).length;
 
   return [
-    `ЮНИТ-ЭКОНОМИКА за ${days} дн.: выручка ${num(totals.revenue)} ₽, прибыль ${num(totals.profit)} ₽ по ${products.length} SKU.` +
+    `ЮНИТ-ЭКОНОМИКА за ${days} дн.: выручка ${num(totals.revenue)} сом, прибыль ${num(totals.profit)} сом по ${products.length} SKU.` +
       (noCost > 0 ? ` ⚠ У ${noCost} SKU не заполнена себестоимость — их прибыль завышена.` : ""),
     "Топ по прибыли:",
     ...products.slice(0, 5).map((i) => `- ${fmtRow(i)}`),
     ...(losers.length ? ["Убыточные:", ...losers.map((i) => `- ${fmtRow(i)}`)] : []),
     ...(unallocated && (unallocated.wbFees !== 0 || unallocated.advert !== 0)
-      ? [`Нераспределённое (не привязано к товарам): удержания ${num(unallocated.wbFees)} ₽, реклама ${num(unallocated.advert)} ₽.`]
+      ? [`Нераспределённое (не привязано к товарам): удержания ${num(unallocated.wbFees)} сом, реклама ${num(unallocated.advert)} сом.`]
       : []),
   ].join("\n");
 }
@@ -2359,10 +2474,11 @@ async function execPaySalary(
 
   const date = isoOr(input.date, localIsoDate()) ?? localIsoDate();
 
+  const rates = await readCurrencyRateMap(ctx.db);
   const gate = confirmGate(
-    toRub(amount, account.currency),
+    toBase(amount, account.currency, rates),
     input.confirm,
-    `${member.name} · ${num(amount)} ${CURRENCY_LABEL[account.currency] ?? "₽"} · статья «${category.name}» · счёт «${account.name}» · ${date}`,
+    `${member.name} · ${num(amount)} ${CURRENCY_SIGN[account.currency] ?? "сом"} · статья «${category.name}» · счёт «${account.name}» · ${date}`,
   );
   if (gate) return gate;
 
@@ -2380,7 +2496,7 @@ async function execPaySalary(
   ctx.touch();
 
   return (
-    `Выплата проведена: ${num(result.amountRub)} ₽ · ${member.name} (${member.roleLabel}) · ` +
+    `Выплата проведена: ${num(result.amountRub)} сом · ${member.name} (${member.roleLabel}) · ` +
     `статья «${category.name}» · счёт «${account.name}» · дата ${date}. ` +
     "Сумма попала в отчёт «Выплаты команде»; сотруднику ушло уведомление в Telegram, если его аккаунт привязан." +
     (acc.autoPicked ? " Счёт в кассе один — взят он." : "")
@@ -2409,19 +2525,19 @@ async function execPayrollReport(
     }
     const lines = [
       `ВЫПЛАТЫ · ${person.name} (${person.roleLabel}) за ${from}…${to}: ` +
-        `${num(person.amountRub)} ₽ за ${person.txCount} выплат` +
+        `${num(person.amountRub)} сом за ${person.txCount} выплат` +
         (person.lastPaidOn ? `, последняя ${person.lastPaidOn}` : "") +
         `. Это ${person.sharePct}% всех выплат команде.`,
     ];
     if (person.slices.length) {
       lines.push(
         "Из чего сложилось: " +
-          person.slices.map((s) => `${s.name} — ${num(s.amountRub)} ₽`).join("; "),
+          person.slices.map((s) => `${s.name} — ${num(s.amountRub)} сом`).join("; "),
       );
     }
     if (person.monthly.length > 1) {
       lines.push(
-        "По месяцам: " + person.monthly.map((m) => `${m.label} — ${num(m.amountRub)} ₽`).join("; "),
+        "По месяцам: " + person.monthly.map((m) => `${m.label} — ${num(m.amountRub)} сом`).join("; "),
       );
     }
     const own = view.items.filter((t) => t.personId === person.personId).slice(0, 8);
@@ -2429,7 +2545,7 @@ async function execPayrollReport(
       lines.push("Операции:");
       for (const t of own) {
         lines.push(
-          `- ${t.occurredOn}: ${num(t.amountRub)} ₽ · ${t.categoryName ?? "без статьи"}` +
+          `- ${t.occurredOn}: ${num(t.amountRub)} сом · ${t.categoryName ?? "без статьи"}` +
             (t.note ? ` · ${t.note}` : ""),
         );
       }
@@ -2441,18 +2557,18 @@ async function execPayrollReport(
     return (
       `ВЫПЛАТЫ КОМАНДЕ за ${from}…${to}: адресных выплат нет.` +
       (view.unassignedRub > 0
-        ? ` При этом по «людским» статьям ушло ${num(view.unassignedRub)} ₽ без указания сотрудника — стоит указывать, кому платили.`
+        ? ` При этом по «людским» статьям ушло ${num(view.unassignedRub)} сом без указания сотрудника — стоит указывать, кому платили.`
         : "")
     );
   }
 
   const lines = [
-    `ВЫПЛАТЫ КОМАНДЕ за ${from}…${to}: всего ${num(view.totalRub)} ₽ на ${view.people.length} человек ` +
+    `ВЫПЛАТЫ КОМАНДЕ за ${from}…${to}: всего ${num(view.totalRub)} сом на ${view.people.length} человек ` +
       `(${view.items.length} выплат).`,
   ];
   for (const p of view.people) {
     lines.push(
-      `- ${p.name} (${p.roleLabel}): ${num(p.amountRub)} ₽ · ${p.sharePct}% · ${p.txCount} выплат` +
+      `- ${p.name} (${p.roleLabel}): ${num(p.amountRub)} сом · ${p.sharePct}% · ${p.txCount} выплат` +
         (p.lastPaidOn ? ` · последняя ${p.lastPaidOn}` : "") +
         (p.slices.length
           ? ` · ${p.slices.map((s) => `${s.name} ${num(s.amountRub)}`).join(", ")}`
@@ -2461,12 +2577,12 @@ async function execPayrollReport(
   }
   if (view.unassignedRub > 0) {
     lines.push(
-      `Без указания сотрудника: ${num(view.unassignedRub)} ₽ (${view.unassignedCount} операций) — ` +
+      `Без указания сотрудника: ${num(view.unassignedRub)} сом (${view.unassignedCount} операций) — ` +
         "в разрезе по людям их не видно.",
     );
   }
   if (view.pendingRub > 0) {
-    lines.push(`Ждут выплаты по заявкам: ${num(view.pendingRub)} ₽.`);
+    lines.push(`Ждут выплаты по заявкам: ${num(view.pendingRub)} сом.`);
   }
   return lines.join("\n");
 }
@@ -2505,12 +2621,12 @@ async function execMySalary(ctx: ToolCtx, input: { days?: number }): Promise<str
   );
 
   const lines = [
-    `МОИ ВЫПЛАТЫ за ${from}…${to}: ${num(total)} ₽ за ${rows.length} ` +
+    `МОИ ВЫПЛАТЫ за ${from}…${to}: ${num(total)} сом за ${rows.length} ` +
       (rows.length === 1 ? "выплату" : "выплат") + ".",
   ];
   for (const r of rows.slice(0, 10)) {
     lines.push(
-      `- ${r.occurred_on}: ${num(Number(r.amount_rub ?? 0))} ₽ · ${one(r.category)?.name ?? "без статьи"}` +
+      `- ${r.occurred_on}: ${num(Number(r.amount_rub ?? 0))} сом · ${one(r.category)?.name ?? "без статьи"}` +
         (r.note ? ` · ${r.note}` : ""),
     );
   }
@@ -2518,7 +2634,7 @@ async function execMySalary(ctx: ToolCtx, input: { days?: number }): Promise<str
     lines.push("Заявки в работе:");
     for (const p of waiting) {
       lines.push(
-        `- «${p.title}» ${num(p.amountRub)} ₽ · ${PAYOUT_STATUS_LABELS[p.status]}`,
+        `- «${p.title}» ${num(p.amountRub)} сом · ${PAYOUT_STATUS_LABELS[p.status]}`,
       );
     }
   }
@@ -2541,8 +2657,8 @@ async function execRequestPayout(
     supply?: string;
   },
 ): Promise<string> {
-  // Тип и валюта — строго, без тихих дефолтов: юаневый счёт фабрики, молча
-  // записанный в рублях, разъедется с реальностью в ~12 раз.
+  // Тип и валюта — строго, без тихих дефолтов: долларовый счёт фабрики, молча
+  // записанный сомами, разъедется с реальностью в десятки раз.
   const kindRaw = String(input.kind ?? "").trim();
   if (!["salary", "contractor", "factory", "reimbursement", "other"].includes(kindRaw)) {
     return (
@@ -2553,10 +2669,11 @@ async function execRequestPayout(
   const kind = kindRaw as PayoutKind;
 
   const currencyRaw = String(input.currency ?? "").trim().toLowerCase();
-  if (!["rub", "kgs", "cny", "uzs"].includes(currencyRaw)) {
+  if (!(CURRENCIES as readonly string[]).includes(currencyRaw)) {
     return (
-      "Уточни валюту заявки: рубли (rub), сомы (kgs), юани (cny) или сумы (uzs). " +
-      "Не подставляй рубли сам, если валюта не звучала."
+      "Уточни валюту заявки: сомы (kgs), доллары (usd), рубли (rub), юани (cny) или " +
+      "сумы (uzs). Не подставляй валюту сам, если она не звучала: счёт фабрики в " +
+      "долларах, записанный сомами, разъедется с реальностью в ~87 раз."
     );
   }
 
@@ -2596,10 +2713,10 @@ async function execPayoutsList(ctx: ToolCtx): Promise<string> {
   const view = await getPayouts(ctx.db, { id: ctx.user.id, role: ctx.user.role });
   if (!view.items.length) return "ЗАЯВОК НА ВЫПЛАТУ нет.";
   const money = (p: { amount: number; currency: string }) =>
-    `${num(p.amount)} ${CURRENCY_LABEL[p.currency] ?? p.currency}`;
+    `${num(p.amount)} ${sign(p.currency)}`;
   const lines = [
-    `ЗАЯВКИ НА ВЫПЛАТУ: ждут решения ${view.pendingCount} на ${num(view.pendingRub)} ₽, ` +
-      `согласовано к оплате ${num(view.approvedRub)} ₽, выплачено за месяц ${num(view.paidMonthRub)} ₽.`,
+    `ЗАЯВКИ НА ВЫПЛАТУ: ждут решения ${view.pendingCount} на ${num(view.pendingRub)} сом, ` +
+      `согласовано к оплате ${num(view.approvedRub)} сом, выплачено за месяц ${num(view.paidMonthRub)} сом.`,
   ];
   for (const p of view.items.slice(0, 15)) {
     lines.push(
@@ -2701,7 +2818,7 @@ async function execPayPayout(
     if (pool.length > 1) {
       return (
         `С какого счёта оплатить «${payout.title}» (${money(payout.amount, payout.currency)})? ` +
-        `Подходящие: ${pool.map((a) => `${a.name} (${CURRENCY_LABEL[a.currency] ?? a.currency})`).join(", ")}. ` +
+        `Подходящие: ${pool.map((a) => `${a.name} (${sign(a.currency)})`).join(", ")}. ` +
         "Уточни у сотрудника."
       );
     }
@@ -2710,11 +2827,11 @@ async function execPayPayout(
   }
 
   // Валюта счёта ≠ валюте заявки: сумма запишется в валюте счёта БЕЗ пересчёта
-  // (5000 ¥ с рублёвого счёта = 5000 ₽ в кассе) — только с явным подтверждением
+  // (5000 $ с сомового счёта = 5000 сом в кассе) — только с явным подтверждением
   if (account.currency !== payout.currency && input.confirm !== true) {
     return (
-      `Заявка в ${CURRENCY_LABEL[payout.currency] ?? payout.currency} (${money(payout.amount, payout.currency)}), ` +
-      `а счёт «${account.name}» — в ${CURRENCY_LABEL[account.currency] ?? account.currency}. ` +
+      `Заявка в ${sign(payout.currency)} (${money(payout.amount, payout.currency)}), ` +
+      `а счёт «${account.name}» — в ${sign(account.currency)}. ` +
       "Сумма запишется в валюте счёта БЕЗ пересчёта и исказит кассу. " +
       "Лучше укажи счёт в валюте заявки; если платили именно с этого счёта — подтверди у сотрудника и повтори с confirm=true."
     );
@@ -2723,7 +2840,7 @@ async function execPayPayout(
   const gate = confirmGate(
     payout.amountRub,
     input.confirm,
-    `оплата заявки «${payout.title}» ~${num(payout.amountRub)} ₽ со счёта «${account.name}»`,
+    `оплата заявки «${payout.title}» ~${num(payout.amountRub)} сом со счёта «${account.name}»`,
   );
   if (gate) return gate;
 
@@ -2763,22 +2880,28 @@ async function execSuppliesList(
     .from("supply_payments")
     .select("supply_id, kind, amount, currency")
     .in("supply_id", rows.map((r) => r.id));
+  const rates = await readCurrencyRateMap(ctx.db);
   const paidRub = new Map<string, number>();
   for (const p of (pays ?? []) as { supply_id: string; amount: number; currency: string }[]) {
-    paidRub.set(p.supply_id, (paidRub.get(p.supply_id) ?? 0) + toRub(Number(p.amount), p.currency));
+    paidRub.set(
+      p.supply_id,
+      (paidRub.get(p.supply_id) ?? 0) + toBase(Number(p.amount), p.currency, rates),
+    );
   }
 
   return [
     `ПОСТАВКИ (${rows.length}):`,
     ...rows.slice(0, 15).map((r) => {
-      const costRub = toRub(Number(r.sewing_cost), r.sewing_currency) + toRub(Number(r.cargo_cost), r.cargo_currency);
+      const costRub =
+        toBase(Number(r.sewing_cost), r.sewing_currency, rates) +
+        toBase(Number(r.cargo_cost), r.cargo_currency, rates);
       const paid = paidRub.get(r.id) ?? 0;
       const debt = Math.max(0, costRub - paid);
       return (
         `- «${r.title}»: ${num(r.quantity)} шт, отгружена ${r.ship_date}, статус «${SUPPLY_STATUS_RU[r.status] ?? r.status}»` +
         (r.received_qty != null ? `, принято ${num(r.received_qty)} шт` : "") +
-        `, стоимость ~${num(costRub)} ₽, оплачено ${num(paid)} ₽` +
-        (debt > 0 ? `, остаток долга ~${num(debt)} ₽` : ", закрыта полностью")
+        `, стоимость ~${num(costRub)} сом, оплачено ${num(paid)} сом` +
+        (debt > 0 ? `, остаток долга ~${num(debt)} сом` : ", закрыта полностью")
       );
     }),
   ].join("\n");
@@ -2890,10 +3013,10 @@ async function execCreateSupply(
   return (
     `Поставка «${title}» с фабрики «${picked.row.name}» создана: ${num(quantity)} шт, статус «в пути». ` +
     (sewingCost
-      ? `Отшивка: ${num(sewingCost)} ${CURRENCY_LABEL[sewingCurrency]}${input.sewing_currency ? "" : " (валюта по стране фабрики — проверь)"}.`
+      ? `Отшивка: ${num(sewingCost)} ${sign(sewingCurrency)}${input.sewing_currency ? "" : " (валюта по стране фабрики — проверь)"}.`
       : "Стоимость отшивки НЕ внесена (по слову сотрудника) — напомни внести позже, долги фабрике пока не считаются.") +
     (cargoCost
-      ? ` Карго: ${num(cargoCost)} ${CURRENCY_LABEL[cargoCurrency]}.`
+      ? ` Карго: ${num(cargoCost)} ${sign(cargoCurrency)}.`
       : " Карго не указано — добавится позже через оплату или карточку поставки.")
   );
 }
@@ -2919,7 +3042,7 @@ async function execAddSupplyPayment(
   }
   if (amount === null || amount === 0) return "Ошибка: нужна сумма платежа больше нуля.";
   const currency = currencyOr(input.currency, "");
-  if (!currency) return "Ошибка: нужна валюта — cny (юань), uzs (сум) или rub (рубль).";
+  if (!currency) return "Ошибка: нужна валюта — kgs (сом), usd (доллар), cny (юань), rub (рубль) или uzs (сум).";
 
   const matches = await findSupplies(ctx.db, supplyQ);
   const picked = pickOne(matches, (m) => m.title, supplyQ, "Поставки");
@@ -2959,20 +3082,21 @@ async function execAddSupplyPayment(
     .from("supply_payments")
     .select("amount, currency")
     .eq("supply_id", supply.id);
+  const rates = await readCurrencyRateMap(ctx.db);
   const paidRub = ((pays ?? []) as { amount: number; currency: string }[]).reduce(
-    (t, p) => t + toRub(Number(p.amount), p.currency),
+    (t, p) => t + toBase(Number(p.amount), p.currency, rates),
     0,
   );
   const costRub =
-    toRub(Number(supply.sewing_cost), supply.sewing_currency) +
-    toRub(Number(supply.cargo_cost), supply.cargo_currency);
+    toBase(Number(supply.sewing_cost), supply.sewing_currency, rates) +
+    toBase(Number(supply.cargo_cost), supply.cargo_currency, rates);
   const debt = Math.max(0, costRub - paidRub);
 
   return (
     `Расход записан: ${money(amount, currency)} за ${kind === "goods" ? "товар" : "карго"} ` +
     `по поставке «${supply.title}», дата ${paidAt}. ` +
-    `Всего оплачено ~${num(paidRub)} ₽ из ~${num(costRub)} ₽` +
-    (debt > 0 ? `, остаток долга ~${num(debt)} ₽.` : " — поставка закрыта полностью.")
+    `Всего оплачено ~${num(paidRub)} сом из ~${num(costRub)} сом` +
+    (debt > 0 ? `, остаток долга ~${num(debt)} сом.` : " — поставка закрыта полностью.")
   );
 }
 
@@ -3018,12 +3142,13 @@ async function execExpensesReport(ctx: ToolCtx, input: { days?: number }): Promi
     paid_at: string;
   }[];
 
-  // За период — по видам и по валютам (валюты не складываем, только пересчёт в ₽)
+  // За период — по видам и по валютам (валюты не складываем, только пересчёт в сомы)
+  const rates = await readCurrencyRateMap(db);
   const inPeriod = payments.filter((p) => p.paid_at >= sinceIso);
   const byKind = { goods: 0, cargo: 0 };
   const byCurrency: Record<string, number> = {};
   for (const p of inPeriod) {
-    const rub = toRub(Number(p.amount), p.currency);
+    const rub = toBase(Number(p.amount), p.currency, rates);
     if (p.kind === "goods") byKind.goods += rub;
     else byKind.cargo += rub;
     byCurrency[p.currency] = (byCurrency[p.currency] ?? 0) + Number(p.amount);
@@ -3031,22 +3156,31 @@ async function execExpensesReport(ctx: ToolCtx, input: { days?: number }): Promi
 
   // Долг: полная стоимость всех поставок минус все оплаты за всё время
   const totalCost = rows.reduce(
-    (t, r) => t + toRub(Number(r.sewing_cost), r.sewing_currency) + toRub(Number(r.cargo_cost), r.cargo_currency),
+    (t, r) =>
+      t +
+      toBase(Number(r.sewing_cost), r.sewing_currency, rates) +
+      toBase(Number(r.cargo_cost), r.cargo_currency, rates),
     0,
   );
-  const totalPaid = payments.reduce((t, p) => t + toRub(Number(p.amount), p.currency), 0);
+  const totalPaid = payments.reduce(
+    (t, p) => t + toBase(Number(p.amount), p.currency, rates),
+    0,
+  );
 
   // Топ незакрытых поставок — по ним и придут вопросы «кому должны»
   const paidBySupply = new Map<string, number>();
   for (const p of payments) {
-    paidBySupply.set(p.supply_id, (paidBySupply.get(p.supply_id) ?? 0) + toRub(Number(p.amount), p.currency));
+    paidBySupply.set(
+      p.supply_id,
+      (paidBySupply.get(p.supply_id) ?? 0) + toBase(Number(p.amount), p.currency, rates),
+    );
   }
   const debts = rows
     .map((r) => ({
       title: r.title,
       debt:
-        toRub(Number(r.sewing_cost), r.sewing_currency) +
-        toRub(Number(r.cargo_cost), r.cargo_currency) -
+        toBase(Number(r.sewing_cost), r.sewing_currency, rates) +
+        toBase(Number(r.cargo_cost), r.cargo_currency, rates) -
         (paidBySupply.get(r.id) ?? 0),
     }))
     .filter((d) => d.debt > 0)
@@ -3054,23 +3188,23 @@ async function execExpensesReport(ctx: ToolCtx, input: { days?: number }): Promi
     .slice(0, 8);
 
   const lines = [
-    `РАСХОДЫ НА ЗАКУПКУ за ${days} дн (курсы: ¥ 12,5 ₽ / сум 0,0068 ₽):`,
-    `- Всего оплачено за период: ${num(byKind.goods + byKind.cargo)} ₽ (${inPeriod.length} платежей)`,
-    `- За товар (отшивка): ${num(byKind.goods)} ₽`,
-    `- За карго (перевозка): ${num(byKind.cargo)} ₽`,
+    `РАСХОДЫ НА ЗАКУПКУ за ${days} дн (курсы к сому: ${rateHint(rates)}):`,
+    `- Всего оплачено за период: ${num(byKind.goods + byKind.cargo)} сом (${inPeriod.length} платежей)`,
+    `- За товар (отшивка): ${num(byKind.goods)} сом`,
+    `- За карго (перевозка): ${num(byKind.cargo)} сом`,
   ];
   const curParts = Object.entries(byCurrency).map(([c, a]) => money(a, c));
   if (curParts.length) lines.push(`- По валютам: ${curParts.join(", ")}`);
   lines.push(
     "",
     "ВСЕГО ПО ВСЕМ ПОСТАВКАМ:",
-    `- Стоимость поставок: ${num(totalCost)} ₽`,
-    `- Оплачено: ${num(totalPaid)} ₽`,
-    `- Остаток долга: ${num(Math.max(0, totalCost - totalPaid))} ₽`,
+    `- Стоимость поставок: ${num(totalCost)} сом`,
+    `- Оплачено: ${num(totalPaid)} сом`,
+    `- Остаток долга: ${num(Math.max(0, totalCost - totalPaid))} сом`,
   );
   if (debts.length) {
     lines.push("", "НЕ ЗАКРЫТЫ (топ по сумме долга):");
-    debts.forEach((d) => lines.push(`- «${d.title}»: ${num(d.debt)} ₽`));
+    debts.forEach((d) => lines.push(`- «${d.title}»: ${num(d.debt)} сом`));
   }
   return lines.join("\n");
 }
@@ -3483,6 +3617,7 @@ const HANDLERS: Record<string, Handler> = {
   set_sales_plan: execSetSalesPlan as Handler,
   add_expense: execAddExpense as Handler,
   add_income: execAddIncome as Handler,
+  reconcile_cash: execReconcileCash as Handler,
   transfer_money: execTransferMoney as Handler,
   delete_cash_tx: execDeleteCashTx as Handler,
   create_expense_category: execCreateExpenseCategory as Handler,

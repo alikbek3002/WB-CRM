@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { CURRENCY_CODES } from "@/shared/currency";
 import { can } from "@/shared/rbac";
 import { getSession } from "@/backend/auth/session";
 import { getSupabaseAdmin } from "@/backend/supabase/admin";
@@ -15,7 +16,7 @@ const payoutSchema = z.object({
   kind: z.enum(["salary", "contractor", "factory", "reimbursement", "other"]),
   title: z.string().trim().min(1).max(140),
   amount: z.number().positive().max(1_000_000_000),
-  currency: z.enum(["rub", "cny", "uzs", "kgs"]).optional(),
+  currency: z.enum(CURRENCY_CODES).optional(),
   description: z.string().trim().max(1000).nullable().optional(),
   payee: z.string().trim().max(120).nullable().optional(),
   payeeUserId: z.string().regex(UUID).nullable().optional(), // адресат из команды

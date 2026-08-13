@@ -30,6 +30,24 @@ export function invalidateWbData(...scopes: WbScope[]): void {
 // ОПиУ одновременно — сбрасываем их вместе, чтобы цифры не разъезжались.
 export const MONEY_SCOPES: WbScope[] = ["cash", "expenses", "payroll", "pnl"];
 
+// Курс валюты — множитель под всеми суммами: касса, расходы, ОПиУ, долги
+// фабрикам, себестоимость партий и сводка фул-фирмы считаются через него.
+// Правка курса обязана сбросить их все, иначе на экранах будут числа по старому
+// курсу рядом с числами по новому.
+export const CURRENCY_SCOPES: WbScope[] = [
+  "currency-rates",
+  "cash",
+  "expenses",
+  "payroll",
+  "pnl",
+  "supplies",
+  "factories",
+  "fulfillment",
+  "fulfillment-partners",
+  "products",
+  "unit-econ",
+];
+
 // Товар/себестоимость: список товаров, РНП и вся экономика считаются от него.
 export const PRODUCT_SCOPES: WbScope[] = [
   "products",
@@ -39,10 +57,12 @@ export const PRODUCT_SCOPES: WbScope[] = [
   "stocks-overview",
 ];
 
-// Поставки меняют «в пути» у товаров и остатки складов.
+// Поставки меняют «в пути» у товаров, остатки складов и сводку фул-фирмы
+// (стадии разбора и разрез по городам разгрузки живут там же).
 export const SUPPLY_SCOPES: WbScope[] = [
   "supplies",
   "products",
   "stocks-overview",
   "wb-incomes",
+  "fulfillment",
 ];
