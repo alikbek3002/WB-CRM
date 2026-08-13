@@ -1,0 +1,17 @@
+# Что НЕ уходит в сборку на Railway (railway up заливает содержимое папки).
+# Смысл: не тащить в прод-образ то, что не нужно рантайму, и не ждать лишнего
+# на индексации/загрузке.
+node_modules
+.next
+.git
+*.log
+*.docx
+PLAN.md
+КП_*.docx
+tsconfig.tsbuildinfo
+scripts/tmp
+docs
+DB_LOGINS.md
+КРЕДЫ-*.txt
+.env*
+!.env.example
